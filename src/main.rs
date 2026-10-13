@@ -1,0 +1,90 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::TrayIconBuilder,
+    Manager, WebviewUrl, WebviewWindowBuilder,
+};
+
+fn show_settings_window(app: &tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("settings") {
+        window
+            .show()
+            .map_err(|e| format!("Could not show the settings window: {e}"))?;
+        window
+            .set_focus()
+            .map_err(|e| format!("Could not focus the settings window: {e}"))?;
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
+        .title("Writely Settings")
+        .inner_size(420.0, 220.0)
+        .resizable(false)
+        .build()
+        .map_err(|e| format!("Could not open the settings window: {e}"))?;
+    Ok(())
+}
+
+fn main() {
+    let app = tauri::Builder::default()
+        .setup(|app| {
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            let settings_item = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)
+                .map_err(|e| format!("Could not create the Settings menu item: {e}"))?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit Writely", true, None::<&str>)
+                .map_err(|e| format!("Could not create the Quit menu item: {e}"))?;
+            let menu = Menu::with_items(app, &[&settings_item, &quit_item])
+                .map_err(|e| format!("Could not create the tray menu: {e}"))?;
+
+            let icon = match app.default_window_icon().cloned() {
+                Some(icon) => icon,
+                None => {
+                    eprintln!(
+                        "Writely: could not create the tray icon: no default window icon is configured"
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            if let Err(e) = TrayIconBuilder::new()
+                .icon(icon)
+                .menu(&menu)
+                .tooltip("Writely")
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "settings" => {
+                        if let Err(e) = show_settings_window(app) {
+                            eprintln!("Writely: {e}");
+                        }
+                    }
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)
+            {
+                eprintln!("Writely: could not create the tray icon: {e}");
+                std::process::exit(1);
+            }
+            Ok(())
+        })
+        .build(tauri::generate_context!());
+
+    let app = match app {
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("Writely: could not start the application: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    app.run(|_app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+            if code.is_none() {
+                api.prevent_exit();
+            }
+        }
+    });
+}
