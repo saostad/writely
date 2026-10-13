@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 #[allow(dead_code)]
-pub const GEMINI_MODEL: &str = "gemini-3.6-flash";
+pub const GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 
 const SYSTEM_INSTRUCTION: &str = "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged.";
 
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn model_name_is_the_required_one() {
-        assert_eq!(GEMINI_MODEL, "gemini-3.6-flash");
+        assert_eq!(GEMINI_MODEL, "gemini-3.5-flash-lite");
     }
 
     #[test]

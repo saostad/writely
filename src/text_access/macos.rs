@@ -10,12 +10,13 @@ use objc2_application_services::{
     AXValueType,
 };
 use objc2_core_foundation::{
-    kCFBooleanFalse, kCFBooleanTrue, CFBoolean, CFDictionary, CFIndex, CFRange, CFRetained,
-    CFString, CFType, CGRect, Type,
+    kCFBooleanFalse, kCFBooleanTrue, CFBoolean, CFDictionary, CFIndex, CFNumber, CFNumberType,
+    CFRange, CFRetained, CFString, CFType, CGRect, Type,
 };
 
 use super::{
-    char_to_utf16_offset, replaced_text, utf16_to_char_offset, CaretInfo, CaretRect, FieldSnapshot,
+    char_to_utf16_offset, covers_whole_field, replaced_text, utf16_len, utf16_to_char_offset,
+    window_for_caret, CaretInfo, CaretRect, FieldSnapshot, WHOLE_READ_LIMIT_UTF16,
 };
 
 pub(crate) struct PlatformHandle {
@@ -35,6 +36,20 @@ fn log_no_caret_once(pid: u32) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if logged.insert(pid) {
         eprintln!("Writely can't find the text cursor in this app, so the icon is hidden.");
+    }
+}
+
+/// Pids already told that the app has no partial-read support, so the
+/// message below logs once per pid instead of on every click.
+static PARTIAL_FALLBACK_LOGGED: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn log_partial_fallback_once(pid: u32, app: &str) {
+    let mut logged = PARTIAL_FALLBACK_LOGGED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if logged.insert(pid) {
+        eprintln!("Writely: {app} doesn't support partial reads; read the whole field.");
     }
 }
 
@@ -185,6 +200,50 @@ fn bounds_for_range(
     ax_rect(&ax_value).ok_or(AXError::Failure)
 }
 
+/// Reads `[location, location + length)` UTF-16 units via the parameterized
+/// `AXStringForRange` attribute, so large documents are never read in full.
+fn string_for_range(
+    element: &AXUIElement,
+    location: usize,
+    length: usize,
+) -> Result<String, AXError> {
+    let param = make_ax_range(location, length).ok_or(AXError::Failure)?;
+    let param_type: &CFType = &param;
+    let attr = CFString::from_str("AXStringForRange");
+    let mut raw: *const CFType = std::ptr::null();
+    let out = NonNull::from(&mut raw);
+    // SAFETY: element and attr are valid and out points at a live local slot.
+    let error = unsafe { element.copy_parameterized_attribute_value(&attr, param_type, out) };
+    if error != AXError::Success {
+        return Err(error);
+    }
+    let Some(ptr) = NonNull::new(raw.cast_mut()) else {
+        return Err(AXError::Failure);
+    };
+    // SAFETY: a successful copy returns a +1-retained CF object owned by the caller.
+    let value = unsafe { CFRetained::from_raw(ptr) };
+    match value.downcast_ref::<CFString>() {
+        Some(text) => Ok(text.to_string()),
+        None => Err(AXError::Failure),
+    }
+}
+
+fn number_of_characters(element: &AXUIElement) -> Result<usize, AXError> {
+    let value = copy_attr(element, "AXNumberOfCharacters")?;
+    let number = value.downcast::<CFNumber>().map_err(|_| AXError::Failure)?;
+    let mut out: i64 = 0;
+    let ptr = NonNull::new((&mut out as *mut i64).cast::<c_void>());
+    let Some(mut ptr) = ptr else {
+        return Err(AXError::Failure);
+    };
+    // SAFETY: ptr points at a writable i64 for a signed-integer conversion.
+    if unsafe { number.value(CFNumberType::SInt64Type, ptr.as_mut()) } {
+        Ok(out.max(0) as usize)
+    } else {
+        Err(AXError::Failure)
+    }
+}
+
 fn app_name(pid: u32) -> String {
     // SAFETY: creating an application element for a live pid is a plain FFI call.
     let app = unsafe { AXUIElement::new_application(pid as i32) };
@@ -264,15 +323,6 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
         Err(error) => return Err(read_error(error)),
     }
 
-    let text = match copy_string(&element, "AXValue") {
-        Ok(Some(text)) => text,
-        Ok(None) => return Ok(None),
-        Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
-            return Ok(None);
-        }
-        Err(error) => return Err(read_error(error)),
-    };
-
     let range_value = match copy_ax_value(&element, "AXSelectedTextRange") {
         Ok(value) => value,
         Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
@@ -289,18 +339,77 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
     } else {
         selected.location as usize
     };
-    let caret = utf16_to_char_offset(&text, caret_utf16);
+    let pid_u32 = pid as u32;
 
+    // Bounded read: only a window of text around the caret, never the whole
+    // document on keystroke-adjacent paths.
+    let total_utf16 = match number_of_characters(&element) {
+        Ok(total) => total,
+        // Fields without a length attribute fall back to the legacy whole
+        // read below.
+        Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
+            return whole_field_snapshot(element, pid_u32, caret_utf16);
+        }
+        Err(error) => return Err(read_error(error)),
+    };
+    let (start, len) = window_for_caret(caret_utf16, total_utf16);
+    match string_for_range(&element, start, len) {
+        Ok(window) => {
+            let caret = utf16_to_char_offset(&window, caret_utf16.saturating_sub(start));
+            let Some(caret_rect) = caret_rect(&element, caret_utf16) else {
+                log_no_caret_once(pid_u32);
+                return Ok(None);
+            };
+            Ok(Some(FieldSnapshot {
+                pid: pid_u32,
+                text: window,
+                caret,
+                caret_rect,
+                window_start_utf16: start,
+                field_len_utf16: total_utf16,
+                handle: PlatformHandle { element },
+            }))
+        }
+        Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
+            let name = app_name(pid_u32);
+            log_partial_fallback_once(pid_u32, &name);
+            if total_utf16 > WHOLE_READ_LIMIT_UTF16 {
+                return Err("This text field is too large for Writely.".to_string());
+            }
+            whole_field_snapshot(element, pid_u32, caret_utf16)
+        }
+        Err(error) => Err(read_error(error)),
+    }
+}
+
+/// Legacy whole-field read for apps without `AXStringForRange` (or without
+/// `AXNumberOfCharacters`). Only used on click paths, never per keystroke.
+fn whole_field_snapshot(
+    element: CFRetained<AXUIElement>,
+    pid: u32,
+    caret_utf16: usize,
+) -> Result<Option<FieldSnapshot>, String> {
+    let text = match copy_string(&element, "AXValue") {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok(None),
+        Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
+            return Ok(None);
+        }
+        Err(error) => return Err(read_error(error)),
+    };
+    let caret = utf16_to_char_offset(&text, caret_utf16);
     let Some(caret_rect) = caret_rect(&element, caret_utf16) else {
-        log_no_caret_once(pid as u32);
+        log_no_caret_once(pid);
         return Ok(None);
     };
-
+    let field_len_utf16 = utf16_len(&text);
     Ok(Some(FieldSnapshot {
-        pid: pid as u32,
+        pid,
         text,
         caret,
         caret_rect,
+        window_start_utf16: 0,
+        field_len_utf16,
         handle: PlatformHandle { element },
     }))
 }
@@ -434,6 +543,18 @@ fn caret_rect(element: &AXUIElement, caret_utf16: usize) -> Option<CaretRect> {
     None
 }
 
+pub(crate) fn read_window(
+    handle: &PlatformHandle,
+    start_utf16: usize,
+    len_utf16: usize,
+) -> Result<String, String> {
+    set_messaging_timeout(&handle.element);
+    match string_for_range(&handle.element, start_utf16, len_utf16) {
+        Ok(text) => Ok(text),
+        Err(error) => Err(read_error(error)),
+    }
+}
+
 pub(crate) fn read_text(handle: &PlatformHandle) -> Result<String, String> {
     set_messaging_timeout(&handle.element);
     match copy_string(&handle.element, "AXValue") {
@@ -451,8 +572,9 @@ pub(crate) fn replace_range(
     let element: &AXUIElement = &snap.handle.element;
     set_messaging_timeout(element);
     let name = app_name(snap.pid);
-    let start = char_to_utf16_offset(&snap.text, range.start);
-    let end = char_to_utf16_offset(&snap.text, range.end);
+    // Window-relative range math; the offset is added only for AX.
+    let start = snap.window_start_utf16 + char_to_utf16_offset(&snap.text, range.start);
+    let end = snap.window_start_utf16 + char_to_utf16_offset(&snap.text, range.end);
     let length = end.saturating_sub(start);
 
     let range_value = match make_ax_range(start, length) {
@@ -482,13 +604,23 @@ pub(crate) fn replace_range(
     if selected_error == AXError::CannotComplete {
         return Err(timeout_error(selected_error));
     }
-    let expected = replaced_text(&snap.text, &range, new_text);
+    // The expected window text after the replacement. Verification re-reads
+    // the window at the same start with the expected length (which differs
+    // from the snapshot length when the suggestion is longer/shorter).
+    let expected_window = replaced_text(&snap.text, &range, new_text);
+    let expected_len_utf16 = utf16_len(&expected_window);
     if selected_error != AXError::Success {
+        if !covers_whole_field(snap) {
+            return Err(format!(
+                "{name} didn't accept the replacement text (AXError {}).",
+                selected_error.0
+            ));
+        }
         eprintln!(
             "Writely: setting AXSelectedText failed (AXError {}); replaced the whole field text instead.",
             selected_error.0
         );
-        let whole_cf = CFString::from_str(&expected);
+        let whole_cf = CFString::from_str(&expected_window);
         let whole_type: &CFType = &whole_cf;
         let value_error = set_attr(element, "AXValue", whole_type);
         if value_error == AXError::CannotComplete {
@@ -502,8 +634,8 @@ pub(crate) fn replace_range(
         }
     }
 
-    match read_text(&snap.handle) {
-        Ok(actual) if actual == expected => Ok(()),
+    match read_at(&snap.handle, snap, expected_len_utf16) {
+        Ok(actual) if actual == expected_window => Ok(()),
         Ok(_) => Err(format!(
             "{name} didn't accept the replacement text (AXError {}).",
             AXError::Failure.0
@@ -512,6 +644,24 @@ pub(crate) fn replace_range(
         Err(error) => Err(format!(
             "{name} didn't accept the replacement text ({error})."
         )),
+    }
+}
+
+/// Reads `[snap.window_start_utf16, + len_utf16)` via a partial read,
+/// falling back to a whole-field read when the snapshot covers the whole
+/// field but the app has no partial-read support.
+pub(crate) fn read_at(
+    handle: &PlatformHandle,
+    snap: &FieldSnapshot,
+    len_utf16: usize,
+) -> Result<String, String> {
+    match read_window(handle, snap.window_start_utf16, len_utf16) {
+        Ok(actual) => Ok(actual),
+        Err(window_error) if covers_whole_field(snap) => match read_text(handle) {
+            Ok(actual) => Ok(actual),
+            Err(_) => Err(window_error),
+        },
+        Err(error) => Err(error),
     }
 }
 

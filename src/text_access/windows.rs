@@ -194,11 +194,16 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
         None => return Ok(None),
     };
 
+    // Bounded reads are a later round on Windows; the snapshot covers the
+    // whole field, so the whole-field write fallback stays allowed.
+    let field_len_utf16 = super::utf16_len(&text);
     Ok(Some(FieldSnapshot {
         pid,
         text,
         caret,
         caret_rect,
+        window_start_utf16: 0,
+        field_len_utf16,
         handle: PlatformHandle { element },
     }))
 }

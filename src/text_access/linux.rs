@@ -134,6 +134,7 @@ async fn focused_field_async() -> Result<Option<FieldSnapshot>, String> {
     if pid != 0 && pid == std::process::id() {
         return Ok(None);
     }
+    let field_len_utf16 = super::utf16_len(&text);
     Ok(Some(FieldSnapshot {
         pid,
         text,
@@ -145,6 +146,10 @@ async fn focused_field_async() -> Result<Option<FieldSnapshot>, String> {
             height: height as f64,
             physical: false,
         },
+        // Bounded reads are a later round on Linux; the snapshot covers the
+        // whole field, so the whole-field write fallback stays allowed.
+        window_start_utf16: 0,
+        field_len_utf16,
         handle: PlatformHandle { object },
     }))
 }
