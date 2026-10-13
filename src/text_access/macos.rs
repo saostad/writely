@@ -16,7 +16,8 @@ use objc2_core_foundation::{
 
 use super::{
     char_to_utf16_offset, covers_whole_field, replaced_text, utf16_len, utf16_to_char_offset,
-    window_for_caret, CaretInfo, CaretRect, FieldSnapshot, WHOLE_READ_LIMIT_UTF16,
+    window_for_caret, window_for_selection, CaretInfo, CaretRect, FieldSnapshot,
+    WHOLE_READ_LIMIT_UTF16,
 };
 
 pub(crate) struct PlatformHandle {
@@ -339,24 +340,49 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
     } else {
         selected.location as usize
     };
+    let sel_len_utf16 = if selected.length < 0 {
+        0usize
+    } else {
+        selected.length as usize
+    };
+    let sel_end_utf16 = caret_utf16.saturating_add(sel_len_utf16);
     let pid_u32 = pid as u32;
 
     // Bounded read: only a window of text around the caret, never the whole
-    // document on keystroke-adjacent paths.
+    // document on keystroke-adjacent paths. When there is a selection the
+    // window covers the whole selection.
     let total_utf16 = match number_of_characters(&element) {
         Ok(total) => total,
         // Fields without a length attribute fall back to the legacy whole
         // read below.
         Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
-            return whole_field_snapshot(element, pid_u32, caret_utf16);
+            return whole_field_snapshot(element, pid_u32, caret_utf16, sel_len_utf16);
         }
         Err(error) => return Err(read_error(error)),
     };
-    let (start, len) = window_for_caret(caret_utf16, total_utf16);
+    let sel_end_clamped = sel_end_utf16.min(total_utf16);
+    let sel_start_clamped = caret_utf16.min(total_utf16);
+    let (start, len) = if sel_len_utf16 > 0 {
+        window_for_selection(sel_start_clamped, sel_end_clamped, total_utf16)
+    } else {
+        window_for_caret(sel_start_clamped, total_utf16)
+    };
     match string_for_range(&element, start, len) {
         Ok(window) => {
-            let caret = utf16_to_char_offset(&window, caret_utf16.saturating_sub(start));
-            let Some(caret_rect) = caret_rect(&element, caret_utf16) else {
+            let caret = utf16_to_char_offset(&window, sel_start_clamped.saturating_sub(start));
+            let selection = if sel_len_utf16 > 0 {
+                let sel_start =
+                    utf16_to_char_offset(&window, sel_start_clamped.saturating_sub(start));
+                let sel_end = utf16_to_char_offset(&window, sel_end_clamped.saturating_sub(start));
+                if sel_start != sel_end {
+                    Some(sel_start..sel_end)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some(caret_rect) = caret_rect(&element, sel_start_clamped) else {
                 log_no_caret_once(pid_u32);
                 return Ok(None);
             };
@@ -365,6 +391,7 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
                 text: window,
                 caret,
                 caret_rect,
+                selection,
                 window_start_utf16: start,
                 field_len_utf16: total_utf16,
                 handle: PlatformHandle { element },
@@ -376,7 +403,7 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
             if total_utf16 > WHOLE_READ_LIMIT_UTF16 {
                 return Err("This text field is too large for Writely.".to_string());
             }
-            whole_field_snapshot(element, pid_u32, caret_utf16)
+            whole_field_snapshot(element, pid_u32, sel_start_clamped, sel_len_utf16)
         }
         Err(error) => Err(read_error(error)),
     }
@@ -388,6 +415,7 @@ fn whole_field_snapshot(
     element: CFRetained<AXUIElement>,
     pid: u32,
     caret_utf16: usize,
+    sel_len_utf16: usize,
 ) -> Result<Option<FieldSnapshot>, String> {
     let text = match copy_string(&element, "AXValue") {
         Ok(Some(text)) => text,
@@ -398,6 +426,18 @@ fn whole_field_snapshot(
         Err(error) => return Err(read_error(error)),
     };
     let caret = utf16_to_char_offset(&text, caret_utf16);
+    let selection = if sel_len_utf16 > 0 {
+        let sel_end_utf16 = caret_utf16.saturating_add(sel_len_utf16);
+        let sel_start = utf16_to_char_offset(&text, caret_utf16);
+        let sel_end = utf16_to_char_offset(&text, sel_end_utf16);
+        if sel_start != sel_end {
+            Some(sel_start..sel_end)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let Some(caret_rect) = caret_rect(&element, caret_utf16) else {
         log_no_caret_once(pid);
         return Ok(None);
@@ -408,6 +448,7 @@ fn whole_field_snapshot(
         text,
         caret,
         caret_rect,
+        selection,
         window_start_utf16: 0,
         field_len_utf16,
         handle: PlatformHandle { element },

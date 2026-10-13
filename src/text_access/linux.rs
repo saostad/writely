@@ -116,6 +116,29 @@ async fn focused_field_async() -> Result<Option<FieldSnapshot>, String> {
     let char_count = text.chars().count();
     let caret = (caret_offset.max(0) as usize).min(char_count);
 
+    // The first selection, when there is one. A failure to read it is an
+    // error for the popup, not a silent "no selection".
+    let selection = {
+        let n = text_proxy.get_n_selections().await.map_err(read_error)?;
+        if n > 0 {
+            let (raw_start, raw_end) = text_proxy.get_selection(0).await.map_err(read_error)?;
+            let start = (raw_start.max(0) as usize).min(char_count);
+            let end = (raw_end.max(0) as usize).min(char_count);
+            let (start, end) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            if end > start {
+                Some(start..end)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     let (x, y, width, height) = match text_proxy
         .get_character_extents(caret_offset, CoordType::Screen)
         .await
@@ -146,6 +169,7 @@ async fn focused_field_async() -> Result<Option<FieldSnapshot>, String> {
             height: height as f64,
             physical: false,
         },
+        selection,
         // Bounded reads are a later round on Linux; the snapshot covers the
         // whole field, so the whole-field write fallback stays allowed.
         window_start_utf16: 0,

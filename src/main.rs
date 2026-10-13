@@ -117,26 +117,58 @@ fn handle_icon_clicked(
         return;
     };
     let anchor = live_anchor.or(Some(snap.caret_rect));
-    let (range, sentence) = match text_access::sentence::sentence_range(&snap.text, snap.caret) {
-        Some(range) => {
-            let sentence: String = snap
-                .text
-                .chars()
-                .skip(range.start)
-                .take(range.end - range.start)
-                .collect();
-            (range, sentence)
+    // A non-empty selection is checked (and replaced) as a whole; otherwise
+    // the sentence at the caret is used.
+    let mut selection_use: Option<(Range<usize>, String)> = None;
+    if let Some(sel) = snap.selection.clone() {
+        match text_access::check_selection(&snap.text, sel) {
+            text_access::CheckedSelection::TooLong => {
+                show_popup(
+                    text_access::SELECTION_TOO_LONG_MESSAGE,
+                    false,
+                    false,
+                    anchor,
+                    None,
+                    last_anchor,
+                );
+                return;
+            }
+            text_access::CheckedSelection::Use(range) => {
+                let sentence: String = snap
+                    .text
+                    .chars()
+                    .skip(range.start)
+                    .take(range.end - range.start)
+                    .collect();
+                selection_use = Some((range, sentence));
+            }
+            text_access::CheckedSelection::Fallback => {}
         }
-        None => {
-            show_popup(
-                "Type a sentence first.",
-                false,
-                false,
-                anchor,
-                None,
-                last_anchor,
-            );
-            return;
+    }
+    let (range, sentence) = if let Some(use_range) = selection_use {
+        use_range
+    } else {
+        match text_access::sentence::sentence_range(&snap.text, snap.caret) {
+            Some(range) => {
+                let sentence: String = snap
+                    .text
+                    .chars()
+                    .skip(range.start)
+                    .take(range.end - range.start)
+                    .collect();
+                (range, sentence)
+            }
+            None => {
+                show_popup(
+                    "Type a sentence first.",
+                    false,
+                    false,
+                    anchor,
+                    None,
+                    last_anchor,
+                );
+                return;
+            }
         }
     };
     if sentence.trim().is_empty() {

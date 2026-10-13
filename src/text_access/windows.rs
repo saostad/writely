@@ -164,26 +164,40 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
     let document = pattern.get_document_range().map_err(read_error)?;
     let text = document.get_text(-1).map_err(read_error)?;
 
-    let caret = match pattern.get_selection() {
-        Ok(selections) => match selections.into_iter().next() {
+    // The first selection range gives both the caret (its start) and the
+    // selection (start..end). A failure to read it is an error for the
+    // popup, not a silent "no selection".
+    let (caret, selection) = match pattern.get_selection().map_err(read_error)? {
+        selections => match selections.into_iter().next() {
             Some(selection) => {
-                let before = document.clone();
-                before
+                let before_start = document.clone();
+                before_start
                     .move_endpoint_by_range(
                         TextPatternRangeEndpoint::End,
                         &selection,
                         TextPatternRangeEndpoint::Start,
                     )
                     .map_err(read_error)?;
-                let before_text = before.get_text(-1).map_err(read_error)?;
-                before_text.chars().count()
+                let start_text = before_start.get_text(-1).map_err(read_error)?;
+                let start = start_text.chars().count();
+                let before_end = document.clone();
+                before_end
+                    .move_endpoint_by_range(
+                        TextPatternRangeEndpoint::End,
+                        &selection,
+                        TextPatternRangeEndpoint::End,
+                    )
+                    .map_err(read_error)?;
+                let end_text = before_end.get_text(-1).map_err(read_error)?;
+                let end = end_text.chars().count();
+                let char_count = text.chars().count();
+                let start = start.min(char_count);
+                let end = end.min(char_count);
+                let range = if end > start { Some(start..end) } else { None };
+                (start, range)
             }
-            None => 0,
+            None => (0, None),
         },
-        Err(error) => {
-            eprintln!("Writely: could not read the caret position on Windows: {error}");
-            0
-        }
     };
 
     // The caret rectangle comes from the foreground thread / UIA caret range
@@ -202,6 +216,7 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
         text,
         caret,
         caret_rect,
+        selection,
         window_start_utf16: 0,
         field_len_utf16,
         handle: PlatformHandle { element },

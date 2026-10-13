@@ -38,6 +38,9 @@ pub struct FieldSnapshot {
     /// Char index of the caret (insertion position) into `text`.
     pub caret: usize,
     pub caret_rect: CaretRect,
+    /// Char-index range of the current selection into `text`, `Some` only
+    /// for a non-empty selection.
+    pub selection: Option<Range<usize>>,
     /// UTF-16 offset of the start of `text` in the field. `text` is a
     /// bounded window around the caret, not the whole field.
     pub window_start_utf16: usize,
@@ -48,6 +51,13 @@ pub struct FieldSnapshot {
 
 /// UTF-16 units read on each side of the caret for the snapshot window.
 pub(crate) const WINDOW_RADIUS_UTF16: usize = 1000;
+
+/// Longest selection (in characters) that gets checked in one click.
+pub const MAX_SELECTION_CHARS: usize = 2000;
+
+/// Shown when the trimmed selection exceeds `MAX_SELECTION_CHARS`.
+pub const SELECTION_TOO_LONG_MESSAGE: &str =
+    "That selection is too long. Select up to 2,000 characters and try again.";
 
 /// Whole-field reads above this many UTF-16 units are refused.
 pub(crate) const WHOLE_READ_LIMIT_UTF16: usize = 20_000;
@@ -69,6 +79,58 @@ pub(crate) fn window_for_caret(caret_utf16: usize, total_utf16: usize) -> (usize
     let start = caret_utf16.saturating_sub(WINDOW_RADIUS_UTF16);
     let end = (caret_utf16 + WINDOW_RADIUS_UTF16).min(total_utf16);
     (start, end.saturating_sub(start))
+}
+
+/// The UTF-16 window covering the whole selection plus `WINDOW_RADIUS_UTF16`
+/// units on each side, clamped to a field of `total_utf16` units.
+pub(crate) fn window_for_selection(
+    sel_start_utf16: usize,
+    sel_end_utf16: usize,
+    total_utf16: usize,
+) -> (usize, usize) {
+    let start = sel_start_utf16.saturating_sub(WINDOW_RADIUS_UTF16);
+    let end = sel_end_utf16
+        .saturating_add(WINDOW_RADIUS_UTF16)
+        .min(total_utf16);
+    (start, end.saturating_sub(start))
+}
+
+/// What a click should check for the given selection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckedSelection {
+    /// Check (and later replace) this trimmed char range.
+    Use(Range<usize>),
+    /// The selection is empty or only whitespace: fall back to the sentence
+    /// at the caret.
+    Fallback,
+    /// The trimmed selection exceeds `MAX_SELECTION_CHARS`: show
+    /// `SELECTION_TOO_LONG_MESSAGE` and send nothing.
+    TooLong,
+}
+
+/// Trims whitespace from both ends of `selection` (char indices into `text`)
+/// and applies the length limit.
+pub fn check_selection(text: &str, selection: Range<usize>) -> CheckedSelection {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut start = selection.start.min(len);
+    let mut end = selection.end.min(len);
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
+    }
+    while start < end && chars[start].is_whitespace() {
+        start += 1;
+    }
+    while end > start && chars[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    if start >= end {
+        return CheckedSelection::Fallback;
+    }
+    if end - start > MAX_SELECTION_CHARS {
+        return CheckedSelection::TooLong;
+    }
+    CheckedSelection::Use(start..end)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -233,8 +295,8 @@ fn read_current_text(snap: &FieldSnapshot) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        char_to_utf16_offset, replaced_text, utf16_len, utf16_to_char_offset, window_for_caret,
-        WINDOW_RADIUS_UTF16,
+        char_to_utf16_offset, check_selection, replaced_text, utf16_len, utf16_to_char_offset,
+        window_for_caret, CheckedSelection, MAX_SELECTION_CHARS,
     };
 
     #[test]
@@ -264,7 +326,7 @@ mod tests {
     fn window_clamps_at_start() {
         let (start, len) = window_for_caret(10, 5000);
         assert_eq!(start, 0);
-        assert_eq!(len, 10 + WINDOW_RADIUS_UTF16);
+        assert_eq!(len, 10 + super::WINDOW_RADIUS_UTF16);
     }
 
     #[test]
@@ -272,7 +334,7 @@ mod tests {
         let total = 5000;
         let caret = 4990;
         let (start, len) = window_for_caret(caret, total);
-        assert_eq!(start, caret - WINDOW_RADIUS_UTF16);
+        assert_eq!(start, caret - super::WINDOW_RADIUS_UTF16);
         assert_eq!(start + len, total);
         assert!(start <= caret && caret <= start + len);
     }
@@ -281,8 +343,8 @@ mod tests {
     fn window_centred_on_caret() {
         let caret = 3000;
         let (start, len) = window_for_caret(caret, 9000);
-        assert_eq!(start, caret - WINDOW_RADIUS_UTF16);
-        assert_eq!(len, 2 * WINDOW_RADIUS_UTF16);
+        assert_eq!(start, caret - super::WINDOW_RADIUS_UTF16);
+        assert_eq!(len, 2 * super::WINDOW_RADIUS_UTF16);
         assert!(start <= caret && caret <= start + len);
     }
 
@@ -295,7 +357,7 @@ mod tests {
         // Caret just after the emoji run, in UTF-16 units.
         let caret_utf16 = 600 * 2;
         let (start, len) = window_for_caret(caret_utf16, total);
-        assert_eq!(start, caret_utf16 - WINDOW_RADIUS_UTF16);
+        assert_eq!(start, caret_utf16 - super::WINDOW_RADIUS_UTF16);
         assert!(start <= caret_utf16 && caret_utf16 <= start + len);
         // The window slice decoded from UTF-16 maps the caret to the same
         // char index as the full text does.
@@ -311,5 +373,79 @@ mod tests {
         // A UTF-16 offset landing inside a surrogate pair clamps forward to
         // the next char boundary instead of splitting the emoji.
         assert_eq!(utf16_to_char_offset(&text, 1), 1);
+    }
+
+    #[test]
+    fn selection_uses_trimmed_multi_sentence_range() {
+        let text = "No notification needed for this repo. Are you ready? Today are a good day.";
+        // Select all three sentences with extra surrounding whitespace.
+        let start = text.find("No notification").expect("fixture contains text");
+        let start_chars = text[..start].chars().count();
+        let selection = start_chars.saturating_sub(2)..text.chars().count();
+        let checked = check_selection(text, selection);
+        let expected_start: usize = text
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count()
+            .min(start_chars);
+        match checked {
+            CheckedSelection::Use(range) => {
+                let got: String = text
+                    .chars()
+                    .skip(range.start)
+                    .take(range.end - range.start)
+                    .collect();
+                assert_eq!(
+                    got,
+                    "No notification needed for this repo. Are you ready? Today are a good day."
+                );
+                assert_eq!(range.start, expected_start);
+            }
+            other => panic!("expected Use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selection_trims_surrounding_whitespace() {
+        let text = "  She go to school.  ";
+        let checked = check_selection(text, 0..text.chars().count());
+        match checked {
+            CheckedSelection::Use(range) => {
+                let got: String = text
+                    .chars()
+                    .skip(range.start)
+                    .take(range.end - range.start)
+                    .collect();
+                assert_eq!(got, "She go to school.");
+            }
+            other => panic!("expected Use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whitespace_only_selection_falls_back_to_sentence() {
+        let text = "First sentence.   Second sentence here.";
+        // A selection covering only the whitespace between the sentences.
+        let first_end = text.find('.').expect("fixture has a period") + 1;
+        let first_end_chars = text[..first_end].chars().count();
+        let checked = check_selection(text, first_end_chars..first_end_chars + 3);
+        assert_eq!(checked, CheckedSelection::Fallback);
+        assert_eq!(check_selection(text, 0..0), CheckedSelection::Fallback);
+    }
+
+    #[test]
+    fn too_long_selection_is_rejected() {
+        let text = "a".repeat(MAX_SELECTION_CHARS + 500);
+        assert_eq!(
+            check_selection(&text, 0..text.chars().count()),
+            CheckedSelection::TooLong
+        );
+        let ok_text = "b".repeat(MAX_SELECTION_CHARS);
+        match check_selection(&ok_text, 0..ok_text.chars().count()) {
+            CheckedSelection::Use(range) => {
+                assert_eq!(range.end - range.start, MAX_SELECTION_CHARS)
+            }
+            other => panic!("expected Use at the limit, got {other:?}"),
+        }
     }
 }

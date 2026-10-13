@@ -3,7 +3,7 @@ use std::time::Duration;
 
 pub const GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 
-const SYSTEM_INSTRUCTION: &str = "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged.";
+const SYSTEM_INSTRUCTION: &str = "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged. Keep line breaks and paragraph breaks as they are.";
 
 pub fn build_request_body(sentence: &str) -> serde_json::Value {
     serde_json::json!({
@@ -139,7 +139,7 @@ mod tests {
         let body = build_request_body("She go to school.");
         assert_eq!(
             body["systemInstruction"]["parts"][0]["text"],
-            "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged."
+            "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged. Keep line breaks and paragraph breaks as they are."
         );
         assert_eq!(body["contents"][0]["parts"][0]["text"], "She go to school.");
         assert_eq!(body["generationConfig"]["temperature"], 0);
