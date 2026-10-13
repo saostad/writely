@@ -20,6 +20,7 @@ use crate::text_access::macos_helpers;
 use crate::UserEvent;
 
 static PENDING: AtomicBool = AtomicBool::new(false);
+static FOCUS_DIRTY: AtomicBool = AtomicBool::new(false);
 static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
 
 fn flag_caret_changed() {
@@ -42,9 +43,14 @@ pub fn clear_pending() {
 unsafe extern "C-unwind" fn ax_callback(
     _observer: NonNull<AXObserver>,
     _element: NonNull<AXUIElement>,
-    _notification: NonNull<CFString>,
+    notification: NonNull<CFString>,
     _refcon: *mut c_void,
 ) {
+    // SAFETY: the notification is a valid CFString for the duration of the call.
+    let name: &CFString = unsafe { notification.as_ref() };
+    if name.to_string() == "AXFocusedUIElementChanged" {
+        FOCUS_DIRTY.store(true, Ordering::SeqCst);
+    }
     flag_caret_changed();
 }
 
@@ -122,7 +128,9 @@ fn refresh_focused_registration(inner: &mut Inner) {
         }
     };
     if let (Some(existing), Some(new)) = (&inner.focused_element, &new_focused) {
-        if CFRetained::as_ptr(existing) == CFRetained::as_ptr(new) {
+        // PartialEq on AXUIElement is CFEqual, not a pointer comparison: AX hands
+        // back a new reference on every read of the same element.
+        if existing == new {
             return;
         }
     }
@@ -238,7 +246,7 @@ fn setup_for_pid(pid: u32) {
         inner.observer = Some(observer);
         inner.app_element = Some(app_element);
         inner.app_pid = pid;
-        refresh_focused_registration(inner);
+        FOCUS_DIRTY.store(true, Ordering::SeqCst);
         flag_caret_changed();
     });
 }
@@ -302,11 +310,13 @@ impl WatcherInner {
 
     pub fn handle_caret_changed(&mut self) {
         clear_pending();
-        INNER.with(|cell| {
-            if let Some(inner) = cell.borrow_mut().as_mut() {
-                refresh_focused_registration(inner);
-            }
-        });
+        if FOCUS_DIRTY.swap(false, Ordering::SeqCst) {
+            INNER.with(|cell| {
+                if let Some(inner) = cell.borrow_mut().as_mut() {
+                    refresh_focused_registration(inner);
+                }
+            });
+        }
     }
 }
 
