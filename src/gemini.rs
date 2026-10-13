@@ -1,12 +1,10 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-#[allow(dead_code)]
 pub const GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 
 const SYSTEM_INSTRUCTION: &str = "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged.";
 
-#[allow(dead_code)]
 pub fn build_request_body(sentence: &str) -> serde_json::Value {
     serde_json::json!({
         "systemInstruction": {
@@ -19,7 +17,6 @@ pub fn build_request_body(sentence: &str) -> serde_json::Value {
     })
 }
 
-#[allow(dead_code)]
 pub fn parse_response(status: u16, body: &str) -> Result<String, String> {
     if !(200..300).contains(&status) {
         let detail = serde_json::from_str::<serde_json::Value>(body)
@@ -108,7 +105,6 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
-#[allow(dead_code)]
 pub fn suggest(api_key: &str, sentence: &str) -> Result<String, String> {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
