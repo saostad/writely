@@ -1,10 +1,30 @@
 use std::ops::Range;
+use std::sync::Mutex;
 
 use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::proxy_ext::ProxyExt;
-use atspi::{AccessibilityConnection, CoordType, ObjectRefOwned, Role, State};
+use atspi::{AccessibilityConnection, CoordType, ObjectRefOwned, Role};
 
 use super::{replaced_text, CaretInfo, CaretRect, FieldSnapshot};
+
+/// The focused accessible from the watcher's focus/caret events.
+/// `focused_field` reads this instead of walking the registry tree, so a
+/// burst of keystrokes never triggers a full tree scan.
+static FOCUSED: Mutex<Option<ObjectRefOwned>> = Mutex::new(None);
+
+pub(crate) fn set_focused(object: Option<ObjectRefOwned>) {
+    match FOCUSED.lock() {
+        Ok(mut guard) => *guard = object,
+        Err(poisoned) => *poisoned.into_inner() = object,
+    }
+}
+
+fn take_focused() -> Option<ObjectRefOwned> {
+    match FOCUSED.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
 
 pub(crate) struct PlatformHandle {
     object: ObjectRefOwned,
@@ -53,99 +73,67 @@ async fn pid_for(conn: &AccessibilityConnection, element: &AccessibleProxy<'_>) 
 }
 
 async fn focused_field_async() -> Result<Option<FieldSnapshot>, String> {
+    let Some(object) = take_focused() else {
+        return Ok(None);
+    };
     let conn = AccessibilityConnection::new().await.map_err(read_error)?;
-    let root = conn
-        .root_accessible_on_registry()
+    let element = object
+        .as_accessible_proxy(conn.connection())
         .await
         .map_err(read_error)?;
-
-    let mut stack: Vec<AccessibleProxy<'_>> = vec![root];
-    let mut visited = 0usize;
-    while let Some(element) = stack.pop() {
-        visited += 1;
-        if visited > 4096 {
-            break;
-        }
-        let state = match element.get_state().await {
-            Ok(state) => state,
-            Err(_) => continue,
-        };
-        if state.contains(State::Focused) {
-            let role = element.get_role().await.map_err(read_error)?;
-            if role == Role::PasswordText {
-                return Ok(None);
-            }
-            let proxies = match element.proxies().await {
-                Ok(proxies) => proxies,
-                Err(_) => return Ok(None),
-            };
-            let text_proxy = match proxies.text().await {
-                Ok(text_proxy) => text_proxy,
-                Err(_) => return Ok(None),
-            };
-            let count = text_proxy.character_count().await.map_err(read_error)?;
-            let text = if count > 0 {
-                text_proxy.get_text(0, count).await.map_err(read_error)?
-            } else {
-                String::new()
-            };
-            let caret_offset = text_proxy.caret_offset().await.map_err(read_error)?;
-            let char_count = text.chars().count();
-            let caret = (caret_offset.max(0) as usize).min(char_count);
-
-            let (x, y, width, height) = match text_proxy
-                .get_character_extents(caret_offset, CoordType::Screen)
-                .await
-            {
-                Ok(extents) => extents,
-                Err(_) if caret_offset > 0 => {
-                    let (px, py, pwidth, pheight) = text_proxy
-                        .get_character_extents(caret_offset - 1, CoordType::Screen)
-                        .await
-                        .map_err(read_error)?;
-                    (px + pwidth, py, 0, pheight)
-                }
-                Err(error) => return Err(read_error(error)),
-            };
-            let pid = pid_for(&conn, &element).await;
-            if pid != 0 && pid == std::process::id() {
-                return Ok(None);
-            }
-            let object = ObjectRefOwned::try_from(&element).map_err(read_error)?;
-            return Ok(Some(FieldSnapshot {
-                pid,
-                text,
-                caret,
-                caret_rect: CaretRect {
-                    x: x as f64,
-                    y: y as f64,
-                    width: width as f64,
-                    height: height as f64,
-                    physical: false,
-                },
-                handle: PlatformHandle { object },
-            }));
-        }
-        match element.get_children().await {
-            Ok(children) => {
-                for child in children {
-                    if child.is_null() {
-                        continue;
-                    }
-                    match child.as_accessible_proxy(conn.connection()).await {
-                        Ok(child_proxy) => stack.push(child_proxy),
-                        Err(error) => {
-                            eprintln!("Writely: could not read a text field on Linux: {error}");
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                eprintln!("Writely: could not list text fields on Linux: {error}");
-            }
-        }
+    let role = element.get_role().await.map_err(read_error)?;
+    if role == Role::PasswordText {
+        return Ok(None);
     }
-    Ok(None)
+    let proxies = match element.proxies().await {
+        Ok(proxies) => proxies,
+        Err(_) => return Ok(None),
+    };
+    let text_proxy = match proxies.text().await {
+        Ok(text_proxy) => text_proxy,
+        Err(_) => return Ok(None),
+    };
+    let count = text_proxy.character_count().await.map_err(read_error)?;
+    let text = if count > 0 {
+        text_proxy.get_text(0, count).await.map_err(read_error)?
+    } else {
+        String::new()
+    };
+    let caret_offset = text_proxy.caret_offset().await.map_err(read_error)?;
+    let char_count = text.chars().count();
+    let caret = (caret_offset.max(0) as usize).min(char_count);
+
+    let (x, y, width, height) = match text_proxy
+        .get_character_extents(caret_offset, CoordType::Screen)
+        .await
+    {
+        Ok(extents) => extents,
+        Err(_) if caret_offset > 0 => {
+            let (px, py, pwidth, pheight) = text_proxy
+                .get_character_extents(caret_offset - 1, CoordType::Screen)
+                .await
+                .map_err(read_error)?;
+            (px + pwidth, py, 0, pheight)
+        }
+        Err(error) => return Err(read_error(error)),
+    };
+    let pid = pid_for(&conn, &element).await;
+    if pid != 0 && pid == std::process::id() {
+        return Ok(None);
+    }
+    Ok(Some(FieldSnapshot {
+        pid,
+        text,
+        caret,
+        caret_rect: CaretRect {
+            x: x as f64,
+            y: y as f64,
+            width: width as f64,
+            height: height as f64,
+            physical: false,
+        },
+        handle: PlatformHandle { object },
+    }))
 }
 
 async fn read_text_async(handle: &PlatformHandle) -> Result<String, String> {

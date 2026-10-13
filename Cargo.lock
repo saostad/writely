@@ -3206,6 +3206,7 @@ version = "0.1.0"
 dependencies = [
  "atspi",
  "block2",
+ "futures-lite",
  "gtk",
  "keyring",
  "objc2",

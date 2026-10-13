@@ -64,7 +64,10 @@ uiautomation = "0.25"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_System_Com",
     "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_UI_Accessibility",
     "Win32_UI_Controls",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
@@ -72,6 +75,7 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 atspi = { version = "0.30", features = ["zbus"] }
+futures-lite = "2"
 pollster = "0.4"
 gtk = "0.18"
 
