@@ -1,5 +1,9 @@
+#[cfg(target_os = "macos")]
+mod macos;
+
 const SERVICE: &str = "writely";
 const USER: &str = "gemini-api-key";
+pub(crate) const API_KEY_PAGE: &str = "https://aistudio.google.com/apikey";
 
 pub fn validate_api_key(key: &str) -> Result<String, String> {
     let trimmed = key.trim();
@@ -52,8 +56,14 @@ pub fn has_api_key() -> Result<bool, String> {
 }
 
 pub fn show_settings() -> Result<(), String> {
-    eprintln!("Writely: Settings window is not available yet.");
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        macos::show_settings()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Could not open the settings window: this platform is not supported yet.".to_string())
+    }
 }
 
 #[cfg(test)]
