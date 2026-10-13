@@ -53,14 +53,8 @@ pub fn remove_api_key() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn has_api_key() -> bool {
-    match load_api_key() {
-        Ok(key) => key.is_some(),
-        Err(e) => {
-            eprintln!("Writely: {e}");
-            false
-        }
-    }
+pub fn has_api_key() -> Result<bool, String> {
+    load_api_key().map(|key| key.is_some())
 }
 
 #[tauri::command]
