@@ -12,7 +12,9 @@ use objc2_core_foundation::{
     CFString, CFType, CGPoint, CGRect, CGSize, Type,
 };
 
-use super::{char_to_utf16_offset, replaced_text, utf16_to_char_offset, CaretRect, FieldSnapshot};
+use super::{
+    char_to_utf16_offset, replaced_text, utf16_to_char_offset, CaretInfo, CaretRect, FieldSnapshot,
+};
 
 pub(crate) struct PlatformHandle {
     element: CFRetained<AXUIElement>,
@@ -35,7 +37,7 @@ fn read_error(error: AXError) -> String {
     }
 }
 
-fn set_messaging_timeout(element: &AXUIElement) {
+pub(crate) fn set_messaging_timeout(element: &AXUIElement) {
     // SAFETY: element is a valid AXUIElement and the timeout is positive.
     let error = unsafe { element.set_messaging_timeout(0.25) };
     if error != AXError::Success {
@@ -46,7 +48,7 @@ fn set_messaging_timeout(element: &AXUIElement) {
     }
 }
 
-fn copy_attr(element: &AXUIElement, name: &str) -> Result<CFRetained<CFType>, AXError> {
+pub(crate) fn copy_attr(element: &AXUIElement, name: &str) -> Result<CFRetained<CFType>, AXError> {
     let attr = CFString::from_str(name);
     let mut raw: *const CFType = std::ptr::null();
     let out = NonNull::from(&mut raw);
@@ -277,6 +279,66 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
         caret,
         caret_rect,
         handle: PlatformHandle { element },
+    }))
+}
+
+pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
+    // SAFETY: creating the system-wide element is a plain FFI call with no arguments.
+    let system = unsafe { AXUIElement::new_system_wide() };
+    set_messaging_timeout(&system);
+    let focused = match copy_attr(&system, "AXFocusedUIElement") {
+        Ok(value) => value,
+        Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
+            return Ok(None);
+        }
+        Err(error) => return Err(read_error(error)),
+    };
+    let element_ref: &AXUIElement = {
+        let ptr = CFRetained::as_ptr(&focused).cast::<AXUIElement>();
+        // SAFETY: AXFocusedUIElement yields an AXUIElement valid while focused is alive.
+        unsafe { ptr.as_ref() }
+    };
+    let element: CFRetained<AXUIElement> = element_ref.retain();
+    set_messaging_timeout(&element);
+
+    let mut pid: i32 = 0;
+    let pid_out = NonNull::from(&mut pid);
+    // SAFETY: pid_out points at a writable i32 for the duration of the call.
+    let pid_error = unsafe { element.pid(pid_out) };
+    if pid_error != AXError::Success {
+        return Err(read_error(pid_error));
+    }
+    if pid < 0 || pid as u32 == std::process::id() {
+        return Ok(None);
+    }
+
+    match copy_string(&element, "AXSubrole") {
+        Ok(Some(subrole)) if subrole == "AXSecureTextField" => return Ok(None),
+        Ok(_) => {}
+        Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {}
+        Err(error) => return Err(read_error(error)),
+    }
+
+    let range_value = match copy_ax_value(&element, "AXSelectedTextRange") {
+        Ok(value) => value,
+        Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
+            return Ok(None);
+        }
+        Err(error) => return Err(read_error(error)),
+    };
+    let selected = match ax_range(&range_value) {
+        Some(range) => range,
+        None => return Err(read_error(AXError::Failure)),
+    };
+    let caret_utf16 = if selected.location < 0 {
+        0usize
+    } else {
+        selected.location as usize
+    };
+    let rect = caret_rect(&element, caret_utf16)?;
+    Ok(Some(CaretInfo {
+        pid: pid as u32,
+        caret_rect: rect,
     }))
 }
 

@@ -20,13 +20,22 @@ block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    "libc",
     "NSApplication",
+    "NSBitmapImageRep",
     "NSButton",
     "NSColor",
     "NSControl",
+    "NSGraphics",
+    "NSImage",
+    "NSImageRep",
+    "NSImageView",
     "NSMenu",
     "NSMenuItem",
+    "NSPanel",
     "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
     "NSSecureTextField",
     "NSTextField",
     "NSView",
@@ -35,7 +44,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
+    "NSArray",
+    "NSDictionary",
     "NSNotification",
+    "NSOperation",
     "NSObject",
     "NSRunLoop",
     "NSString",

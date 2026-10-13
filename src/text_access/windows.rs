@@ -4,7 +4,7 @@ use uiautomation::core::{UIAutomation, UIElement};
 use uiautomation::patterns::{UITextPattern, UIValuePattern};
 use uiautomation::types::TextPatternRangeEndpoint;
 
-use super::{replaced_text, CaretRect, FieldSnapshot};
+use super::{replaced_text, CaretInfo, CaretRect, FieldSnapshot};
 
 pub(crate) struct PlatformHandle {
     element: UIElement,
@@ -86,6 +86,16 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
         caret_rect,
         handle: PlatformHandle { element },
     }))
+}
+
+pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
+    match focused_field()? {
+        Some(snap) => Ok(Some(CaretInfo {
+            pid: snap.pid,
+            caret_rect: snap.caret_rect,
+        })),
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn read_text(handle: &PlatformHandle) -> Result<String, String> {

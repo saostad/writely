@@ -9,6 +9,22 @@ const SERVICE: &str = "writely";
 const USER: &str = "gemini-api-key";
 pub(crate) const API_KEY_PAGE: &str = "https://aistudio.google.com/apikey";
 
+static PERMISSION_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_permission_message(message: Option<String>) {
+    match PERMISSION_MESSAGE.lock() {
+        Ok(mut guard) => *guard = message,
+        Err(poisoned) => *poisoned.into_inner() = message,
+    }
+}
+
+pub fn permission_message() -> Option<String> {
+    match PERMISSION_MESSAGE.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 pub fn validate_api_key(key: &str) -> Result<String, String> {
     let trimmed = key.trim();
     if trimmed.is_empty() {
@@ -57,6 +73,18 @@ pub fn remove_api_key() -> Result<(), String> {
 
 pub fn has_api_key() -> Result<bool, String> {
     load_api_key().map(|key| key.is_some())
+}
+
+#[allow(dead_code)]
+pub fn is_settings_key_window() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::is_settings_key_window()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 pub fn show_settings() -> Result<(), String> {

@@ -217,14 +217,18 @@ pub fn show_settings() -> Result<(), String> {
     if already_open {
         STATE.with(|state| {
             if let Some(window_state) = state.borrow().as_ref() {
-                match super::has_api_key() {
-                    Ok(true) => window_state
-                        .field
-                        .setPlaceholderString(Some(&NSString::from_str("••••••••"))),
-                    Ok(false) => window_state
-                        .field
-                        .setPlaceholderString(Some(&NSString::from_str("Paste your key here"))),
-                    Err(error) => set_status(&window_state.status, &error, true),
+                if let Some(message) = super::permission_message() {
+                    set_status(&window_state.status, &message, true);
+                } else {
+                    match super::has_api_key() {
+                        Ok(true) => window_state
+                            .field
+                            .setPlaceholderString(Some(&NSString::from_str("••••••••"))),
+                        Ok(false) => window_state
+                            .field
+                            .setPlaceholderString(Some(&NSString::from_str("Paste your key here"))),
+                        Err(error) => set_status(&window_state.status, &error, true),
+                    }
                 }
                 NSApplication::sharedApplication(mtm).activate();
                 window_state.window.makeKeyAndOrderFront(None);
@@ -335,7 +339,9 @@ pub fn show_settings() -> Result<(), String> {
         NSPoint::new(20.0, 18.0),
         NSSize::new(380.0, 18.0),
     ));
-    if let Some(error) = &initial_error {
+    if let Some(message) = super::permission_message() {
+        set_status(&status_label, &message, true);
+    } else if let Some(error) = &initial_error {
         set_status(&status_label, error, true);
     }
 
@@ -367,4 +373,14 @@ pub fn show_settings() -> Result<(), String> {
     window.makeKeyAndOrderFront(None);
     window.makeFirstResponder(Some(&field));
     Ok(())
+}
+
+pub fn is_settings_key_window() -> bool {
+    STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|window_state| window_state.window.isKeyWindow())
+            .unwrap_or(false)
+    })
 }

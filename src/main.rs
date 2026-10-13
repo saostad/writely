@@ -4,6 +4,7 @@ mod gemini;
 mod settings;
 #[allow(dead_code)]
 mod text_access;
+mod watcher;
 
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -11,8 +12,10 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 #[derive(Debug)]
-enum UserEvent {
+pub enum UserEvent {
     MenuEvent(MenuEvent),
+    CaretChanged,
+    IconClicked,
 }
 
 fn main() {
@@ -30,10 +33,13 @@ fn main() {
             eprintln!("Writely: could not deliver the tray menu event: {error}");
         }
     }));
+    let watcher_proxy = event_loop.create_proxy();
 
     let mut tray_icon: Option<TrayIcon> = None;
     let mut settings_id = tray_icon::menu::MenuId::new("settings");
     let mut quit_id = tray_icon::menu::MenuId::new("quit");
+    let mut caret_watcher: Option<watcher::Watcher> = None;
+    let mut last_caret_error: Option<String> = None;
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -79,6 +85,40 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
+
+                if watcher::is_wayland_without_x11() {
+                    eprintln!("Writely: {}", watcher::WAYLAND_MESSAGE);
+                    settings::set_permission_message(Some(watcher::WAYLAND_MESSAGE.to_string()));
+                    if let Some(tray) = &tray_icon {
+                        if let Err(error) = tray.set_tooltip(Some(watcher::WAYLAND_MESSAGE)) {
+                            eprintln!("Writely: could not update the tray tooltip: {error}");
+                        }
+                    }
+                } else {
+                    match text_access::check_permission(true) {
+                        Ok(()) => match watcher::Watcher::start(watcher_proxy.clone()) {
+                            Ok(watcher) => {
+                                caret_watcher = Some(watcher);
+                            }
+                            Err(error) => {
+                                eprintln!("Writely: {error}");
+                            }
+                        },
+                        Err(error) => {
+                            eprintln!("Writely: {error}");
+                            settings::set_permission_message(Some(error));
+                            if let Some(tray) = &tray_icon {
+                                if let Err(tooltip_error) = tray.set_tooltip(Some(
+                                    "Writely needs Accessibility permission — see Settings",
+                                )) {
+                                    eprintln!(
+                                        "Writely: could not update the tray tooltip: {tooltip_error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Event::UserEvent(UserEvent::MenuEvent(event)) => {
                 if event.id == settings_id {
@@ -87,9 +127,30 @@ fn main() {
                     }
                 } else if event.id == quit_id {
                     drop(tray_icon.take());
+                    caret_watcher = None;
                     *control_flow = ControlFlow::Exit;
                 }
             }
+            Event::UserEvent(UserEvent::CaretChanged) => {
+                if let Some(watcher) = caret_watcher.as_mut() {
+                    watcher.handle_caret_changed();
+                }
+                match text_access::caret_info() {
+                    Ok(Some(_info)) => {
+                        last_caret_error = None;
+                    }
+                    Ok(None) => {
+                        last_caret_error = None;
+                    }
+                    Err(error) => {
+                        if last_caret_error.as_deref() != Some(error.as_str()) {
+                            eprintln!("Writely: {error}");
+                            last_caret_error = Some(error);
+                        }
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::IconClicked) => {}
             _ => {}
         }
     });

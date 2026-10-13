@@ -4,7 +4,7 @@ use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{AccessibilityConnection, CoordType, ObjectRefOwned, Role, State};
 
-use super::{replaced_text, CaretRect, FieldSnapshot};
+use super::{replaced_text, CaretInfo, CaretRect, FieldSnapshot};
 
 pub(crate) struct PlatformHandle {
     object: ObjectRefOwned,
@@ -209,6 +209,16 @@ async fn replace_range_async(
         return Err("The app didn't accept the replacement text.".to_string());
     }
     Ok(())
+}
+
+pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
+    match focused_field()? {
+        Some(snap) => Ok(Some(CaretInfo {
+            pid: snap.pid,
+            caret_rect: snap.caret_rect,
+        })),
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {

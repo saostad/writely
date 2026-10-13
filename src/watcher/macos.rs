@@ -1,0 +1,331 @@
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::ffi::c_void;
+use std::ptr::{null_mut, NonNull};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+use objc2::rc::Retained;
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2_app_kit::{NSWorkspace, NSWorkspaceDidActivateApplicationNotification};
+use objc2_application_services::{AXError, AXObserver, AXUIElement};
+use objc2_core_foundation::{
+    kCFRunLoopCommonModes, CFBoolean, CFRetained, CFRunLoop, CFString, CFType, Type,
+};
+use objc2_foundation::{NSObjectProtocol, NSOperationQueue};
+
+use tao::event_loop::EventLoopProxy;
+
+use crate::text_access::macos_helpers;
+use crate::UserEvent;
+
+static PENDING: AtomicBool = AtomicBool::new(false);
+static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
+
+fn flag_caret_changed() {
+    if !PENDING.swap(true, Ordering::SeqCst) {
+        if let Some(proxy) = PROXY.get() {
+            if proxy.send_event(UserEvent::CaretChanged).is_err() {
+                PENDING.store(false, Ordering::SeqCst);
+            }
+        } else {
+            PENDING.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+pub fn clear_pending() {
+    PENDING.store(false, Ordering::SeqCst);
+}
+
+// SAFETY: the observer, element and notification are valid AX objects for the duration of the call and refcon is unused.
+unsafe extern "C-unwind" fn ax_callback(
+    _observer: NonNull<AXObserver>,
+    _element: NonNull<AXUIElement>,
+    _notification: NonNull<CFString>,
+    _refcon: *mut c_void,
+) {
+    flag_caret_changed();
+}
+
+struct Inner {
+    observer: Option<CFRetained<AXObserver>>,
+    app_element: Option<CFRetained<AXUIElement>>,
+    app_pid: u32,
+    focused_element: Option<CFRetained<AXUIElement>>,
+    logged_manual_pids: HashSet<u32>,
+}
+
+thread_local! {
+    static INNER: RefCell<Option<Inner>> = const { RefCell::new(None) };
+    static WORKSPACE_TOKEN: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>> =
+        const { RefCell::new(None) };
+}
+
+fn focused_element_for_app(app: &AXUIElement) -> Result<Option<CFRetained<AXUIElement>>, AXError> {
+    let value = macos_helpers::copy_attr(app, "AXFocusedUIElement")?;
+    let ptr = CFRetained::as_ptr(&value).cast::<AXUIElement>();
+    // SAFETY: AXFocusedUIElement yields an AXUIElement valid while value is alive.
+    let element_ref: &AXUIElement = unsafe { ptr.as_ref() };
+    Ok(Some(element_ref.retain()))
+}
+
+fn teardown_inner(inner: &mut Inner) {
+    if let (Some(observer), Some(app)) = (&inner.observer, &inner.app_element) {
+        let notification = CFString::from_str("AXFocusedUIElementChanged");
+        // SAFETY: observer and app are valid AX objects registered above.
+        let _ = unsafe { observer.remove_notification(app, &notification) };
+    }
+    if let (Some(observer), Some(focused)) = (&inner.observer, &inner.focused_element) {
+        let selected = CFString::from_str("AXSelectedTextChanged");
+        let value = CFString::from_str("AXValueChanged");
+        // SAFETY: observer and focused are valid AX objects registered above.
+        let _ = unsafe { observer.remove_notification(focused, &selected) };
+        // SAFETY: observer and focused are valid AX objects registered above.
+        let _ = unsafe { observer.remove_notification(focused, &value) };
+    }
+    if let Some(observer) = &inner.observer {
+        // SAFETY: the observer's run loop source is valid while the observer is alive.
+        let source = unsafe { observer.run_loop_source() };
+        if let Some(run_loop) = CFRunLoop::main() {
+            // SAFETY: kCFRunLoopCommonModes is a valid run loop mode.
+            run_loop.remove_source(Some(&source), unsafe { kCFRunLoopCommonModes });
+        }
+    }
+    inner.observer = None;
+    inner.app_element = None;
+    inner.focused_element = None;
+    inner.app_pid = 0;
+}
+
+fn refresh_focused_registration(inner: &mut Inner) {
+    let (Some(observer), Some(app_element)) = (inner.observer.clone(), inner.app_element.clone())
+    else {
+        return;
+    };
+    let new_focused = match focused_element_for_app(&app_element) {
+        Ok(element) => element,
+        Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => None,
+        Err(error) => {
+            if error == AXError::CannotComplete {
+                eprintln!(
+                    "Writely: The focused app didn't respond to Writely in time (AXError {}).",
+                    error.0
+                );
+            } else {
+                eprintln!(
+                    "Writely: Could not read the focused text field: AXError {}",
+                    error.0
+                );
+            }
+            None
+        }
+    };
+    if let (Some(existing), Some(new)) = (&inner.focused_element, &new_focused) {
+        if CFRetained::as_ptr(existing) == CFRetained::as_ptr(new) {
+            return;
+        }
+    }
+    if let Some(old) = inner.focused_element.take() {
+        let selected = CFString::from_str("AXSelectedTextChanged");
+        let value = CFString::from_str("AXValueChanged");
+        // SAFETY: observer and old are valid AX objects registered above.
+        let _ = unsafe { observer.remove_notification(&old, &selected) };
+        // SAFETY: observer and old are valid AX objects registered above.
+        let _ = unsafe { observer.remove_notification(&old, &value) };
+    }
+    if let Some(new_element) = new_focused {
+        macos_helpers::set_messaging_timeout(&new_element);
+        let selected = CFString::from_str("AXSelectedTextChanged");
+        let value = CFString::from_str("AXValueChanged");
+        // SAFETY: observer and new_element are valid and refcon is unused.
+        let selected_error =
+            unsafe { observer.add_notification(&new_element, &selected, null_mut()) };
+        if selected_error != AXError::Success
+            && selected_error != AXError::NotificationAlreadyRegistered
+        {
+            eprintln!(
+                "Writely: could not watch text changes (AXError {}).",
+                selected_error.0
+            );
+        }
+        // SAFETY: observer and new_element are valid and refcon is unused.
+        let value_error = unsafe { observer.add_notification(&new_element, &value, null_mut()) };
+        if value_error != AXError::Success && value_error != AXError::NotificationAlreadyRegistered
+        {
+            eprintln!(
+                "Writely: could not watch text changes (AXError {}).",
+                value_error.0
+            );
+        }
+        inner.focused_element = Some(new_element);
+    }
+}
+
+fn setup_for_pid(pid: u32) {
+    INNER.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let inner = borrow.get_or_insert_with(|| Inner {
+            observer: None,
+            app_element: None,
+            app_pid: 0,
+            focused_element: None,
+            logged_manual_pids: HashSet::new(),
+        });
+        if inner.app_pid == pid && inner.observer.is_some() {
+            return;
+        }
+        teardown_inner(inner);
+        if pid == std::process::id() {
+            flag_caret_changed();
+            return;
+        }
+        // SAFETY: pid comes from NSWorkspace and identifies a live process.
+        let app_element = unsafe { AXUIElement::new_application(pid as i32) };
+        macos_helpers::set_messaging_timeout(&app_element);
+        let manual_attr = CFString::from_str("AXManualAccessibility");
+        let manual_value: &CFType = CFBoolean::new(true);
+        // SAFETY: app_element and manual_value are valid CF objects of the expected kinds.
+        let manual_error = unsafe { app_element.set_attribute_value(&manual_attr, manual_value) };
+        if manual_error == AXError::AttributeUnsupported {
+            // Electron apps that do not expose this attribute need no action.
+        } else if manual_error != AXError::Success && inner.logged_manual_pids.insert(pid) {
+            eprintln!(
+                "Writely: could not enable manual accessibility for pid {pid}: AXError {}",
+                manual_error.0
+            );
+        }
+        let mut raw: *mut AXObserver = null_mut();
+        let out = NonNull::from(&mut raw);
+        // SAFETY: out points at a live slot and the callback only flags a caret change.
+        let create_error = unsafe { AXObserver::create(pid as i32, Some(ax_callback), out) };
+        if create_error != AXError::Success {
+            eprintln!(
+                "Writely: could not create the Accessibility observer for pid {pid}: AXError {}",
+                create_error.0
+            );
+            return;
+        }
+        let Some(observer_ptr) = NonNull::new(raw) else {
+            eprintln!(
+                "Writely: could not create the Accessibility observer for pid {pid}: AXError {}",
+                AXError::Failure.0
+            );
+            return;
+        };
+        // SAFETY: a successful create returns a +1-retained observer owned by the caller.
+        let observer = unsafe { CFRetained::from_raw(observer_ptr) };
+        // SAFETY: the observer's run loop source is valid while the observer is alive.
+        let source = unsafe { observer.run_loop_source() };
+        if let Some(run_loop) = CFRunLoop::main() {
+            // SAFETY: kCFRunLoopCommonModes is a valid run loop mode.
+            run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
+        } else {
+            eprintln!("Writely: could not add the Accessibility observer to the main run loop.");
+            return;
+        }
+        let focus_notification = CFString::from_str("AXFocusedUIElementChanged");
+        // SAFETY: observer and app_element are valid and refcon is unused.
+        let focus_error =
+            unsafe { observer.add_notification(&app_element, &focus_notification, null_mut()) };
+        if focus_error != AXError::Success && focus_error != AXError::NotificationAlreadyRegistered
+        {
+            eprintln!(
+                "Writely: could not watch focus changes for pid {pid}: AXError {}",
+                focus_error.0
+            );
+        }
+        inner.observer = Some(observer);
+        inner.app_element = Some(app_element);
+        inner.app_pid = pid;
+        refresh_focused_registration(inner);
+        flag_caret_changed();
+    });
+}
+
+pub struct WatcherInner {
+    _private: (),
+}
+
+impl WatcherInner {
+    pub fn start(proxy: EventLoopProxy<UserEvent>) -> Result<Self, String> {
+        if PROXY.set(proxy).is_err() {
+            // A proxy is already installed; keep the first one for this process.
+        }
+        INNER.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(Inner {
+                    observer: None,
+                    app_element: None,
+                    app_pid: 0,
+                    focused_element: None,
+                    logged_manual_pids: HashSet::new(),
+                });
+            }
+        });
+        let workspace = NSWorkspace::sharedWorkspace();
+        let center = workspace.notificationCenter();
+        // SAFETY: NSWorkspaceDidActivateApplicationNotification is a framework-provided constant.
+        let name = unsafe { NSWorkspaceDidActivateApplicationNotification };
+        let queue = NSOperationQueue::mainQueue();
+        let block = block2::RcBlock::new(
+            move |_notification: NonNull<objc2_foundation::NSNotification>| {
+                let workspace = NSWorkspace::sharedWorkspace();
+                if let Some(app) = workspace.frontmostApplication() {
+                    let pid = app.processIdentifier();
+                    if pid > 0 {
+                        setup_for_pid(pid as u32);
+                    }
+                }
+            },
+        );
+        // SAFETY: the notification name and main queue are valid and the block only reads the frontmost app.
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(name),
+                None,
+                Some(&queue),
+                &block,
+            )
+        };
+        WORKSPACE_TOKEN.with(|cell| {
+            *cell.borrow_mut() = Some(token);
+        });
+        if let Some(app) = workspace.frontmostApplication() {
+            let pid = app.processIdentifier();
+            if pid > 0 {
+                setup_for_pid(pid as u32);
+            }
+        }
+        Ok(Self { _private: () })
+    }
+
+    pub fn handle_caret_changed(&mut self) {
+        clear_pending();
+        INNER.with(|cell| {
+            if let Some(inner) = cell.borrow_mut().as_mut() {
+                refresh_focused_registration(inner);
+            }
+        });
+    }
+}
+
+impl Drop for WatcherInner {
+    fn drop(&mut self) {
+        INNER.with(|cell| {
+            if let Some(mut inner) = cell.borrow_mut().take() {
+                teardown_inner(&mut inner);
+            }
+        });
+        WORKSPACE_TOKEN.with(|cell| {
+            if let Some(token) = cell.borrow_mut().take() {
+                let center = NSWorkspace::sharedWorkspace().notificationCenter();
+                let ptr = Retained::as_ptr(&token).cast::<AnyObject>();
+                // SAFETY: token is the observer returned when the workspace observer was added and ptr is valid while token is alive.
+                let observer: &AnyObject = unsafe { &*ptr };
+                // SAFETY: token is the observer returned when the workspace observer was added.
+                unsafe { center.removeObserver(observer) };
+            }
+        });
+    }
+}

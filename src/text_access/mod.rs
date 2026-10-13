@@ -3,7 +3,9 @@ pub mod sentence;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
+#[cfg(target_os = "macos")]
+pub(crate) use macos as macos_helpers;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -35,6 +37,12 @@ pub struct FieldSnapshot {
     pub caret: usize,
     pub caret_rect: CaretRect,
     pub(crate) handle: PlatformHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaretInfo {
+    pub pid: u32,
+    pub caret_rect: CaretRect,
 }
 
 /// Converts a char index into a UTF-16 code-unit offset into `text`.
@@ -91,6 +99,25 @@ pub fn check_permission(prompt: bool) -> Result<(), String> {
     {
         let _ = prompt;
         Ok(())
+    }
+}
+
+pub fn caret_info() -> Result<Option<CaretInfo>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::caret_info()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::caret_info()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::caret_info()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Ok(None)
     }
 }
 
