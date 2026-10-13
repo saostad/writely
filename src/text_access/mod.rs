@@ -39,10 +39,7 @@ pub struct FieldSnapshot {
 
 /// Converts a char index into a UTF-16 code-unit offset into `text`.
 pub(crate) fn char_to_utf16_offset(text: &str, char_index: usize) -> usize {
-    text.chars()
-        .take(char_index)
-        .map(|ch| ch.len_utf16())
-        .sum()
+    text.chars().take(char_index).map(|ch| ch.len_utf16()).sum()
 }
 
 /// Converts a UTF-16 code-unit offset into a char index into `text`.
@@ -197,10 +194,7 @@ mod tests {
 
     #[test]
     fn replaced_text_splices_by_char_index() {
-        assert_eq!(
-            replaced_text("Café bad.", &(5..8), "good"),
-            "Café good."
-        );
+        assert_eq!(replaced_text("Café bad.", &(5..8), "good"), "Café good.");
         assert_eq!(replaced_text("hello", &(5..5), "!"), "hello!");
     }
 }

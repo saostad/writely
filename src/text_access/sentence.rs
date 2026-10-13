@@ -141,7 +141,10 @@ mod tests {
     use super::sentence_range;
 
     fn text_of(text: &str, range: std::ops::Range<usize>) -> String {
-        text.chars().skip(range.start).take(range.end - range.start).collect()
+        text.chars()
+            .skip(range.start)
+            .take(range.end - range.start)
+            .collect()
     }
 
     fn caret_after(text: &str, prefix: &str) -> usize {
