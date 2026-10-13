@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod gemini;
+mod overlay;
 mod settings;
 #[allow(dead_code)]
 mod text_access;
@@ -34,6 +35,7 @@ fn main() {
         }
     }));
     let watcher_proxy = event_loop.create_proxy();
+    overlay::init(watcher_proxy.clone());
 
     let mut tray_icon: Option<TrayIcon> = None;
     let mut settings_id = tray_icon::menu::MenuId::new("settings");
@@ -136,13 +138,16 @@ fn main() {
                     watcher.handle_caret_changed();
                 }
                 match text_access::caret_info() {
-                    Ok(Some(_info)) => {
+                    Ok(Some(info)) => {
                         last_caret_error = None;
+                        overlay::show_at(&info.caret_rect);
                     }
                     Ok(None) => {
                         last_caret_error = None;
+                        overlay::hide();
                     }
                     Err(error) => {
+                        overlay::hide();
                         if last_caret_error.as_deref() != Some(error.as_str()) {
                             eprintln!("Writely: {error}");
                             last_caret_error = Some(error);
