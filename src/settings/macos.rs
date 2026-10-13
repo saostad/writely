@@ -9,7 +9,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString, NSURL,
+    NSRunLoop, NSSize, NSString, NSURL,
 };
 
 #[derive(Default)]
@@ -103,13 +103,20 @@ define_class!(
     unsafe impl NSWindowDelegate for SettingsDelegate {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
-            // SAFETY: self is a valid SettingsDelegate on the main thread.
-            let keep_alive = unsafe {
-                Retained::<SettingsDelegate>::retain(self as *const Self as *mut Self)
-            };
+            STATE.with(|state| {
+                if let Some(window_state) = state.borrow().as_ref() {
+                    window_state.window.setDelegate(None);
+                }
+            });
             let taken = STATE.with(|state| state.borrow_mut().take());
-            drop(taken);
-            drop(keep_alive);
+            if let Some(taken) = taken {
+                let taken_cell = std::cell::RefCell::new(Some(taken));
+                let block = block2::RcBlock::new(move || {
+                    drop(taken_cell.borrow_mut().take());
+                });
+                // SAFETY: the main run loop is valid and the block is copied by the run loop.
+                unsafe { NSRunLoop::mainRunLoop().performBlock(&block) };
+            }
         }
     }
 );
@@ -237,8 +244,8 @@ pub fn show_settings() -> Result<(), String> {
             false,
         )
     };
-    // SAFETY: releasing on close is required so no hidden window is kept around.
-    unsafe { window.setReleasedWhenClosed(true) };
+    // SAFETY: the window is owned by a Retained in STATE, so AppKit must not also release it on close.
+    unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(ns_string!("Writely Settings"));
     window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     window.center();

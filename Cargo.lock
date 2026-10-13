@@ -3204,6 +3204,7 @@ name = "writely"
 version = "0.1.0"
 dependencies = [
  "atspi",
+ "block2",
  "gtk",
  "keyring",
  "objc2",
