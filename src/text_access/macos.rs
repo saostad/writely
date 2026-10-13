@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::ptr::NonNull;
+use std::sync::{LazyLock, Mutex};
 
 use objc2_application_services::{
     kAXTrustedCheckOptionPrompt, AXError, AXIsProcessTrustedWithOptions, AXUIElement, AXValue,
@@ -9,7 +11,7 @@ use objc2_application_services::{
 };
 use objc2_core_foundation::{
     kCFBooleanFalse, kCFBooleanTrue, CFBoolean, CFDictionary, CFIndex, CFRange, CFRetained,
-    CFString, CFType, CGPoint, CGRect, CGSize, Type,
+    CFString, CFType, CGRect, Type,
 };
 
 use super::{
@@ -21,6 +23,20 @@ pub(crate) struct PlatformHandle {
 }
 
 const PERMISSION_ERROR: &str = "Writely needs Accessibility permission to see where you're typing. Open System Settings › Privacy & Security › Accessibility, turn on Writely, then restart Writely.";
+
+/// Pids already told that the caret position is unavailable, so the message
+/// below logs once per pid instead of on every keystroke.
+static NO_CARET_LOGGED: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn log_no_caret_once(pid: u32) {
+    let mut logged = NO_CARET_LOGGED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if logged.insert(pid) {
+        eprintln!("Writely can't find the text cursor in this app, so the icon is hidden.");
+    }
+}
 
 fn timeout_error(error: AXError) -> String {
     format!(
@@ -112,30 +128,6 @@ fn ax_range(value: &AXValue) -> Option<CFRange> {
     if unsafe { value.value(AXValueType::CFRange, ptr) } {
         // SAFETY: AXValueGetValue filled the CFRange when it returned true.
         Some(unsafe { range.assume_init() })
-    } else {
-        None
-    }
-}
-
-fn ax_point(value: &AXValue) -> Option<CGPoint> {
-    let mut point = MaybeUninit::<CGPoint>::uninit();
-    let ptr = NonNull::new(point.as_mut_ptr().cast::<c_void>())?;
-    // SAFETY: ptr points at writable CGPoint storage and value is an AXValue.
-    if unsafe { value.value(AXValueType::CGPoint, ptr) } {
-        // SAFETY: AXValueGetValue filled the CGPoint when it returned true.
-        Some(unsafe { point.assume_init() })
-    } else {
-        None
-    }
-}
-
-fn ax_size(value: &AXValue) -> Option<CGSize> {
-    let mut size = MaybeUninit::<CGSize>::uninit();
-    let ptr = NonNull::new(size.as_mut_ptr().cast::<c_void>())?;
-    // SAFETY: ptr points at writable CGSize storage and value is an AXValue.
-    if unsafe { value.value(AXValueType::CGSize, ptr) } {
-        // SAFETY: AXValueGetValue filled the CGSize when it returned true.
-        Some(unsafe { size.assume_init() })
     } else {
         None
     }
@@ -299,7 +291,10 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
     };
     let caret = utf16_to_char_offset(&text, caret_utf16);
 
-    let caret_rect = caret_rect(&element, caret_utf16)?;
+    let Some(caret_rect) = caret_rect(&element, caret_utf16) else {
+        log_no_caret_once(pid as u32);
+        return Ok(None);
+    };
 
     Ok(Some(FieldSnapshot {
         pid: pid as u32,
@@ -337,7 +332,10 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
         } else {
             selected.location as usize
         };
-        let rect = caret_rect(&element, caret_utf16)?;
+        let Some(rect) = caret_rect(&element, caret_utf16) else {
+            log_no_caret_once(pid);
+            return Ok(None);
+        };
         return Ok(Some(CaretInfo {
             pid,
             caret_rect: rect,
@@ -395,17 +393,23 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
     } else {
         selected.location as usize
     };
-    let rect = caret_rect(&element, caret_utf16)?;
+    let Some(rect) = caret_rect(&element, caret_utf16) else {
+        log_no_caret_once(pid as u32);
+        return Ok(None);
+    };
     Ok(Some(CaretInfo {
         pid: pid as u32,
         caret_rect: rect,
     }))
 }
 
-fn caret_rect(element: &AXUIElement, caret_utf16: usize) -> Result<CaretRect, String> {
+/// The caret screen rectangle, or `None` when neither bounds lookup yields a
+/// real caret position. There is no fallback: without a real position the
+/// icon stays hidden.
+fn caret_rect(element: &AXUIElement, caret_utf16: usize) -> Option<CaretRect> {
     if let Ok(rect) = bounds_for_range(element, caret_utf16, 0) {
         if rect.size.width != 0.0 || rect.size.height != 0.0 {
-            return Ok(CaretRect {
+            return Some(CaretRect {
                 x: rect.origin.x,
                 y: rect.origin.y,
                 width: rect.size.width,
@@ -417,7 +421,7 @@ fn caret_rect(element: &AXUIElement, caret_utf16: usize) -> Result<CaretRect, St
     if caret_utf16 > 0 {
         if let Ok(rect) = bounds_for_range(element, caret_utf16 - 1, 1) {
             if rect.size.width != 0.0 || rect.size.height != 0.0 {
-                return Ok(CaretRect {
+                return Some(CaretRect {
                     x: rect.origin.x + rect.size.width,
                     y: rect.origin.y,
                     width: 0.0,
@@ -427,20 +431,7 @@ fn caret_rect(element: &AXUIElement, caret_utf16: usize) -> Result<CaretRect, St
             }
         }
     }
-    let position_value = copy_ax_value(element, "AXPosition").map_err(read_error)?;
-    let size_value = copy_ax_value(element, "AXSize").map_err(read_error)?;
-    let position = ax_point(&position_value).ok_or_else(|| read_error(AXError::Failure))?;
-    let size = ax_size(&size_value).ok_or_else(|| read_error(AXError::Failure))?;
-    eprintln!(
-        "Writely: the caret position is approximate; using the bottom-left corner of the focused field."
-    );
-    Ok(CaretRect {
-        x: position.x,
-        y: position.y + size.height,
-        width: 0.0,
-        height: 0.0,
-        physical: false,
-    })
+    None
 }
 
 pub(crate) fn read_text(handle: &PlatformHandle) -> Result<String, String> {
