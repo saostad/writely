@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 #[allow(dead_code)]
@@ -95,29 +96,34 @@ pub fn parse_response(status: u16, body: &str) -> Result<String, String> {
     Ok(unquoted.to_string())
 }
 
-#[allow(dead_code)]
-pub async fn suggest(api_key: &str, sentence: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("Could not reach Gemini: {e}"))?;
+static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
+fn agent() -> &'static ureq::Agent {
+    AGENT.get_or_init(|| {
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(20)))
+            .http_status_as_error(false)
+            .build();
+        ureq::Agent::new_with_config(config)
+    })
+}
+
+#[allow(dead_code)]
+pub fn suggest(api_key: &str, sentence: &str) -> Result<String, String> {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     );
 
-    let response = client
+    let mut response = agent()
         .post(&url)
         .header("x-goog-api-key", api_key)
-        .json(&build_request_body(sentence))
-        .send()
-        .await
+        .send_json(build_request_body(sentence))
         .map_err(|e| format!("Could not reach Gemini: {e}"))?;
 
     let status = response.status().as_u16();
     let body = response
-        .text()
-        .await
+        .body_mut()
+        .read_to_string()
         .map_err(|e| format!("Could not reach Gemini: {e}"))?;
 
     parse_response(status, &body)

@@ -20,8 +20,30 @@ pub(crate) struct PlatformHandle {
 
 const PERMISSION_ERROR: &str = "Writely needs Accessibility permission to see where you're typing. Open System Settings › Privacy & Security › Accessibility, turn on Writely, then restart Writely.";
 
+fn timeout_error(error: AXError) -> String {
+    format!(
+        "The focused app didn't respond to Writely in time (AXError {}).",
+        error.0
+    )
+}
+
 fn read_error(error: AXError) -> String {
-    format!("Could not read the focused text field: AXError {}", error.0)
+    if error == AXError::CannotComplete {
+        timeout_error(error)
+    } else {
+        format!("Could not read the focused text field: AXError {}", error.0)
+    }
+}
+
+fn set_messaging_timeout(element: &AXUIElement) {
+    // SAFETY: element is a valid AXUIElement and the timeout is positive.
+    let error = unsafe { element.set_messaging_timeout(0.25) };
+    if error != AXError::Success {
+        eprintln!(
+            "Writely: could not set the Accessibility timeout (AXError {}).",
+            error.0
+        );
+    }
 }
 
 fn copy_attr(element: &AXUIElement, name: &str) -> Result<CFRetained<CFType>, AXError> {
@@ -144,6 +166,7 @@ fn bounds_for_range(
 fn app_name(pid: u32) -> String {
     // SAFETY: creating an application element for a live pid is a plain FFI call.
     let app = unsafe { AXUIElement::new_application(pid as i32) };
+    set_messaging_timeout(&app);
     match copy_string(&app, "AXTitle") {
         Ok(Some(name)) if !name.trim().is_empty() => name,
         _ => "The app".to_string(),
@@ -185,6 +208,7 @@ pub(crate) fn check_permission(prompt: bool) -> Result<(), String> {
 pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
     // SAFETY: creating the system-wide element is a plain FFI call with no arguments.
     let system = unsafe { AXUIElement::new_system_wide() };
+    set_messaging_timeout(&system);
     let focused = match copy_attr(&system, "AXFocusedUIElement") {
         Ok(value) => value,
         Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
@@ -198,6 +222,7 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
         unsafe { ptr.as_ref() }
     };
     let element: CFRetained<AXUIElement> = element_ref.retain();
+    set_messaging_timeout(&element);
 
     let mut pid: i32 = 0;
     let pid_out = NonNull::from(&mut pid);
@@ -297,6 +322,7 @@ fn caret_rect(element: &AXUIElement, caret_utf16: usize) -> Result<CaretRect, St
 }
 
 pub(crate) fn read_text(handle: &PlatformHandle) -> Result<String, String> {
+    set_messaging_timeout(&handle.element);
     match copy_string(&handle.element, "AXValue") {
         Ok(Some(text)) => Ok(text),
         Ok(None) => Err(read_error(AXError::Failure)),
@@ -310,6 +336,7 @@ pub(crate) fn replace_range(
     new_text: &str,
 ) -> Result<(), String> {
     let element: &AXUIElement = &snap.handle.element;
+    set_messaging_timeout(element);
     let name = app_name(snap.pid);
     let start = char_to_utf16_offset(&snap.text, range.start);
     let end = char_to_utf16_offset(&snap.text, range.end);
@@ -326,6 +353,9 @@ pub(crate) fn replace_range(
     };
     let range_type: &CFType = &range_value;
     let select_error = set_attr(element, "AXSelectedTextRange", range_type);
+    if select_error == AXError::CannotComplete {
+        return Err(timeout_error(select_error));
+    }
     if select_error != AXError::Success {
         return Err(format!(
             "{name} didn't accept the replacement text (AXError {}).",
@@ -336,6 +366,9 @@ pub(crate) fn replace_range(
     let new_cf = CFString::from_str(new_text);
     let new_type: &CFType = &new_cf;
     let selected_error = set_attr(element, "AXSelectedText", new_type);
+    if selected_error == AXError::CannotComplete {
+        return Err(timeout_error(selected_error));
+    }
     let expected = replaced_text(&snap.text, &range, new_text);
     if selected_error != AXError::Success {
         eprintln!(
@@ -345,6 +378,9 @@ pub(crate) fn replace_range(
         let whole_cf = CFString::from_str(&expected);
         let whole_type: &CFType = &whole_cf;
         let value_error = set_attr(element, "AXValue", whole_type);
+        if value_error == AXError::CannotComplete {
+            return Err(timeout_error(value_error));
+        }
         if value_error != AXError::Success {
             return Err(format!(
                 "{name} didn't accept the replacement text (AXError {}).",
@@ -359,8 +395,30 @@ pub(crate) fn replace_range(
             "{name} didn't accept the replacement text (AXError {}).",
             AXError::Failure.0
         )),
+        Err(error) if error.starts_with("The focused app didn't respond") => Err(error),
         Err(error) => Err(format!(
             "{name} didn't accept the replacement text ({error})."
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_error, timeout_error};
+    use objc2_application_services::AXError;
+
+    #[test]
+    fn cannot_complete_maps_to_timeout_message() {
+        let expected = "The focused app didn't respond to Writely in time (AXError -25204).";
+        assert_eq!(read_error(AXError::CannotComplete), expected);
+        assert_eq!(timeout_error(AXError::CannotComplete), expected);
+    }
+
+    #[test]
+    fn other_ax_errors_keep_read_message() {
+        assert_eq!(
+            read_error(AXError::Failure),
+            "Could not read the focused text field: AXError -25200"
+        );
     }
 }

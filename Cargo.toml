@@ -11,14 +11,34 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 tao = "0.37"
 tray-icon = "0.25"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = "0.3"
-objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSButton",
+    "NSColor",
+    "NSControl",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSSecureTextField",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+    "NSWorkspace",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSNotification",
+    "NSObject",
+    "NSString",
+    "NSURL",
+] }
 objc2-application-services = "0.3"
 objc2-core-foundation = "0.3"
 
