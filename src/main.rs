@@ -1,32 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod settings;
+
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager, WebviewUrl, WebviewWindowBuilder,
 };
-
-fn show_settings_window(app: &tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("settings") {
-        window
-            .show()
-            .map_err(|e| format!("Could not show the settings window: {e}"))?;
-        window
-            .set_focus()
-            .map_err(|e| format!("Could not focus the settings window: {e}"))?;
-        return Ok(());
-    }
-    WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
-        .title("Writely Settings")
-        .inner_size(420.0, 220.0)
-        .resizable(false)
-        .build()
-        .map_err(|e| format!("Could not open the settings window: {e}"))?;
-    Ok(())
-}
 
 fn main() {
     let app = tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            settings::save_api_key,
+            settings::remove_api_key,
+            settings::has_api_key,
+            settings::open_apikey_page
+        ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -54,7 +42,7 @@ fn main() {
                 .tooltip("Writely")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "settings" => {
-                        if let Err(e) = show_settings_window(app) {
+                        if let Err(e) = settings::show_settings_window(app) {
                             eprintln!("Writely: {e}");
                         }
                     }

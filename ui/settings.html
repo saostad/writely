@@ -1,5 +1,159 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Writely Settings</title></head>
-<body><p>Writely Settings</p></body>
+<head>
+<meta charset="utf-8">
+<title>Writely Settings</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px 20px;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+    color: #1c1c1e;
+    background: #ffffff;
+  }
+  h1 {
+    margin: 0 0 14px;
+    font-size: 15px;
+    font-weight: 600;
+  }
+  label {
+    display: block;
+    margin-bottom: 6px;
+    font-weight: 600;
+  }
+  input[type="password"] {
+    width: 100%;
+    padding: 7px 8px;
+    font-size: 14px;
+    border: 1px solid #b9b9be;
+    border-radius: 6px;
+  }
+  .help {
+    margin: 8px 0 14px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #3a3a3c;
+  }
+  .help a { color: #0a5cff; }
+  .row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  button {
+    padding: 6px 14px;
+    font-size: 13px;
+    border: 1px solid #b9b9be;
+    border-radius: 6px;
+    background: #f2f2f4;
+    color: #1c1c1e;
+    cursor: pointer;
+  }
+  button.primary {
+    background: #1c1c1e;
+    border-color: #1c1c1e;
+    color: #ffffff;
+  }
+  #status {
+    margin: 12px 0 0;
+    font-size: 12px;
+    min-height: 16px;
+  }
+  #status.error { color: #c81e1e; }
+</style>
+</head>
+<body>
+  <h1>Writely Settings</h1>
+
+  <label for="api-key">Google Gemini API key</label>
+  <input id="api-key" type="password" placeholder="Paste your key here" autocomplete="off">
+
+  <p class="help">Writely sends the sentence you're editing to Google Gemini to check its grammar. Get a free key at <a id="apikey-link" href="https://aistudio.google.com/apikey">https://aistudio.google.com/apikey</a></p>
+
+  <div class="row">
+    <button id="save" class="primary" type="button">Save</button>
+    <button id="remove" type="button">Remove key</button>
+  </div>
+
+  <p id="status" role="status"></p>
+
+<script>
+  const invoke = window.__TAURI__ && window.__TAURI__.core
+    ? window.__TAURI__.core.invoke
+    : null;
+  const input = document.getElementById('api-key');
+  const statusEl = document.getElementById('status');
+
+  function showStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.className = isError ? 'error' : '';
+  }
+
+  function errorText(err) {
+    if (typeof err === 'string') return err;
+    if (err && err.message) return err.message;
+    return String(err);
+  }
+
+  async function refreshPlaceholder() {
+    if (!invoke) {
+      showStatus('Could not load Writely settings: Tauri API is not available.', true);
+      return;
+    }
+    try {
+      const has = await invoke('has_api_key');
+      input.placeholder = has ? '••••••••' : 'Paste your key here';
+    } catch (err) {
+      showStatus(errorText(err), true);
+    }
+  }
+
+  document.getElementById('apikey-link').addEventListener('click', async (event) => {
+    event.preventDefault();
+    if (!invoke) {
+      showStatus('Could not open the API key page: Tauri API is not available.', true);
+      return;
+    }
+    try {
+      await invoke('open_apikey_page');
+    } catch (err) {
+      showStatus(errorText(err), true);
+    }
+  });
+
+  document.getElementById('save').addEventListener('click', async () => {
+    if (!invoke) {
+      showStatus('Could not save the key: Tauri API is not available.', true);
+      return;
+    }
+    try {
+      await invoke('save_api_key', { key: input.value });
+      input.value = '';
+      input.placeholder = '••••••••';
+      showStatus('Saved.', false);
+    } catch (err) {
+      showStatus(errorText(err), true);
+    }
+  });
+
+  document.getElementById('remove').addEventListener('click', async () => {
+    if (!invoke) {
+      showStatus('Could not remove the key: Tauri API is not available.', true);
+      return;
+    }
+    try {
+      await invoke('remove_api_key');
+      input.value = '';
+      input.placeholder = 'Paste your key here';
+      showStatus('Key removed.', false);
+    } catch (err) {
+      showStatus(errorText(err), true);
+    }
+  });
+
+  refreshPlaceholder();
+</script>
+</body>
 </html>
