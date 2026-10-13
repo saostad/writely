@@ -113,50 +113,46 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_COMMAND => {
             let id = (wparam.0 & 0xffff) as i32;
             if id == ID_SAVE {
-                STATE.with(|state| {
-                    if let Some(handles) = state.borrow().as_ref() {
-                        let edit = handles.edit;
-                        let value = read_edit_text(edit);
-                        match super::save_api_key(&value) {
-                            Ok(()) => {
-                                let empty = wide("");
-                                // SAFETY: edit is a live EDIT control.
-                                if let Err(error) =
-                                    unsafe { SetWindowTextW(edit, PCWSTR(empty.as_ptr())) }
-                                {
-                                    eprintln!(
-                                        "Writely: could not clear the Settings key field: {error}"
-                                    );
-                                }
-                                refresh_cue_banner(edit);
-                                set_status("Saved.", false);
+                let edit = STATE.with(|state| state.borrow().as_ref().map(|handles| handles.edit));
+                if let Some(edit) = edit {
+                    let value = read_edit_text(edit);
+                    match super::save_api_key(&value) {
+                        Ok(()) => {
+                            let empty = wide("");
+                            // SAFETY: edit is a live EDIT control.
+                            if let Err(error) =
+                                unsafe { SetWindowTextW(edit, PCWSTR(empty.as_ptr())) }
+                            {
+                                eprintln!(
+                                    "Writely: could not clear the Settings key field: {error}"
+                                );
                             }
-                            Err(error) => set_status(&error, true),
+                            refresh_cue_banner(edit);
+                            set_status("Saved.", false);
                         }
+                        Err(error) => set_status(&error, true),
                     }
-                });
+                }
             } else if id == ID_REMOVE {
-                STATE.with(|state| {
-                    if let Some(handles) = state.borrow().as_ref() {
-                        let edit = handles.edit;
-                        match super::remove_api_key() {
-                            Ok(()) => {
-                                let empty = wide("");
-                                // SAFETY: edit is a live EDIT control.
-                                if let Err(error) =
-                                    unsafe { SetWindowTextW(edit, PCWSTR(empty.as_ptr())) }
-                                {
-                                    eprintln!(
-                                        "Writely: could not clear the Settings key field: {error}"
-                                    );
-                                }
-                                refresh_cue_banner(edit);
-                                set_status("Key removed.", false);
+                let edit = STATE.with(|state| state.borrow().as_ref().map(|handles| handles.edit));
+                if let Some(edit) = edit {
+                    match super::remove_api_key() {
+                        Ok(()) => {
+                            let empty = wide("");
+                            // SAFETY: edit is a live EDIT control.
+                            if let Err(error) =
+                                unsafe { SetWindowTextW(edit, PCWSTR(empty.as_ptr())) }
+                            {
+                                eprintln!(
+                                    "Writely: could not clear the Settings key field: {error}"
+                                );
                             }
-                            Err(error) => set_status(&error, true),
+                            refresh_cue_banner(edit);
+                            set_status("Key removed.", false);
                         }
+                        Err(error) => set_status(&error, true),
                     }
-                });
+                }
             } else if id == ID_LINK {
                 open_api_key_page();
             }

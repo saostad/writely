@@ -29,6 +29,9 @@ pub fn show_settings() -> Result<(), String> {
         // GTK may already be initialised by the tray/event-loop stack; only
         // fail when there is no usable display at all.
         eprintln!("Writely: GTK initialisation note on Linux: {error}");
+        if !gtk::is_initialized() {
+            return Err(format!("Could not open the settings window: {error}"));
+        }
     }
 
     let already_open = STATE.with(|state| state.borrow().is_some());
