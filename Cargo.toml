@@ -7,16 +7,13 @@ edition = "2021"
 name = "writely"
 path = "src/main.rs"
 
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
-
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
-open = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tao = "0.37"
+tray-icon = "0.25"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-application-services = "0.3"
@@ -28,3 +25,10 @@ uiautomation = "0.25"
 [target.'cfg(target_os = "linux")'.dependencies]
 atspi = { version = "0.30", features = ["zbus"] }
 pollster = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

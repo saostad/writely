@@ -1,81 +1,97 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod gemini;
+#[allow(dead_code)]
 mod settings;
 #[allow(dead_code)]
 mod text_access;
 
-use tauri::{
-    menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
-};
+use tao::event::{Event, StartCause};
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+#[derive(Debug)]
+enum UserEvent {
+    MenuEvent(MenuEvent),
+}
 
 fn main() {
-    let app = tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            settings::save_api_key,
-            settings::remove_api_key,
-            settings::has_api_key,
-            settings::open_apikey_page
-        ])
-        .setup(|app| {
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
-            let settings_item = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)
-                .map_err(|e| format!("Could not create the Settings menu item: {e}"))?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit Writely", true, None::<&str>)
-                .map_err(|e| format!("Could not create the Quit menu item: {e}"))?;
-            let menu = Menu::with_items(app, &[&settings_item, &quit_item])
-                .map_err(|e| format!("Could not create the tray menu: {e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    }
 
-            let icon = match app.default_window_icon().cloned() {
-                Some(icon) => icon,
-                None => {
-                    eprintln!(
-                        "Writely: could not create the tray icon: no default window icon is configured"
-                    );
-                    std::process::exit(1);
-                }
-            };
-
-            if let Err(e) = TrayIconBuilder::new()
-                .icon(icon)
-                .menu(&menu)
-                .tooltip("Writely")
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "settings" => {
-                        if let Err(e) = settings::show_settings_window(app) {
-                            eprintln!("Writely: {e}");
-                        }
-                    }
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    _ => {}
-                })
-                .build(app)
-            {
-                eprintln!("Writely: could not create the tray icon: {e}");
-                std::process::exit(1);
-            }
-            Ok(())
-        })
-        .build(tauri::generate_context!());
-
-    let app = match app {
-        Ok(app) => app,
-        Err(e) => {
-            eprintln!("Writely: could not start the application: {e}");
-            std::process::exit(1);
+    let proxy = event_loop.create_proxy();
+    MenuEvent::set_event_handler(Some(move |event| {
+        if let Err(error) = proxy.send_event(UserEvent::MenuEvent(event)) {
+            eprintln!("Writely: could not deliver the tray menu event: {error}");
         }
-    };
+    }));
 
-    app.run(|_app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
-            if code.is_none() {
-                api.prevent_exit();
+    let mut tray_icon: Option<TrayIcon> = None;
+    let mut settings_id = tray_icon::menu::MenuId::new("settings");
+    let mut quit_id = tray_icon::menu::MenuId::new("quit");
+
+    event_loop.run(move |event, _target, control_flow| {
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::NewEvents(StartCause::Init) => {
+                let settings_item = MenuItem::with_id("settings", "Settings…", true, None);
+                let quit_item = MenuItem::with_id("quit", "Quit Writely", true, None);
+                settings_id = settings_item.id().clone();
+                quit_id = quit_item.id().clone();
+
+                let menu = match Menu::with_items(&[&settings_item, &quit_item]) {
+                    Ok(menu) => menu,
+                    Err(error) => {
+                        eprintln!("Writely: could not create the tray icon: {error}");
+                        std::process::exit(1);
+                    }
+                };
+
+                let icon =
+                    match Icon::from_rgba(include_bytes!("../icons/tray-32.rgba").to_vec(), 32, 32)
+                    {
+                        Ok(icon) => icon,
+                        Err(error) => {
+                            eprintln!("Writely: could not create the tray icon: {error}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                let builder = TrayIconBuilder::new()
+                    .with_menu(Box::new(menu))
+                    .with_icon(icon)
+                    .with_tooltip("Writely");
+                #[cfg(target_os = "macos")]
+                let builder = builder.with_icon_as_template(true);
+
+                match builder.build() {
+                    Ok(icon) => {
+                        tray_icon = Some(icon);
+                    }
+                    Err(error) => {
+                        eprintln!("Writely: could not create the tray icon: {error}");
+                        std::process::exit(1);
+                    }
+                }
             }
+            Event::UserEvent(UserEvent::MenuEvent(event)) => {
+                if event.id == settings_id {
+                    if let Err(error) = settings::show_settings() {
+                        eprintln!("Writely: {error}");
+                    }
+                } else if event.id == quit_id {
+                    drop(tray_icon.take());
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
+            _ => {}
         }
     });
 }

@@ -1,8 +1,5 @@
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
-
 const SERVICE: &str = "writely";
 const USER: &str = "gemini-api-key";
-const API_KEY_PAGE: &str = "https://aistudio.google.com/apikey";
 
 pub fn validate_api_key(key: &str) -> Result<String, String> {
     let trimmed = key.trim();
@@ -29,9 +26,8 @@ pub fn load_api_key() -> Result<Option<String>, String> {
     }
 }
 
-#[tauri::command]
-pub fn save_api_key(key: String) -> Result<(), String> {
-    let trimmed = validate_api_key(&key)?;
+pub fn save_api_key(key: &str) -> Result<(), String> {
+    let trimmed = validate_api_key(key)?;
     let entry = keyring_entry()
         .map_err(|e| format!("Could not save the key to the system keychain: {e}"))?;
     entry
@@ -39,7 +35,6 @@ pub fn save_api_key(key: String) -> Result<(), String> {
         .map_err(|e| format!("Could not save the key to the system keychain: {e}"))
 }
 
-#[tauri::command]
 pub fn remove_api_key() -> Result<(), String> {
     let entry = keyring_entry()
         .map_err(|e| format!("Could not remove the key from the system keychain: {e}"))?;
@@ -52,33 +47,12 @@ pub fn remove_api_key() -> Result<(), String> {
     }
 }
 
-#[tauri::command]
 pub fn has_api_key() -> Result<bool, String> {
     load_api_key().map(|key| key.is_some())
 }
 
-#[tauri::command]
-pub fn open_apikey_page() -> Result<(), String> {
-    open::that(API_KEY_PAGE)
-        .map_err(|e| format!("Could not open the API key page in your browser: {e}"))
-}
-
-pub fn show_settings_window(app: &tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("settings") {
-        window
-            .show()
-            .map_err(|e| format!("Could not show the settings window: {e}"))?;
-        window
-            .set_focus()
-            .map_err(|e| format!("Could not focus the settings window: {e}"))?;
-        return Ok(());
-    }
-    WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
-        .title("Writely Settings")
-        .inner_size(420.0, 220.0)
-        .resizable(false)
-        .build()
-        .map_err(|e| format!("Could not open the settings window: {e}"))?;
+pub fn show_settings() -> Result<(), String> {
+    eprintln!("Writely: Settings window is not available yet.");
     Ok(())
 }
 
