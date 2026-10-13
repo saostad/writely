@@ -113,7 +113,7 @@ async fn watch_loop() {
                 if changed.enabled {
                     crate::text_access::set_focused(Some(changed.item));
                 } else {
-                    crate::text_access::set_focused(None);
+                    crate::text_access::clear_focused_if(&changed.item);
                 }
                 flag_caret_changed();
             }

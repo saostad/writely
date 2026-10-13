@@ -3,7 +3,7 @@ pub mod sentence;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub(crate) use linux::set_focused;
+pub(crate) use linux::{clear_focused_if, set_focused};
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 #[cfg(target_os = "macos")]

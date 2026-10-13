@@ -19,6 +19,19 @@ pub(crate) fn set_focused(object: Option<ObjectRefOwned>) {
     }
 }
 
+/// Clears the cached focused accessible only when it is the item that lost
+/// focus, so a stale "lost focus" arriving after the new field's "got focus"
+/// cannot wipe the cache.
+pub(crate) fn clear_focused_if(item: &ObjectRefOwned) {
+    let is_current = match FOCUSED.lock() {
+        Ok(guard) => guard.as_ref() == Some(item),
+        Err(poisoned) => poisoned.into_inner().as_ref() == Some(item),
+    };
+    if is_current {
+        set_focused(None);
+    }
+}
+
 fn take_focused() -> Option<ObjectRefOwned> {
     match FOCUSED.lock() {
         Ok(guard) => guard.clone(),
