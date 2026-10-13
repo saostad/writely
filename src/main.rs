@@ -26,6 +26,7 @@ fn main() {
     {
         use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
+        event_loop.set_activate_ignoring_other_apps(false);
     }
 
     let proxy = event_loop.create_proxy();
