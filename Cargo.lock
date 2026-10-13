@@ -3525,6 +3525,7 @@ name = "writely"
 version = "0.1.0"
 dependencies = [
  "atspi",
+ "gtk",
  "keyring",
  "objc2",
  "objc2-app-kit",
@@ -3538,6 +3539,7 @@ dependencies = [
  "tao",
  "tray-icon",
  "uiautomation",
+ "windows",
 ]
 
 [[package]]

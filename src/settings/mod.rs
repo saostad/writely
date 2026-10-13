@@ -1,5 +1,9 @@
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 const SERVICE: &str = "writely";
 const USER: &str = "gemini-api-key";
@@ -60,9 +64,17 @@ pub fn show_settings() -> Result<(), String> {
     {
         macos::show_settings()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        Err("Could not open the settings window: this platform is not supported yet.".to_string())
+        windows::show_settings()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::show_settings()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Err("Could not open the settings window: this platform is not supported.".to_string())
     }
 }
 
