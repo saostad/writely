@@ -2,6 +2,8 @@
 
 mod gemini;
 mod settings;
+#[allow(dead_code)]
+mod text_access;
 
 use tauri::{
     menu::{Menu, MenuItem},
