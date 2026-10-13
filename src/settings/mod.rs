@@ -8,6 +8,8 @@ mod windows;
 const SERVICE: &str = "writely";
 const USER: &str = "gemini-api-key";
 pub(crate) const API_KEY_PAGE: &str = "https://aistudio.google.com/apikey";
+pub(crate) const ACCESSIBILITY_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
 
 static PERMISSION_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 

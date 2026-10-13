@@ -97,6 +97,29 @@ define_class!(
                 );
             }
         }
+
+        #[unsafe(method(openAccessibilitySettings:))]
+        fn open_accessibility_settings(&self, _sender: Option<&AnyObject>) {
+            let Some(status) = self.ivars().status.get() else {
+                return;
+            };
+            let url_string = NSString::from_str(super::ACCESSIBILITY_SETTINGS_URL);
+            let Some(url) = NSURL::URLWithString(&url_string) else {
+                set_status(
+                    status,
+                    "Could not open System Settings: invalid Accessibility settings URL",
+                    true,
+                );
+                return;
+            };
+            if !NSWorkspace::sharedWorkspace().openURL(&url) {
+                set_status(
+                    status,
+                    "Could not open System Settings: NSWorkspace could not open System Settings",
+                    true,
+                );
+            }
+        }
     }
 
     // SAFETY: NSWindowDelegate has no safety requirements.
@@ -135,6 +158,7 @@ struct WindowState {
     delegate: Retained<SettingsDelegate>,
     field: Retained<NSSecureTextField>,
     status: Retained<NSTextField>,
+    accessibility_button: Option<Retained<NSButton>>,
 }
 
 thread_local! {
@@ -219,7 +243,13 @@ pub fn show_settings() -> Result<(), String> {
             if let Some(window_state) = state.borrow().as_ref() {
                 if let Some(message) = super::permission_message() {
                     set_status(&window_state.status, &message, true);
+                    if let Some(button) = window_state.accessibility_button.as_ref() {
+                        button.setHidden(false);
+                    }
                 } else {
+                    if let Some(button) = window_state.accessibility_button.as_ref() {
+                        button.setHidden(true);
+                    }
                     match super::has_api_key() {
                         Ok(true) => window_state
                             .field
@@ -238,11 +268,17 @@ pub fn show_settings() -> Result<(), String> {
     }
 
     let delegate = SettingsDelegate::new(mtm);
+    let permission_text = super::permission_message();
+    let window_height = if permission_text.is_some() {
+        260.0
+    } else {
+        200.0
+    };
     // SAFETY: the content rect, style mask and backing store are valid and mtm is the main thread.
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 200.0)),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, window_height)),
             NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
             NSBackingStoreType::Buffered,
             false,
@@ -260,15 +296,20 @@ pub fn show_settings() -> Result<(), String> {
         );
     };
 
+    // When Accessibility permission is missing the controls shift up to make room
+    // for the "Open Accessibility Settings" button row and a taller wrapping
+    // status label; otherwise the layout is unchanged from before.
+    let dy = if permission_text.is_some() { 52.0 } else { 0.0 };
+
     let title_label = NSTextField::labelWithString(ns_string!("Google Gemini API key"), mtm);
     title_label.setFrame(NSRect::new(
-        NSPoint::new(20.0, 172.0),
+        NSPoint::new(20.0, 172.0 + dy),
         NSSize::new(380.0, 18.0),
     ));
 
     let field = NSSecureTextField::initWithFrame(
         NSSecureTextField::alloc(mtm),
-        NSRect::new(NSPoint::new(20.0, 142.0), NSSize::new(380.0, 24.0)),
+        NSRect::new(NSPoint::new(20.0, 142.0 + dy), NSSize::new(380.0, 24.0)),
     );
 
     let mut initial_error: Option<String> = None;
@@ -286,7 +327,7 @@ pub fn show_settings() -> Result<(), String> {
         mtm,
     );
     help_label.setFrame(NSRect::new(
-        NSPoint::new(20.0, 104.0),
+        NSPoint::new(20.0, 104.0 + dy),
         NSSize::new(380.0, 32.0),
     ));
 
@@ -301,7 +342,7 @@ pub fn show_settings() -> Result<(), String> {
         )
     };
     link_button.setFrame(NSRect::new(
-        NSPoint::new(20.0, 86.0),
+        NSPoint::new(20.0, 86.0 + dy),
         NSSize::new(280.0, 18.0),
     ));
     link_button.setBordered(false);
@@ -316,7 +357,7 @@ pub fn show_settings() -> Result<(), String> {
         )
     };
     save_button.setFrame(NSRect::new(
-        NSPoint::new(20.0, 48.0),
+        NSPoint::new(20.0, 48.0 + dy),
         NSSize::new(80.0, 24.0),
     ));
 
@@ -330,17 +371,57 @@ pub fn show_settings() -> Result<(), String> {
         )
     };
     remove_button.setFrame(NSRect::new(
-        NSPoint::new(110.0, 48.0),
+        NSPoint::new(110.0, 48.0 + dy),
         NSSize::new(110.0, 24.0),
     ));
 
-    let status_label = NSTextField::labelWithString(ns_string!(""), mtm);
+    // The Accessibility button gets its own row above the status line and only
+    // exists while the permission message is set. It uses its own selector.
+    let accessibility_button: Option<Retained<NSButton>> = if permission_text.is_some() {
+        // SAFETY: delegate implements openAccessibilitySettings: and lives in STATE while the window is open.
+        let button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Open Accessibility Settings"),
+                Some(target),
+                Some(sel!(openAccessibilitySettings:)),
+                mtm,
+            )
+        };
+        button.setFrame(NSRect::new(
+            NSPoint::new(20.0, 74.0),
+            NSSize::new(220.0, 24.0),
+        ));
+        content.addSubview(&button);
+        Some(button)
+    } else {
+        None
+    };
+
+    let status_label = if permission_text.is_some() {
+        NSTextField::wrappingLabelWithString(ns_string!(""), mtm)
+    } else {
+        NSTextField::labelWithString(ns_string!(""), mtm)
+    };
     status_label.setFrame(NSRect::new(
-        NSPoint::new(20.0, 18.0),
-        NSSize::new(380.0, 18.0),
+        NSPoint::new(
+            20.0,
+            if permission_text.is_some() {
+                14.0
+            } else {
+                18.0
+            },
+        ),
+        NSSize::new(
+            380.0,
+            if permission_text.is_some() {
+                54.0
+            } else {
+                18.0
+            },
+        ),
     ));
-    if let Some(message) = super::permission_message() {
-        set_status(&status_label, &message, true);
+    if let Some(message) = permission_text.as_ref() {
+        set_status(&status_label, message, true);
     } else if let Some(error) = &initial_error {
         set_status(&status_label, error, true);
     }
@@ -366,6 +447,7 @@ pub fn show_settings() -> Result<(), String> {
             delegate,
             field: field.clone(),
             status: status_label.clone(),
+            accessibility_button,
         });
     });
 
