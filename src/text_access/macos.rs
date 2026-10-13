@@ -77,6 +77,34 @@ fn copy_ax_value(element: &AXUIElement, name: &str) -> Result<CFRetained<AXValue
     value.downcast::<AXValue>().map_err(|_| AXError::Failure)
 }
 
+/// Whether the element is editable text, for the watcher's per-focus cache:
+/// not a secure field and `AXValue` is settable. Called once per focus change.
+pub(crate) fn element_is_editable(element: &AXUIElement) -> bool {
+    match copy_string(element, "AXSubrole") {
+        Ok(Some(subrole)) if subrole == "AXSecureTextField" => return false,
+        // A missing subrole tells nothing, and a transient failure surfaces on
+        // the next read; neither hides the icon here.
+        Ok(_) | Err(_) => {}
+    }
+    let attr = CFString::from_str("AXValue");
+    let mut flag: u8 = 0;
+    let Some(out) = NonNull::new(&mut flag as *mut u8).map(|ptr| ptr.cast()) else {
+        return true;
+    };
+    // SAFETY: element and attr are valid, and out points at a writable u8 with
+    // the same layout as the Darwin Boolean the call writes.
+    let error = unsafe { element.is_attribute_settable(&attr, out) };
+    if error == AXError::Success {
+        flag != 0
+    } else if error == AXError::AttributeUnsupported {
+        // Not settable (e.g. static text): not editable.
+        false
+    } else {
+        // Transient failure surfaces on the next read; don't hide the icon.
+        true
+    }
+}
+
 fn ax_range(value: &AXValue) -> Option<CFRange> {
     let mut range = MaybeUninit::<CFRange>::uninit();
     let ptr = NonNull::new(range.as_mut_ptr().cast::<c_void>())?;
@@ -283,6 +311,38 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
 }
 
 pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
+    // Cheap path: reuse the watcher's cached focused element (no AXValue read,
+    // no pid/subrole re-reads). A burst then costs just AXSelectedTextRange +
+    // AXBoundsForRange.
+    if let Some((element, pid, editable)) = crate::watcher::macos::cached_focused() {
+        if pid == std::process::id() {
+            return Ok(None);
+        }
+        if !editable {
+            return Ok(None);
+        }
+        let range_value = match copy_ax_value(&element, "AXSelectedTextRange") {
+            Ok(value) => value,
+            Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
+                return Ok(None);
+            }
+            Err(error) => return Err(read_error(error)),
+        };
+        let selected = match ax_range(&range_value) {
+            Some(range) => range,
+            None => return Err(read_error(AXError::Failure)),
+        };
+        let caret_utf16 = if selected.location < 0 {
+            0usize
+        } else {
+            selected.location as usize
+        };
+        let rect = caret_rect(&element, caret_utf16)?;
+        return Ok(Some(CaretInfo {
+            pid,
+            caret_rect: rect,
+        }));
+    }
     // SAFETY: creating the system-wide element is a plain FFI call with no arguments.
     let system = unsafe { AXUIElement::new_system_wide() };
     set_messaging_timeout(&system);

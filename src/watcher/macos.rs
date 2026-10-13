@@ -59,6 +59,8 @@ struct Inner {
     app_element: Option<CFRetained<AXUIElement>>,
     app_pid: u32,
     focused_element: Option<CFRetained<AXUIElement>>,
+    /// Cached with `focused_element`, refreshed only when focus changes.
+    focused_editable: bool,
     logged_manual_pids: HashSet<u32>,
 }
 
@@ -101,6 +103,7 @@ fn teardown_inner(inner: &mut Inner) {
     inner.observer = None;
     inner.app_element = None;
     inner.focused_element = None;
+    inner.focused_editable = false;
     inner.app_pid = 0;
 }
 
@@ -144,6 +147,7 @@ fn refresh_focused_registration(inner: &mut Inner) {
     }
     if let Some(new_element) = new_focused {
         macos_helpers::set_messaging_timeout(&new_element);
+        inner.focused_editable = macos_helpers::element_is_editable(&new_element);
         let selected = CFString::from_str("AXSelectedTextChanged");
         let value = CFString::from_str("AXValueChanged");
         // SAFETY: observer and new_element are valid and refcon is unused.
@@ -167,6 +171,8 @@ fn refresh_focused_registration(inner: &mut Inner) {
             );
         }
         inner.focused_element = Some(new_element);
+    } else {
+        inner.focused_editable = false;
     }
 }
 
@@ -178,6 +184,7 @@ fn setup_for_pid(pid: u32) {
             app_element: None,
             app_pid: 0,
             focused_element: None,
+            focused_editable: false,
             logged_manual_pids: HashSet::new(),
         });
         if inner.app_pid == pid && inner.observer.is_some() {
@@ -251,6 +258,18 @@ fn setup_for_pid(pid: u32) {
     });
 }
 
+/// The watcher's cached focused element, pid and per-focus editable flag for
+/// `caret_info`. `None` when nothing is watched: the caller falls back to the
+/// system-wide query.
+pub(crate) fn cached_focused() -> Option<(CFRetained<AXUIElement>, u32, bool)> {
+    INNER.with(|cell| {
+        let borrow = cell.borrow();
+        let inner = borrow.as_ref()?;
+        let element = inner.focused_element.clone()?;
+        Some((element, inner.app_pid, inner.focused_editable))
+    })
+}
+
 pub struct WatcherInner {
     _private: (),
 }
@@ -267,6 +286,7 @@ impl WatcherInner {
                     app_element: None,
                     app_pid: 0,
                     focused_element: None,
+                    focused_editable: false,
                     logged_manual_pids: HashSet::new(),
                 });
             }
