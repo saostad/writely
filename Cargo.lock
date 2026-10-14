@@ -3275,6 +3275,7 @@ dependencies = [
  "uiautomation",
  "ureq",
  "windows",
+ "zbus",
 ]
 
 [[package]]

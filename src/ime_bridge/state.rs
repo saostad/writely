@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 /// Current protocol version, returned by `Hello`.
-pub const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 1;
 
 /// One bridge context, keyed by (D-Bus unique sender name, context string).
 /// Two bridges may reuse the same context string without colliding.
@@ -56,6 +56,8 @@ struct ContextData {
 pub struct BridgeState {
     contexts: HashMap<ContextKey, ContextData>,
     focused: Option<ContextKey>,
+    // Used from round 2 wiring.
+    #[allow(dead_code)]
     next_replace_id: u32,
     /// Senders that already got their `Hello` log line.
     hello_logged: HashSet<String>,
@@ -197,6 +199,8 @@ impl BridgeState {
     }
 
     /// Next `Replace` request id: 1, 2, 3, …
+    // Used from round 2 wiring.
+    #[allow(dead_code)]
     pub fn next_request(&mut self) -> u32 {
         let request = self.next_replace_id;
         self.next_replace_id = self.next_replace_id.wrapping_add(1).max(1);
@@ -291,13 +295,17 @@ mod tests {
         let mut state = focused_with_text();
         assert_eq!(
             state.surrounding_text(A, "ctx", "hello", 6, 0),
-            Err("SurroundingText: cursor 6 / anchor 0 is past the end of the 5-character text."
-                .to_string())
+            Err(
+                "SurroundingText: cursor 6 / anchor 0 is past the end of the 5-character text."
+                    .to_string()
+            )
         );
         assert_eq!(
             state.surrounding_text(A, "ctx", "hello", 0, 6),
-            Err("SurroundingText: cursor 0 / anchor 6 is past the end of the 5-character text."
-                .to_string())
+            Err(
+                "SurroundingText: cursor 0 / anchor 6 is past the end of the 5-character text."
+                    .to_string()
+            )
         );
         // At the end is fine.
         assert!(state.surrounding_text(A, "ctx", "hello", 5, 5).is_ok());
@@ -310,10 +318,7 @@ mod tests {
         let mut state = BridgeState::new();
         state.focus_in(A, "ctx", "gedit", false);
         state.surrounding_text(A, "ctx", "hello", 1, 4).unwrap();
-        assert_eq!(
-            state.focused_text().unwrap().selection,
-            Some(1..4)
-        );
+        assert_eq!(state.focused_text().unwrap().selection, Some(1..4));
         state.surrounding_text(A, "ctx", "hello", 4, 1).unwrap();
         let focused = state.focused_text().unwrap();
         assert_eq!(focused.caret, 4);
@@ -408,15 +413,23 @@ mod tests {
     #[test]
     fn unknown_action_rejected_with_exact_message() {
         let state = focused_with_text();
-        assert_eq!(state.clicked(A, "ctx", "check").unwrap(), ClickAction::Check);
-        assert_eq!(state.clicked(A, "ctx", "apply").unwrap(), ClickAction::Apply);
+        assert_eq!(
+            state.clicked(A, "ctx", "check").unwrap(),
+            ClickAction::Check
+        );
+        assert_eq!(
+            state.clicked(A, "ctx", "apply").unwrap(),
+            ClickAction::Apply
+        );
         assert_eq!(
             state.clicked(A, "ctx", "dismiss").unwrap(),
             ClickAction::Dismiss
         );
         assert_eq!(
             state.clicked(A, "ctx", "bogus"),
-            Err("Clicked: unknown action \"bogus\" (expected check, apply or dismiss).".to_string())
+            Err(
+                "Clicked: unknown action \"bogus\" (expected check, apply or dismiss).".to_string()
+            )
         );
     }
 

@@ -780,6 +780,8 @@ fn main() {
         }
     }));
     let watcher_proxy = event_loop.create_proxy();
+    #[cfg(target_os = "linux")]
+    ime_bridge::start(watcher_proxy.clone());
     overlay::init(watcher_proxy.clone());
     popup::init(watcher_proxy.clone());
 
