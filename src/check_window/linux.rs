@@ -77,9 +77,13 @@ fn render_suggestion(buffer: &TextBuffer, changed: &TextTag, original: &str, sug
         match op {
             crate::diff::DiffOp::Equal(text) => buffer.insert(&mut end, &text),
             crate::diff::DiffOp::Insert(text) => {
-                let start = end;
+                // Inserting invalidates existing iters, so re-derive them
+                // from char offsets afterwards instead of reusing `end`.
+                let offset = end.offset();
                 buffer.insert(&mut end, &text);
-                buffer.apply_tag(changed, &start, &end);
+                let start = buffer.iter_at_offset(offset);
+                let tagged_end = buffer.iter_at_offset(offset + text.chars().count() as i32);
+                buffer.apply_tag(changed, &start, &tagged_end);
             }
             crate::diff::DiffOp::Delete(_) => {}
         }
@@ -403,4 +407,36 @@ pub fn show() -> Result<(), String> {
     window.present();
     input_view.grab_focus();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use gtk::prelude::*;
+
+    use super::render_suggestion;
+
+    #[test]
+    fn inserted_words_carry_the_changed_tag() {
+        // TextTagTable/TextBuffer panic without gtk::init(), and init needs a
+        // display; where there is none (headless CI) there is nothing
+        // meaningful to assert, so skip instead of faking the check.
+        if gtk::init().is_err() {
+            eprintln!("skipping changed-tag test: gtk::init() failed (no display)");
+            return;
+        }
+        let table = gtk::TextTagTable::new();
+        let changed = gtk::TextTag::new(Some("writely-changed"));
+        table.add(&changed);
+        // TextBuffer needs no display, so this runs headless without gtk::init().
+        let buffer = gtk::TextBuffer::new(Some(&table));
+        render_suggestion(&buffer, &changed, "I goes home", "I went home");
+        let (start, end) = (buffer.start_iter(), buffer.end_iter());
+        let text = buffer
+            .text(&start, &end, false)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert_eq!(text, "I went home");
+        assert!(buffer.iter_at_offset(2).has_tag(&changed));
+        assert!(!buffer.iter_at_offset(0).has_tag(&changed));
+    }
 }
