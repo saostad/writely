@@ -71,6 +71,12 @@ fn ensure_window() -> Option<Window> {
 }
 
 pub fn show_at(rect: &CaretRect) {
+    // An all-zero box means the app gave no screen position (native Wayland
+    // apps); hide rather than park the icon in the screen's top-left corner.
+    if rect.x == 0.0 && rect.y == 0.0 && rect.width == 0.0 && rect.height == 0.0 {
+        hide();
+        return;
+    }
     if ensure_window().is_none() {
         return;
     };
