@@ -47,13 +47,16 @@ pub struct FieldSnapshot {
     pub selection: Option<Range<usize>>,
     /// UTF-16 offset of the start of `text` in the field. `text` is a
     /// bounded window around the caret, not the whole field.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub window_start_utf16: usize,
     /// Total length of the field in UTF-16 units.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub field_len_utf16: usize,
     pub(crate) handle: PlatformHandle,
 }
 
 /// UTF-16 units read on each side of the caret for the snapshot window.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) const WINDOW_RADIUS_UTF16: usize = 1000;
 
 /// Longest selection (in characters) that gets checked in one click.
@@ -64,6 +67,7 @@ pub const SELECTION_TOO_LONG_MESSAGE: &str =
     "That selection is too long. Select up to 2,000 characters and try again.";
 
 /// Whole-field reads above this many UTF-16 units are refused.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) const WHOLE_READ_LIMIT_UTF16: usize = 20_000;
 
 /// Number of UTF-16 code units in `text`.
@@ -73,12 +77,14 @@ pub(crate) fn utf16_len(text: &str) -> usize {
 
 /// Whether the snapshot covers the whole field, in which case a whole-field
 /// write fallback is allowed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn covers_whole_field(snap: &FieldSnapshot) -> bool {
     snap.window_start_utf16 == 0 && utf16_len(&snap.text) == snap.field_len_utf16
 }
 
 /// The `[start, start + len)` UTF-16 window around `caret_utf16`, clamped to
 /// a field of `total_utf16` units.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn window_for_caret(caret_utf16: usize, total_utf16: usize) -> (usize, usize) {
     let start = caret_utf16.saturating_sub(WINDOW_RADIUS_UTF16);
     let end = (caret_utf16 + WINDOW_RADIUS_UTF16).min(total_utf16);
@@ -87,6 +93,7 @@ pub(crate) fn window_for_caret(caret_utf16: usize, total_utf16: usize) -> (usize
 
 /// The UTF-16 window covering the whole selection plus `WINDOW_RADIUS_UTF16`
 /// units on each side, clamped to a field of `total_utf16` units.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn window_for_selection(
     sel_start_utf16: usize,
     sel_end_utf16: usize,
@@ -177,6 +184,7 @@ pub struct CaretInfo {
 }
 
 /// Converts a char index into a UTF-16 code-unit offset into `text`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn char_to_utf16_offset(text: &str, char_index: usize) -> usize {
     text.chars().take(char_index).map(|ch| ch.len_utf16()).sum()
 }
@@ -185,6 +193,7 @@ pub(crate) fn char_to_utf16_offset(text: &str, char_index: usize) -> usize {
 ///
 /// An offset that lands inside a surrogate pair or past the end clamps to
 /// the next char boundary / the end of the text.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn utf16_to_char_offset(text: &str, utf16_offset: usize) -> usize {
     let mut units = 0usize;
     for (index, ch) in text.chars().enumerate() {

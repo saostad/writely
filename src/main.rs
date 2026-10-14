@@ -57,7 +57,9 @@ struct Pending {
     snap: Option<FieldSnapshot>,
     range: Range<usize>,
     suggestion: String,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pid: u32,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     via_clipboard: bool,
 }
 

@@ -10,6 +10,7 @@ const USER: &str = "gemini-api-key";
 const TOGETHER_USER: &str = "together-api-key";
 pub(crate) const API_KEY_PAGE: &str = "https://aistudio.google.com/apikey";
 pub(crate) const TOGETHER_API_KEY_PAGE: &str = "https://api.together.ai/settings/api-keys";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) const ACCESSIBILITY_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
 
@@ -31,8 +32,10 @@ fn keychain_user_for(provider: crate::config::Provider) -> Option<&'static str> 
 }
 
 static PERMISSION_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 static HOTKEY_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn set_hotkey_message(message: Option<String>) {
     match HOTKEY_MESSAGE.lock() {
         Ok(mut guard) => *guard = message,
@@ -40,6 +43,7 @@ pub fn set_hotkey_message(message: Option<String>) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn hotkey_message() -> Option<String> {
     match HOTKEY_MESSAGE.lock() {
         Ok(guard) => guard.clone(),
@@ -54,6 +58,7 @@ pub fn set_permission_message(message: Option<String>) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn permission_message() -> Option<String> {
     match PERMISSION_MESSAGE.lock() {
         Ok(guard) => guard.clone(),

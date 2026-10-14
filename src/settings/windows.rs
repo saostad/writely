@@ -205,10 +205,10 @@ fn refresh_provider_rows() {
     // SAFETY: all handles are live child windows while Settings is open.
     unsafe {
         for handle in [rows.key_label, rows.edit, rows.key_help, rows.link] {
-            ShowWindow(handle, if is_ollama { SW_HIDE } else { SW_SHOW });
+            let _ = ShowWindow(handle, if is_ollama { SW_HIDE } else { SW_SHOW });
         }
         for handle in [rows.url_label, rows.url_edit, rows.url_help] {
-            ShowWindow(handle, if is_ollama { SW_SHOW } else { SW_HIDE });
+            let _ = ShowWindow(handle, if is_ollama { SW_SHOW } else { SW_HIDE });
         }
     }
     let key_title = wide(match rows.provider {
@@ -445,8 +445,8 @@ pub fn show_settings() -> Result<(), String> {
         if alive {
             // SAFETY: window is a live top-level window on this thread.
             unsafe {
-                ShowWindow(window, SW_SHOW);
-                SetForegroundWindow(window);
+                let _ = ShowWindow(window, SW_SHOW);
+                let _ = SetForegroundWindow(window);
             }
             return Ok(());
         }
@@ -714,8 +714,8 @@ pub fn show_settings() -> Result<(), String> {
     }
     // SAFETY: window is a live top-level window on this thread.
     unsafe {
-        ShowWindow(window, SW_SHOW);
-        SetForegroundWindow(window);
+        let _ = ShowWindow(window, SW_SHOW);
+        let _ = SetForegroundWindow(window);
     }
     Ok(())
 }

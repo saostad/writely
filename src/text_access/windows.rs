@@ -167,37 +167,36 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
     // The first selection range gives both the caret (its start) and the
     // selection (start..end). A failure to read it is an error for the
     // popup, not a silent "no selection".
-    let (caret, selection) = match pattern.get_selection().map_err(read_error)? {
-        selections => match selections.into_iter().next() {
-            Some(selection) => {
-                let before_start = document.clone();
-                before_start
-                    .move_endpoint_by_range(
-                        TextPatternRangeEndpoint::End,
-                        &selection,
-                        TextPatternRangeEndpoint::Start,
-                    )
-                    .map_err(read_error)?;
-                let start_text = before_start.get_text(-1).map_err(read_error)?;
-                let start = start_text.chars().count();
-                let before_end = document.clone();
-                before_end
-                    .move_endpoint_by_range(
-                        TextPatternRangeEndpoint::End,
-                        &selection,
-                        TextPatternRangeEndpoint::End,
-                    )
-                    .map_err(read_error)?;
-                let end_text = before_end.get_text(-1).map_err(read_error)?;
-                let end = end_text.chars().count();
-                let char_count = text.chars().count();
-                let start = start.min(char_count);
-                let end = end.min(char_count);
-                let range = if end > start { Some(start..end) } else { None };
-                (start, range)
-            }
-            None => (0, None),
-        },
+    let selections = pattern.get_selection().map_err(read_error)?;
+    let (caret, selection) = match selections.into_iter().next() {
+        Some(selection) => {
+            let before_start = document.clone();
+            before_start
+                .move_endpoint_by_range(
+                    TextPatternRangeEndpoint::End,
+                    &selection,
+                    TextPatternRangeEndpoint::Start,
+                )
+                .map_err(read_error)?;
+            let start_text = before_start.get_text(-1).map_err(read_error)?;
+            let start = start_text.chars().count();
+            let before_end = document.clone();
+            before_end
+                .move_endpoint_by_range(
+                    TextPatternRangeEndpoint::End,
+                    &selection,
+                    TextPatternRangeEndpoint::End,
+                )
+                .map_err(read_error)?;
+            let end_text = before_end.get_text(-1).map_err(read_error)?;
+            let end = end_text.chars().count();
+            let char_count = text.chars().count();
+            let start = start.min(char_count);
+            let end = end.min(char_count);
+            let range = if end > start { Some(start..end) } else { None };
+            (start, range)
+        }
+        None => (0, None),
     };
 
     // The caret rectangle comes from the foreground thread / UIA caret range

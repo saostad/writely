@@ -24,7 +24,7 @@ pub fn settings_path() -> PathBuf {
                     .join("settings.json");
             }
         }
-        return PathBuf::from("Writely").join("settings.json");
+        PathBuf::from("Writely").join("settings.json");
     }
     #[cfg(target_os = "macos")]
     {
@@ -43,7 +43,7 @@ pub fn settings_path() -> PathBuf {
             }
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        return PathBuf::from(home)
+        PathBuf::from(home)
             .join(".config")
             .join("writely")
             .join("settings.json");

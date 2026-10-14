@@ -5,6 +5,7 @@
 /// LCS (dynamic programming) over tokens. Inputs are at most
 /// `MAX_SELECTION_CHARS`, so O(n·m) on tokens is fine.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum DiffOp {
     /// Text in both, shown in `labelColor`.
     Equal(String),
@@ -14,6 +15,7 @@ pub enum DiffOp {
     Insert(String),
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn token_kind(ch: char) -> u8 {
     if ch.is_whitespace() {
         0
@@ -26,6 +28,7 @@ fn token_kind(ch: char) -> u8 {
 
 /// Splits `text` into word / whitespace / punctuation runs. Pure so the popup
 /// and the tests share it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -50,6 +53,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
 
 /// Diffs `old` against `new` at the token level. Adjacent ops of the same
 /// kind are merged into single runs.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn diff_words(old: &str, new: &str) -> Vec<DiffOp> {
     let a = tokenize(old);
     let b = tokenize(new);
