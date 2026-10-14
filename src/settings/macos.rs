@@ -466,3 +466,26 @@ pub fn is_settings_key_window() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// Called on the main thread when Accessibility permission is granted while
+/// the app is running: hides the Accessibility button in the open Settings
+/// window and shows a green ready message. Returns true if a window was open.
+pub(crate) fn notify_permission_granted() -> bool {
+    let found = STATE.with(|state| {
+        let borrow = state.borrow();
+        borrow.as_ref().map(|window_state| {
+            (
+                window_state.accessibility_button.clone(),
+                window_state.status.clone(),
+            )
+        })
+    });
+    let Some((button, status)) = found else {
+        return false;
+    };
+    if let Some(button) = button.as_ref() {
+        button.setHidden(true);
+    }
+    set_status(&status, "Accessibility is on — Writely is ready.", false);
+    true
+}

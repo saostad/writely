@@ -27,6 +27,20 @@ pub fn permission_message() -> Option<String> {
     }
 }
 
+/// Refresh an open Settings window after Accessibility permission is granted.
+/// Returns true if a window was open and refreshed.
+#[allow(dead_code)]
+pub fn notify_permission_granted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::notify_permission_granted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 pub fn validate_api_key(key: &str) -> Result<String, String> {
     let trimmed = key.trim();
     if trimmed.is_empty() {

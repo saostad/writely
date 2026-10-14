@@ -22,6 +22,7 @@ pub enum UserEvent {
     CaretChanged,
     IconClicked,
     ReplaceClicked,
+    PermissionGranted,
     Suggestion {
         generation: u64,
         result: Result<String, String>,
@@ -286,6 +287,54 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
     }
 }
 
+/// Start the caret watcher, logging failures the same way as startup.
+fn start_watcher(proxy: &EventLoopProxy<UserEvent>) -> Option<watcher::Watcher> {
+    match watcher::Watcher::start(proxy.clone()) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            eprintln!("Writely: {error}");
+            None
+        }
+    }
+}
+
+/// Poll `check_permission(false)` every 2 s until Accessibility is granted,
+/// then send one `PermissionGranted` and exit. Never prompts.
+fn spawn_permission_poll(proxy: EventLoopProxy<UserEvent>) {
+    if let Err(error) = std::thread::Builder::new()
+        .name("writely-permission".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if text_access::check_permission(false).is_ok() {
+                if let Err(send_error) = proxy.send_event(UserEvent::PermissionGranted) {
+                    eprintln!("Writely: could not deliver the permission event: {send_error}");
+                }
+                break;
+            }
+        })
+    {
+        eprintln!("Writely: could not start the permission watcher: {error}");
+    }
+}
+
+fn handle_permission_granted(
+    proxy: &EventLoopProxy<UserEvent>,
+    caret_watcher: &mut Option<watcher::Watcher>,
+    tray_icon: &Option<TrayIcon>,
+) {
+    settings::set_permission_message(None);
+    if caret_watcher.is_none() {
+        *caret_watcher = start_watcher(proxy);
+    }
+    if let Some(tray) = tray_icon {
+        if let Err(error) = tray.set_tooltip(Some("Writely")) {
+            eprintln!("Writely: could not update the tray tooltip: {error}");
+        }
+    }
+    settings::notify_permission_granted();
+    eprintln!("Writely: Accessibility permission granted.");
+}
+
 fn main() {
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
@@ -373,14 +422,9 @@ fn main() {
                     }
                 } else {
                     match text_access::check_permission(true) {
-                        Ok(()) => match watcher::Watcher::start(watcher_proxy.clone()) {
-                            Ok(watcher) => {
-                                caret_watcher = Some(watcher);
-                            }
-                            Err(error) => {
-                                eprintln!("Writely: {error}");
-                            }
-                        },
+                        Ok(()) => {
+                            caret_watcher = start_watcher(&watcher_proxy);
+                        }
                         Err(error) => {
                             eprintln!("Writely: {error}");
                             settings::set_permission_message(Some(error));
@@ -393,6 +437,7 @@ fn main() {
                                     );
                                 }
                             }
+                            spawn_permission_poll(watcher_proxy.clone());
                         }
                     }
                 }
@@ -400,6 +445,17 @@ fn main() {
             Event::UserEvent(UserEvent::MenuEvent(event)) => {
                 if event.id == settings_id {
                     popup::hide();
+                    // A stale permission message (e.g. granted after startup)
+                    // is cleared here so Settings opens fresh.
+                    if text_access::check_permission(false).is_ok()
+                        && caret_watcher.is_none()
+                    {
+                        handle_permission_granted(
+                            &watcher_proxy,
+                            &mut caret_watcher,
+                            &tray_icon,
+                        );
+                    }
                     if let Err(error) = settings::show_settings() {
                         eprintln!("Writely: {error}");
                     }
@@ -450,6 +506,9 @@ fn main() {
             }
             Event::UserEvent(UserEvent::ReplaceClicked) => {
                 handle_replace_clicked(&mut pending, &mut last_anchor);
+            }
+            Event::UserEvent(UserEvent::PermissionGranted) => {
+                handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon);
             }
             Event::UserEvent(UserEvent::Suggestion {
                 generation: event_generation,

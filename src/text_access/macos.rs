@@ -24,7 +24,7 @@ pub(crate) struct PlatformHandle {
     element: CFRetained<AXUIElement>,
 }
 
-const PERMISSION_ERROR: &str = "Writely needs Accessibility permission to see where you're typing. Open System Settings › Privacy & Security › Accessibility, turn on Writely, then restart Writely.";
+const PERMISSION_ERROR: &str = "Writely needs Accessibility permission to see where you're typing. Open System Settings › Privacy & Security › Accessibility, turn on Writely. Writely starts working by itself once the switch is on.";
 
 /// Pids already told that the caret position is unavailable, so the message
 /// below logs once per pid instead of on every keystroke.
