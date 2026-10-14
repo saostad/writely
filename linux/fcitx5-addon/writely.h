@@ -71,6 +71,9 @@ private:
 
     // Select fallback for apps without surrounding text.
     void scheduleUnavailableTimer(fcitx::InputContext *ic);
+    // Records the PRIMARY selection as this context gained focus, so only
+    // text selected while the field has focus is ever reported.
+    void recordPrimaryAtFocus(fcitx::InputContext *ic);
     bool clipboardAvailable();
     // The user clicked one of Writely's candidates.
     void sendClicked(fcitx::InputContext *ic, const std::string &action);
@@ -101,13 +104,14 @@ private:
         std::string auxText;
     };
     std::map<std::string, ShownPanel> shown_;
-    // Pending one-shot timers per context id: the TextUnavailable delay
-    // after FocusIn, and the select read-back delay after Shift+Home.
-    // Fired timers stay in the map, disabled, until replaced or erased.
+    // Pending TextUnavailable timers per context id (the delay after
+    // FocusIn). Fired timers stay in the map, disabled, until replaced or
+    // erased.
     std::map<std::string, std::unique_ptr<fcitx::EventSourceTime>>
         unavailableTimers_;
-    std::map<std::string, std::unique_ptr<fcitx::EventSourceTime>>
-        selectTimers_;
+    // PRIMARY selection when each context gained focus: only PRIMARY text
+    // that differs from this was selected while the field had focus.
+    std::map<std::string, std::string> primaryAtFocus_;
     // Text reported by Selected per context, for the ReplaceSelection check.
     std::map<std::string, std::string> selectedText_;
     // Programs already warned about missing surrounding-text support.

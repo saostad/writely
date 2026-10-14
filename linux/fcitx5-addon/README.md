@@ -50,6 +50,9 @@ sudo make -C linux/fcitx5-addon install
   the cursor, without touching another engine's panel content, and applies
   accepted fixes via surrounding-text deletion.
 - For apps that don't share their text (e.g. Chromium), reports
-  `TextUnavailable` and falls back to selecting the line with `Shift+Home`
-  and reading it through the PRIMARY selection (the clipboard is untouched);
-  accepted fixes are committed over the still-active selection.
+  `TextUnavailable`. In those apps the user selects the text to check first,
+  and the add-on reads the selection through the PRIMARY selection (the
+  clipboard is untouched); it never moves the cursor or changes the
+  selection itself, because forwarded keys lose their modifiers on Wayland
+  and can't select reliably. Accepted fixes are committed over the
+  still-active selection.

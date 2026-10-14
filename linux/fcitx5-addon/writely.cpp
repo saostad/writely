@@ -6,7 +6,6 @@
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/dbus/matchrule.h>
 #include <fcitx-utils/event.h>
-#include <fcitx-utils/key.h>
 #include <fcitx-utils/log.h>
 #include <fcitx-module/clipboard/clipboard_public.h>
 #include <fcitx-module/dbus/dbus_public.h>
@@ -32,9 +31,6 @@ constexpr uint64_t kCallTimeoutUsec = 5000000;
 // Delay after FocusIn before reporting missing surrounding text, giving
 // the app time to send it. In microseconds.
 constexpr uint64_t kUnavailableDelayUsec = 300000;
-// Delay after forwarding Shift+Home before reading back the PRIMARY
-// selection. In microseconds.
-constexpr uint64_t kSelectReadDelayUsec = 150000;
 
 bool hasSurroundingText(const fcitx::InputContext *ic) {
     return ic->capabilityFlags().test(fcitx::CapabilityFlag::SurroundingText);
@@ -124,8 +120,9 @@ void Writely::onWritelyDisappeared() {
     writelyAvailable_ = false;
     announced_.clear();
     unavailableTimers_.clear();
-    selectTimers_.clear();
     selectedText_.clear();
+    // primaryAtFocus_ survives: tracked focus does too, and a selection made
+    // while Writely was away is still the user's selection in that field.
     // Drop pending panel state; clicking a stale candidate would send Clicked
     // to nobody.
     instance_->inputContextManager().foreach([this](fcitx::InputContext *ic) {
@@ -141,7 +138,31 @@ void Writely::onWritelyDisappeared() {
 void Writely::onFocusIn(fcitx::InputContext *ic) {
     focusedUuid_ = ic->uuid();
     hasFocused_ = true;
+    recordPrimaryAtFocus(ic);
     announceFocus(ic);
+}
+
+void Writely::recordPrimaryAtFocus(fcitx::InputContext *ic) {
+    const std::string ctx = contextId(ic);
+    fcitx::AddonInstance *clipboard =
+        instance_->addonManager().addon("clipboard");
+    if (!clipboard) {
+        primaryAtFocus_[ctx] = "";
+        return;
+    }
+    try {
+        primaryAtFocus_[ctx] =
+            clipboard->call<fcitx::IClipboard::primary>(ic);
+    } catch (const std::exception &e) {
+        FCITX_WARN() << "Writely: could not read the PRIMARY selection for "
+                        "focus tracking: "
+                     << e.what();
+        primaryAtFocus_[ctx] = "";
+    } catch (...) {
+        FCITX_WARN() << "Writely: could not read the PRIMARY selection for "
+                        "focus tracking: unknown error";
+        primaryAtFocus_[ctx] = "";
+    }
 }
 
 void Writely::onFocusOut(fcitx::InputContext *ic) {
@@ -170,7 +191,7 @@ void Writely::onDestroyed(fcitx::InputContext *ic) {
     announced_.erase(ctx);
     shown_.erase(ctx);
     unavailableTimers_.erase(ctx);
-    selectTimers_.erase(ctx);
+    primaryAtFocus_.erase(ctx);
     selectedText_.erase(ctx);
     if (bus_) {
         fcitx::dbus::Message msg =
@@ -551,59 +572,38 @@ void Writely::onSelectRequest(const std::string &ctx, uint32_t request) {
                      "the text field is no longer focused");
         return;
     }
-    if (!clipboardAvailable()) {
+    // The user selects; the add-on never changes the selection (forwarded
+    // keys lose their modifiers on Wayland, so it can't select reliably).
+    // Selecting sets the PRIMARY selection on Linux, so reading it back
+    // never touches the user's clipboard. PRIMARY is only accepted when it
+    // changed while this field had focus, so a selection from another app
+    // is never reported.
+    fcitx::AddonInstance *clipboard =
+        instance_->addonManager().addon("clipboard");
+    if (!clipboard) {
         sendSelected(ctx, request, false, "",
                      "the fcitx5 clipboard add-on is not available");
         return;
     }
+    std::string current;
     try {
-        const fcitx::Key shiftHome("Shift+Home");
-        ic->forwardKey(shiftHome, false);
-        ic->forwardKey(shiftHome, true);
+        current = clipboard->call<fcitx::IClipboard::primary>(ic);
     } catch (const std::exception &e) {
         sendSelected(ctx, request, false, "", e.what());
         return;
     } catch (...) {
         sendSelected(ctx, request, false, "",
-                     "unknown error while selecting the text");
+                     "unknown error while reading the selection");
         return;
     }
-    // Selecting sets the PRIMARY selection on Linux, so reading it back
-    // never touches the user's clipboard.
-    const fcitx::ICUUID uuid = ic->uuid();
-    auto timer = instance_->eventLoop().addTimeEvent(
-        CLOCK_MONOTONIC,
-        fcitx::now(CLOCK_MONOTONIC) + kSelectReadDelayUsec, 0,
-        [this, ctx, uuid, request](fcitx::EventSourceTime *, uint64_t) {
-            fcitx::InputContext *current =
-                instance_->inputContextManager().findByUUID(uuid);
-            if (!current || !hasFocused_ || current->uuid() != focusedUuid_) {
-                sendSelected(ctx, request, false, "",
-                             "the text field is no longer focused");
-                return true;
-            }
-            fcitx::AddonInstance *clipboard =
-                instance_->addonManager().addon("clipboard");
-            if (!clipboard) {
-                sendSelected(ctx, request, false, "",
-                             "the fcitx5 clipboard add-on is not available");
-                return true;
-            }
-            try {
-                const std::string text =
-                    clipboard->call<fcitx::IClipboard::primary>(current);
-                selectedText_[ctx] = text;
-                sendSelected(ctx, request, true, text, "");
-            } catch (const std::exception &e) {
-                sendSelected(ctx, request, false, "", e.what());
-            } catch (...) {
-                sendSelected(ctx, request, false, "",
-                             "unknown error while reading the selection");
-            }
-            return true;
-        });
-    timer->setOneShot();
-    selectTimers_[ctx] = std::move(timer);
+    const auto baseline = primaryAtFocus_.find(ctx);
+    if (current.empty() || (baseline != primaryAtFocus_.end() &&
+                            current == baseline->second)) {
+        sendSelected(ctx, request, true, "", "");
+        return;
+    }
+    selectedText_[ctx] = current;
+    sendSelected(ctx, request, true, current, "");
 }
 
 void Writely::onReplaceSelection(const std::string &ctx, uint32_t request,
@@ -651,6 +651,9 @@ void Writely::onReplaceSelection(const std::string &ctx, uint32_t request,
         return;
     }
     sendReplaceResult(ctx, request, true, "");
+    // The committed-over selection is still in PRIMARY; make it the new
+    // baseline so the same old selection can't be checked a second time.
+    primaryAtFocus_[ctx] = current;
     if (hideWritelyPanel(ic, ctx)) {
         ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
     }
