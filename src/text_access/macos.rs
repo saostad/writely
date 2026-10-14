@@ -11,7 +11,7 @@ use objc2_application_services::{
 };
 use objc2_core_foundation::{
     kCFBooleanFalse, kCFBooleanTrue, CFBoolean, CFDictionary, CFIndex, CFNumber, CFNumberType,
-    CFRange, CFRetained, CFString, CFType, CGRect, Type,
+    CFRange, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
 };
 
 use super::{
@@ -34,7 +34,7 @@ static NO_CARET_LOGGED: LazyLock<Mutex<HashSet<u32>>> =
 fn log_no_caret_once(pid: u32) {
     // While cursor reporting was newly enabled for this pid, the caret
     // position may lag behind the focused element (the retry ends as soon as
-    // the element appears); the "no text cursor appeared within 4 s" line at
+    // the element appears); the "no text cursor appeared within 12 s" line at
     // the end of the window covers a lasting failure, so don't log here.
     if crate::watcher::macos::no_caret_suppressed(pid) {
         return;
@@ -47,7 +47,27 @@ fn log_no_caret_once(pid: u32) {
     }
 }
 
-/// Whether setting `AXSelectedText` was silently ignored: the verification
+/// Whether a caret rectangle from `AXBoundsForRange` is a real caret
+/// position: it must have a non-zero height and its origin must lie inside
+/// the focused element's `AXFrame`, grown by 4 pt on each side. Some apps
+/// (e.g. the Claude desktop app) report a bogus {0,0,0,0}-style rect that
+/// must not anchor the icon.
+pub(crate) fn caret_rect_valid(rect: &CGRect, frame: &CGRect) -> bool {
+    if rect.size.height == 0.0 {
+        return false;
+    }
+    const MARGIN: f64 = 4.0;
+    rect.origin.x >= frame.origin.x - MARGIN
+        && rect.origin.x <= frame.origin.x + frame.size.width + MARGIN
+        && rect.origin.y >= frame.origin.y - MARGIN
+        && rect.origin.y <= frame.origin.y + frame.size.height + MARGIN
+}
+
+/// The focused element's `AXFrame` in top-left screen coordinates.
+fn element_frame(element: &AXUIElement) -> Result<CGRect, AXError> {
+    let value = copy_ax_value(element, "AXFrame")?;
+    ax_rect(&value).ok_or(AXError::Failure)
+}
 /// read still shows the snapshot text instead of the expected text.
 pub(crate) fn selected_write_ignored(actual: &str, snapshot_text: &str, expected: &str) -> bool {
     actual == snapshot_text && actual != expected
@@ -601,34 +621,49 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
 }
 
 /// The caret screen rectangle, or `None` when neither bounds lookup yields a
-/// real caret position. There is no fallback: without a real position the
-/// icon stays hidden.
+/// real caret position. A lookup that yields a rect outside the focused
+/// element's frame (or with zero height) is bogus and ignored; when the
+/// frame itself can't be read, today's behaviour is kept. There is no
+/// fallback: without a real position the icon stays hidden.
 fn caret_rect(element: &AXUIElement, caret_utf16: usize) -> Option<CaretRect> {
+    let frame = element_frame(element).ok();
+    let mut candidate: Option<CGRect> = None;
     if let Ok(rect) = bounds_for_range(element, caret_utf16, 0) {
         if rect.size.width != 0.0 || rect.size.height != 0.0 {
-            return Some(CaretRect {
-                x: rect.origin.x,
-                y: rect.origin.y,
-                width: rect.size.width,
-                height: rect.size.height,
-                physical: false,
-            });
+            candidate = Some(rect);
         }
     }
-    if caret_utf16 > 0 {
+    if candidate.is_none() && caret_utf16 > 0 {
         if let Ok(rect) = bounds_for_range(element, caret_utf16 - 1, 1) {
             if rect.size.width != 0.0 || rect.size.height != 0.0 {
-                return Some(CaretRect {
-                    x: rect.origin.x + rect.size.width,
-                    y: rect.origin.y,
-                    width: 0.0,
-                    height: rect.size.height,
-                    physical: false,
+                candidate = Some(CGRect {
+                    origin: CGPoint {
+                        x: rect.origin.x + rect.size.width,
+                        y: rect.origin.y,
+                    },
+                    size: CGSize {
+                        width: 0.0,
+                        height: rect.size.height,
+                    },
                 });
             }
         }
     }
-    None
+    let rect = candidate?;
+    // A bogus rect (e.g. Claude's {0,1117,0,0}) fails validation; without a
+    // readable frame the rect is trusted as before.
+    if let Some(frame) = frame {
+        if !caret_rect_valid(&rect, &frame) {
+            return None;
+        }
+    }
+    Some(CaretRect {
+        x: rect.origin.x,
+        y: rect.origin.y,
+        width: rect.size.width,
+        height: rect.size.height,
+        physical: false,
+    })
 }
 
 pub(crate) fn read_window(
@@ -815,8 +850,12 @@ pub(crate) fn read_at(
 
 #[cfg(test)]
 mod tests {
-    use super::{read_error, selected_write_ignored, selected_write_ignored_reread, timeout_error};
+    use super::{
+        caret_rect_valid, read_error, selected_write_ignored, selected_write_ignored_reread,
+        timeout_error,
+    };
     use objc2_application_services::AXError;
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
     #[test]
     fn cannot_complete_maps_to_timeout_message() {
@@ -843,6 +882,62 @@ mod tests {
         assert!(!selected_write_ignored("other", "old", "new"));
         // Identical snapshot and expectation: nothing to distinguish.
         assert!(!selected_write_ignored("same", "same", "same"));
+    }
+
+    #[test]
+    fn bogus_caret_rect_outside_frame_is_rejected() {
+        let frame = CGRect {
+            origin: CGPoint { x: 100.0, y: 100.0 },
+            size: CGSize {
+                width: 400.0,
+                height: 200.0,
+            },
+        };
+        // Claude's bogus rect: zero size, far outside the frame.
+        let bogus = CGRect {
+            origin: CGPoint { x: 0.0, y: 1117.0 },
+            size: CGSize {
+                width: 0.0,
+                height: 0.0,
+            },
+        };
+        assert!(!caret_rect_valid(&bogus, &frame));
+        // Zero height alone is rejected even inside the frame.
+        let flat = CGRect {
+            origin: CGPoint { x: 150.0, y: 150.0 },
+            size: CGSize {
+                width: 2.0,
+                height: 0.0,
+            },
+        };
+        assert!(!caret_rect_valid(&flat, &frame));
+        // A real caret rect inside the frame (and within the 4 pt margin)
+        // is accepted.
+        let good = CGRect {
+            origin: CGPoint { x: 180.0, y: 165.0 },
+            size: CGSize {
+                width: 0.0,
+                height: 16.0,
+            },
+        };
+        assert!(caret_rect_valid(&good, &frame));
+        let on_edge = CGRect {
+            origin: CGPoint { x: 100.0, y: 100.0 },
+            size: CGSize {
+                width: 1.0,
+                height: 16.0,
+            },
+        };
+        assert!(caret_rect_valid(&on_edge, &frame));
+        // Outside the frame plus the 4 pt margin is rejected.
+        let far = CGRect {
+            origin: CGPoint { x: 505.0, y: 150.0 },
+            size: CGSize {
+                width: 1.0,
+                height: 16.0,
+            },
+        };
+        assert!(!caret_rect_valid(&far, &frame));
     }
 
     #[test]

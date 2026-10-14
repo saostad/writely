@@ -70,13 +70,13 @@ struct Inner {
     enhanced_pids: HashSet<u32>,
     /// Pids where the enable/failure report already logged (once per pid).
     logged_report_pids: HashSet<u32>,
-    /// Pids where the 4 s timeout report already logged (once per pid).
+    /// Pids where the 12 s timeout report already logged (once per pid).
     logged_timeout_pids: HashSet<u32>,
     /// Pids where a retry window already started; cleared when the pid is
     /// deactivated so a re-activation may retry once more.
     retried_pids: HashSet<u32>,
     /// When cursor reporting was newly enabled per pid (CFAbsoluteTime). The
-    /// "can't find the text cursor" message stays suppressed for the full 4 s
+    /// "can't find the text cursor" message stays suppressed for the full 12 s
     /// window even when the retry ends early, because the caret position can
     /// lag behind the newly appeared focused element.
     grace_enabled_at: HashMap<u32, f64>,
@@ -85,9 +85,10 @@ struct Inner {
     retry_remaining: u8,
 }
 
-/// Retry cadence after enabling cursor reporting: every 500 ms for up to 4 s.
+/// Retry cadence after enabling cursor reporting: every 500 ms for up to 12 s
+/// (Firefox needs about 10 s to build its accessibility tree).
 const RETRY_INTERVAL_SECS: f64 = 0.5;
-const RETRY_ATTEMPTS: u8 = 8;
+const RETRY_ATTEMPTS: u8 = 24;
 
 /// Whether the app reports a focused element, for `needs_enhanced_ui`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +209,7 @@ fn start_retry(inner: &mut Inner, pid: u32) {
 
 /// One 500 ms retry tick: re-register the focused element and flag a caret
 /// change. Stops early once a focused element is registered or the frontmost
-/// app changed; after 4 s logs that no cursor appeared.
+/// app changed; after 12 s logs that no cursor appeared.
 fn retry_tick() {
     INNER.with(|cell| {
         let mut borrow = cell.borrow_mut();
@@ -242,7 +243,7 @@ fn retry_tick() {
             cancel_retry(inner);
             if inner.logged_timeout_pids.insert(pid) {
                 eprintln!(
-                    "Writely: turned on cursor reporting for {name} but no text cursor appeared within 4 s."
+                    "Writely: turned on cursor reporting for {name} but no text cursor appeared within 12 s."
                 );
             }
         }
@@ -517,7 +518,7 @@ fn setup_for_pid(pid: u32) {
         inner.app_pid = pid;
         // Chrome builds its accessibility tree asynchronously with no
         // focus-change event, so poll the focused element on the main run
-        // loop for up to 4 s after newly enabling cursor reporting.
+        // loop for up to 12 s after newly enabling cursor reporting.
         if newly_enabled && inner.retried_pids.insert(pid) {
             start_retry(inner, pid);
         }
@@ -538,10 +539,10 @@ pub(crate) fn retry_active_for(pid: u32) -> bool {
 }
 
 /// Whether the "can't find the text cursor" message is suppressed for `pid`:
-/// while its retry window runs, plus the rest of the 4 s window after the
+/// while its retry window runs, plus the rest of the 12 s window after the
 /// retry ends early (the focused element appearing cancels the retry, but the
 /// caret position may lag behind it). `text_access` uses this to skip the
-/// premature message; afterwards the window's own 4 s timeout line or the
+/// premature message; afterwards the window's own 12 s timeout line or the
 /// regular message covers a lasting failure.
 pub(crate) fn no_caret_suppressed(pid: u32) -> bool {
     if retry_active_for(pid) {
@@ -733,19 +734,19 @@ mod tests {
     }
 
     #[test]
-    fn retry_constants_cover_four_seconds() {
-        assert_eq!(super::RETRY_ATTEMPTS, 8);
+    fn retry_constants_cover_twelve_seconds() {
+        assert_eq!(super::RETRY_ATTEMPTS, 24);
         assert_eq!(
             super::RETRY_ATTEMPTS as f64 * super::RETRY_INTERVAL_SECS,
-            4.0
+            12.0
         );
     }
 
     #[test]
     fn grace_covers_the_retry_window() {
         assert!(super::within_grace(100.0, 100.0));
-        assert!(super::within_grace(103.9, 100.0));
-        assert!(!super::within_grace(104.0, 100.0));
-        assert!(!super::within_grace(110.0, 100.0));
+        assert!(super::within_grace(111.9, 100.0));
+        assert!(!super::within_grace(112.0, 100.0));
+        assert!(!super::within_grace(120.0, 100.0));
     }
 }
