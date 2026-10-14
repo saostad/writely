@@ -509,9 +509,9 @@ pub fn show_settings() -> Result<(), String> {
     let delegate = SettingsDelegate::new(mtm);
     let permission_text = super::permission_message();
     let window_height = if permission_text.is_some() {
-        538.0
+        566.0
     } else {
-        470.0
+        498.0
     };
     // SAFETY: the content rect, style mask and backing store are valid and mtm is the main thread.
     let window = unsafe {
@@ -645,6 +645,12 @@ pub fn show_settings() -> Result<(), String> {
         NSSize::new(110.0, 26.0),
     ));
 
+    let hotkey_hint = NSTextField::wrappingLabelWithString(
+        ns_string!("Tip: select text in any app and press ⌃⌥G to check it."),
+        mtm,
+    );
+    hotkey_hint.setFrame(row(18.0, 10.0));
+
     // The Accessibility button gets its own row above the status line and only
     // exists while the permission message is set. It uses its own selector.
     let accessibility_button: Option<Retained<NSButton>> = if permission_text.is_some() {
@@ -728,6 +734,8 @@ pub fn show_settings() -> Result<(), String> {
         set_status(&status_label, message, true);
     } else if let Some(error) = &initial_error {
         set_status(&status_label, error, true);
+    } else if let Some(hotkey_error) = super::hotkey_message() {
+        set_status(&status_label, &hotkey_error, true);
     }
 
     if delegate.ivars().field.set(field.clone()).is_err() {
@@ -755,6 +763,7 @@ pub fn show_settings() -> Result<(), String> {
     content.addSubview(&url_help);
     content.addSubview(&save_button);
     content.addSubview(&remove_button);
+    content.addSubview(&hotkey_hint);
     content.addSubview(&status_label);
 
     STATE.with(|state| {

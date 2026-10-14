@@ -31,6 +31,21 @@ fn keychain_user_for(provider: crate::config::Provider) -> Option<&'static str> 
 }
 
 static PERMISSION_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static HOTKEY_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_hotkey_message(message: Option<String>) {
+    match HOTKEY_MESSAGE.lock() {
+        Ok(mut guard) => *guard = message,
+        Err(poisoned) => *poisoned.into_inner() = message,
+    }
+}
+
+pub fn hotkey_message() -> Option<String> {
+    match HOTKEY_MESSAGE.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
 
 pub fn set_permission_message(message: Option<String>) {
     match PERMISSION_MESSAGE.lock() {

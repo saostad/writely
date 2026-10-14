@@ -24,6 +24,7 @@ pub enum UserEvent {
     MenuEvent(MenuEvent),
     CaretChanged,
     IconClicked,
+    HotkeyPressed,
     ReplaceClicked,
     PermissionGranted,
     Suggestion {
@@ -50,6 +51,66 @@ struct Pending {
     suggestion: String,
     pid: u32,
     via_clipboard: bool,
+}
+
+/// Mouse-pointer anchor for the hotkey popup when no caret or container is
+/// known: a zero-size rect at the pointer, converted from AppKit
+/// bottom-left coords to the top-left coords the popup uses.
+#[cfg(target_os = "macos")]
+fn mouse_anchor() -> Option<CaretRect> {
+    use objc2_app_kit::NSScreen;
+    use objc2_foundation::MainThreadMarker;
+    let mtm = MainThreadMarker::new()?;
+    let screens = NSScreen::screens(mtm);
+    if screens.count() == 0 {
+        return None;
+    }
+    let primary_height = screens.objectAtIndex(0).frame().size.height;
+    let point = objc2_app_kit::NSEvent::mouseLocation();
+    Some(CaretRect {
+        x: point.x,
+        y: primary_height - point.y,
+        width: 0.0,
+        height: 0.0,
+        physical: false,
+    })
+}
+
+/// Registers the global hotkey (⌃⌥G) on macOS. Returns the manager (kept
+/// alive by the caller) or `None` when registration failed; failures are
+/// logged and shown in the Settings status line with the real error.
+#[cfg(target_os = "macos")]
+fn register_hotkey(proxy: &EventLoopProxy<UserEvent>) -> Option<global_hotkey::GlobalHotKeyManager> {
+    use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+    use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(manager) => manager,
+        Err(error) => {
+            let message = format!("Could not register the ⌃⌥G hotkey: {error}");
+            eprintln!("Writely: {message}");
+            settings::set_hotkey_message(Some(message));
+            return None;
+        }
+    };
+    let hotkey = HotKey::new(
+        Some(Modifiers::CONTROL | Modifiers::ALT),
+        Code::KeyG,
+    );
+    if let Err(error) = manager.register(hotkey) {
+        let message = format!("Could not register the ⌃⌥G hotkey: {error}");
+        eprintln!("Writely: {message}");
+        settings::set_hotkey_message(Some(message));
+        return None;
+    }
+    let proxy = proxy.clone();
+    GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
+        if event.state() == HotKeyState::Pressed {
+            if let Err(error) = proxy.send_event(UserEvent::HotkeyPressed) {
+                eprintln!("Writely: could not deliver the hotkey event: {error}");
+            }
+        }
+    }));
+    Some(manager)
 }
 
 /// Shows the popup at `anchor` (falling back to `fallback`), remembers the
@@ -123,6 +184,7 @@ fn handle_icon_clipboard(
     last_anchor: &mut Option<CaretRect>,
     app_settings: config::AppSettings,
     key: Option<String>,
+    from_hotkey: bool,
 ) {
     let copied = match clipboard::copy_selected_text(pid) {
         Ok(copied) => copied,
@@ -131,29 +193,20 @@ fn handle_icon_clipboard(
             return;
         }
     };
+    let empty_message = if from_hotkey {
+        "Select the text you want to check, then press ⌃⌥G."
+    } else {
+        "Select the text you want to check, then click W."
+    };
     let text = match copied {
         clipboard::CopyResult::Text(text) => text,
         clipboard::CopyResult::NothingNew => {
-            show_popup(
-                "Select the text you want to check, then click W.",
-                false,
-                false,
-                anchor,
-                None,
-                last_anchor,
-            );
+            show_popup(empty_message, false, false, anchor, None, last_anchor);
             return;
         }
     };
     if text.trim().is_empty() {
-        show_popup(
-            "Select the text you want to check, then click W.",
-            false,
-            false,
-            anchor,
-            None,
-            last_anchor,
-        );
+        show_popup(empty_message, false, false, anchor, None, last_anchor);
         return;
     }
     if text.chars().count() > text_access::MAX_SELECTION_CHARS {
@@ -196,6 +249,7 @@ fn handle_icon_clicked(
     checking: &mut Option<Checking>,
     pending: &mut Option<Pending>,
     last_anchor: &mut Option<CaretRect>,
+    from_hotkey: bool,
 ) {
     // A new click invalidates any in-flight request; stale replies are dropped.
     *generation = generation.wrapping_add(1);
@@ -210,6 +264,16 @@ fn handle_icon_clicked(
             (None, None)
         }
     };
+    // The hotkey popup anchors at the caret if one is known, else at the
+    // input-area container (already in `live_anchor`), else at the mouse.
+    #[cfg(target_os = "macos")]
+    let (live_anchor, live_pid) = if from_hotkey && live_anchor.is_none() {
+        (mouse_anchor().or(live_anchor), live_pid)
+    } else {
+        (live_anchor, live_pid)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = from_hotkey;
     let app_settings = match config::load_settings() {
         Ok(app_settings) => app_settings,
         Err(error) => {
@@ -276,6 +340,7 @@ fn handle_icon_clicked(
                     last_anchor,
                     app_settings.clone(),
                     key,
+                    from_hotkey,
                 );
                 return;
             }
@@ -361,6 +426,7 @@ fn handle_icon_clicked(
                         last_anchor,
                         app_settings.clone(),
                         key,
+                        from_hotkey,
                     );
                     return;
                 }
@@ -603,6 +669,8 @@ fn main() {
     popup::init(watcher_proxy.clone());
 
     let mut tray_icon: Option<TrayIcon> = None;
+    #[cfg(target_os = "macos")]
+    let mut _hotkey_manager: Option<global_hotkey::GlobalHotKeyManager> = None;
     let mut settings_id = tray_icon::menu::MenuId::new("settings");
     let mut quit_id = tray_icon::menu::MenuId::new("quit");
     let mut caret_watcher: Option<watcher::Watcher> = None;
@@ -688,6 +756,10 @@ fn main() {
                         }
                     }
                 }
+                #[cfg(target_os = "macos")]
+                {
+                    _hotkey_manager = register_hotkey(&watcher_proxy);
+                }
             }
             Event::UserEvent(UserEvent::MenuEvent(event)) => {
                 if event.id == settings_id {
@@ -749,6 +821,17 @@ fn main() {
                     &mut checking,
                     &mut pending,
                     &mut last_anchor,
+                    false,
+                );
+            }
+            Event::UserEvent(UserEvent::HotkeyPressed) => {
+                handle_icon_clicked(
+                    &watcher_proxy,
+                    &mut generation,
+                    &mut checking,
+                    &mut pending,
+                    &mut last_anchor,
+                    true,
                 );
             }
             Event::UserEvent(UserEvent::ReplaceClicked) => {
