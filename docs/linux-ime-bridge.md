@@ -97,6 +97,8 @@ Answer to a `Replace` or `ReplaceSelection` signal: whether replacing
 Answer to a `SelectRequest` signal: the text the user selected in this
 field while it had focus; empty text means nothing is selected.
 `ok=false` with a human-readable `error` when the selection can't be read.
+After Writely uses a selection (Apply or Dismiss), the bridge clears
+PRIMARY, so middle-click paste is empty until the next selection.
 
 ## Signals (Writely emits these)
 

@@ -74,6 +74,10 @@ private:
     // Records the PRIMARY selection as this context gained focus, so only
     // text selected while the field has focus is ever reported.
     void recordPrimaryAtFocus(fcitx::InputContext *ic);
+    // Clears PRIMARY after Writely used a selection (Apply or Dismiss), so
+    // re-selecting the same text counts as new. Resets the focus baseline
+    // to the PRIMARY content afterwards and drops the remembered selection.
+    void clearPrimaryAfterUse(fcitx::InputContext *ic, const std::string &ctx);
     bool clipboardAvailable();
     // The user clicked one of Writely's candidates.
     void sendClicked(fcitx::InputContext *ic, const std::string &action);

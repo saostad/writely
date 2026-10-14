@@ -55,4 +55,6 @@ sudo make -C linux/fcitx5-addon install
   clipboard is untouched); it never moves the cursor or changes the
   selection itself, because forwarded keys lose their modifiers on Wayland
   and can't select reliably. Accepted fixes are committed over the
-  still-active selection.
+  still-active selection. After Writely uses a selection (Apply or Dismiss),
+  the bridge clears PRIMARY, so middle-click paste is empty until the next
+  selection.

@@ -7,6 +7,7 @@
 #include <fcitx-utils/dbus/matchrule.h>
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/log.h>
+#include <fcitx-utils/utf8.h>
 #include <fcitx-module/clipboard/clipboard_public.h>
 #include <fcitx-module/dbus/dbus_public.h>
 #include <fcitx/addonfactory.h>
@@ -162,6 +163,34 @@ void Writely::recordPrimaryAtFocus(fcitx::InputContext *ic) {
         FCITX_WARN() << "Writely: could not read the PRIMARY selection for "
                         "focus tracking: unknown error";
         primaryAtFocus_[ctx] = "";
+    }
+}
+
+void Writely::clearPrimaryAfterUse(fcitx::InputContext *ic,
+                                   const std::string &ctx) {
+    fcitx::AddonInstance *clipboard =
+        instance_->addonManager().addon("clipboard");
+    if (!clipboard) {
+        return;
+    }
+    try {
+        clipboard->call<fcitx::IClipboard::setPrimary>("writely", "");
+        const std::string current =
+            clipboard->call<fcitx::IClipboard::primary>(ic);
+        if (!current.empty()) {
+            FCITX_WARN() << "Writely: could not clear the PRIMARY selection "
+                            "after use; it still holds "
+                         << fcitx::utf8::length(current) << " characters.";
+        }
+        primaryAtFocus_[ctx] = current;
+        selectedText_.erase(ctx);
+    } catch (const std::exception &e) {
+        FCITX_WARN() << "Writely: could not clear the PRIMARY selection "
+                        "after use: "
+                     << e.what();
+    } catch (...) {
+        FCITX_WARN() << "Writely: could not clear the PRIMARY selection "
+                        "after use: unknown error";
     }
 }
 
@@ -651,9 +680,10 @@ void Writely::onReplaceSelection(const std::string &ctx, uint32_t request,
         return;
     }
     sendReplaceResult(ctx, request, true, "");
-    // The committed-over selection is still in PRIMARY; make it the new
-    // baseline so the same old selection can't be checked a second time.
-    primaryAtFocus_[ctx] = current;
+    // PRIMARY still holds the committed-over selection; clear it so
+    // re-selecting the same text counts as new. This also resets the
+    // baseline and drops the remembered selection.
+    clearPrimaryAfterUse(ic, ctx);
     if (hideWritelyPanel(ic, ctx)) {
         ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
     }
@@ -678,6 +708,12 @@ void Writely::sendClicked(fcitx::InputContext *ic, const std::string &action) {
         bus_->createMethodCall(kBusName, kObjectPath, kInterface, "Clicked");
     msg << contextId(ic) << action;
     send(std::move(msg), "Clicked");
+    if (action == "dismiss") {
+        const std::string ctx = contextId(ic);
+        if (selectedText_.count(ctx)) {
+            clearPrimaryAfterUse(ic, ctx);
+        }
+    }
 }
 
 WritelyCandidateWord::WritelyCandidateWord(Writely *writely,
