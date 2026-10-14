@@ -17,7 +17,7 @@ struct CheckState {
     window: Window,
     input: TextView,
     result: TextView,
-    bold_tag: TextTag,
+    changed_tag: TextTag,
     check_button: Button,
     copy_button: Button,
     status: Label,
@@ -68,9 +68,9 @@ fn input_text(state: &CheckState) -> Option<String> {
     Some(buffer.text(&start, &end, false)?.to_string())
 }
 
-/// Shows `suggestion` with inserted words in bold. Deletions from the
-/// original are not part of the suggestion and are skipped.
-fn render_suggestion(buffer: &TextBuffer, bold: &TextTag, original: &str, suggestion: &str) {
+/// Shows `suggestion` with inserted words in bold on a light highlight. Deletions
+/// from the original are not part of the suggestion and are skipped.
+fn render_suggestion(buffer: &TextBuffer, changed: &TextTag, original: &str, suggestion: &str) {
     buffer.set_text("");
     let mut end = buffer.end_iter();
     for op in crate::diff::diff_words(original, suggestion) {
@@ -79,7 +79,7 @@ fn render_suggestion(buffer: &TextBuffer, bold: &TextTag, original: &str, sugges
             crate::diff::DiffOp::Insert(text) => {
                 let start = end;
                 buffer.insert(&mut end, &text);
-                buffer.apply_tag(bold, &start, &end);
+                buffer.apply_tag(changed, &start, &end);
             }
             crate::diff::DiffOp::Delete(_) => {}
         }
@@ -245,7 +245,7 @@ pub fn handle_result(generation: u64, result: Result<String, String>) {
                 match crate::check_text::outcome_for_suggestion(suggestion, &st.original) {
                     crate::check_text::CheckOutcome::Suggestion(text) => {
                         if let Some(buffer) = st.result.buffer() {
-                            render_suggestion(&buffer, &st.bold_tag, &st.original, &text);
+                            render_suggestion(&buffer, &st.changed_tag, &st.original, &text);
                         }
                         st.suggestion = Some(text);
                         st.copy_button.set_sensitive(true);
@@ -344,12 +344,14 @@ pub fn show() -> Result<(), String> {
     copy_row.pack_start(&copy_button, false, false, 0);
     container.pack_start(&copy_row, false, false, 0);
 
-    // Bold for the inserted words in the suggestion view.
-    let bold_tag = TextTag::new(Some("writely-bold"));
-    bold_tag.set_weight(gtk::pango::Weight::Bold.into_glib());
+    // Bold on a light highlight for the inserted words in the suggestion view.
+    let changed_tag = TextTag::new(Some("writely-changed"));
+    changed_tag.set_weight(gtk::pango::Weight::Bold.into_glib());
+    changed_tag.set_background(Some("#fff3b0"));
+    changed_tag.set_foreground(Some("#1a1a1a"));
     if let Some(buffer) = result_view.buffer() {
         if let Some(table) = buffer.tag_table() {
-            table.add(&bold_tag);
+            table.add(&changed_tag);
         }
     }
 
@@ -388,7 +390,7 @@ pub fn show() -> Result<(), String> {
             window: window.clone(),
             input: input_view.clone(),
             result: result_view.clone(),
-            bold_tag,
+            changed_tag,
             check_button,
             copy_button,
             status: status_label,
