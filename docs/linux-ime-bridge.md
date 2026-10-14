@@ -179,3 +179,12 @@ When a bridge disappears from the bus (`NameOwnerChanged` with an empty new
 owner), Writely drops all of its contexts and clears focus if it owned the
 focused one. A bridge that restarts just calls `FocusIn` again; no explicit
 goodbye is needed.
+
+## Known limitations
+
+- Chromium and Electron apps don't send a cursor rectangle on Wayland, so
+  the input method places Writely's panel at the window edge instead of at
+  the cursor.
+- GNOME doesn't let background programs read the PRIMARY selection, so the
+  select fallback is fcitx5-on-Hyprland/KDE only for now (IBus on GNOME is a
+  later round).
