@@ -89,11 +89,7 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
-pub fn suggest(
-    settings: &AppSettings,
-    key: Option<&str>,
-    text: &str,
-) -> Result<String, String> {
+pub fn suggest(settings: &AppSettings, key: Option<&str>, text: &str) -> Result<String, String> {
     let model = settings.current_model();
     if model.is_empty() {
         return Err(
@@ -148,7 +144,11 @@ mod tests {
         assert!(minimal.get("reasoning_effort").is_none());
         for effort in [Effort::Low, Effort::Medium, Effort::High] {
             let body = build_request_body(MODEL, "She go.", effort);
-            assert_eq!(body["reasoning_effort"], effort.as_str(), "effort {effort:?}");
+            assert_eq!(
+                body["reasoning_effort"],
+                effort.as_str(),
+                "effort {effort:?}"
+            );
             assert!(body.get("reasoning").is_none());
         }
     }

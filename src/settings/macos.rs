@@ -4,13 +4,83 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSColor, NSMenu, NSMenuItem, NSSecureTextField,
-    NSTextField, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSApplication, NSBackingStoreType, NSButton, NSColor, NSMenu, NSMenuItem, NSPopUpButton,
+    NSSecureTextField, NSTextField, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
     NSRunLoop, NSSize, NSString, NSURL,
 };
+
+use crate::config::{AppSettings, Effort, Provider};
+
+const PROVIDER_TITLES: [&str; 3] = [
+    "Google Gemini",
+    "Together AI",
+    "Ollama (local, no key needed)",
+];
+
+const EFFORT_TITLES: [&str; 5] = ["Default", "Minimal (fastest)", "Low", "Medium", "High"];
+
+fn provider_at(index: isize) -> Provider {
+    match index {
+        1 => Provider::Together,
+        2 => Provider::Ollama,
+        _ => Provider::Gemini,
+    }
+}
+
+fn provider_index(provider: Provider) -> isize {
+    match provider {
+        Provider::Gemini => 0,
+        Provider::Together => 1,
+        Provider::Ollama => 2,
+    }
+}
+
+fn effort_at(index: isize) -> Effort {
+    match index {
+        1 => Effort::Minimal,
+        2 => Effort::Low,
+        3 => Effort::Medium,
+        4 => Effort::High,
+        _ => Effort::Default,
+    }
+}
+
+fn effort_index(effort: Effort) -> isize {
+    match effort {
+        Effort::Default => 0,
+        Effort::Minimal => 1,
+        Effort::Low => 2,
+        Effort::Medium => 3,
+        Effort::High => 4,
+    }
+}
+
+fn model_placeholder_for(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Gemini => "gemini-3.5-flash-lite",
+        Provider::Together => "deepseek-ai/DeepSeek-V4.1-Flash",
+        Provider::Ollama => "llama3.2",
+    }
+}
+
+fn key_title_for(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Gemini => "Google Gemini API key",
+        Provider::Together => "Together AI API key",
+        Provider::Ollama => "Ollama address",
+    }
+}
+
+fn key_help_for(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Gemini => "Writely sends the sentence you're editing to Google Gemini to check its grammar. Get a free key at ",
+        Provider::Together => "Writely sends the sentence you're editing to Together AI to check its grammar. Get a key at ",
+        Provider::Ollama => "Where Ollama runs on your computer. No key needed.",
+    }
+}
 
 #[derive(Default)]
 struct DelegateIvars {
@@ -24,6 +94,112 @@ fn set_status(status: &NSTextField, text: &str, is_error: bool) {
         status.setTextColor(Some(&NSColor::systemRedColor()));
     } else {
         status.setTextColor(Some(&NSColor::labelColor()));
+    }
+}
+
+/// Refreshes the provider-dependent rows (model text, placeholders, key vs.
+/// Ollama-address visibility, link title) for the currently selected provider.
+fn refresh_provider_rows() {
+    struct Rows {
+        provider: Provider,
+        model_field: Retained<NSTextField>,
+        key_field: Retained<NSSecureTextField>,
+        url_field: Retained<NSTextField>,
+        key_label: Retained<NSTextField>,
+        key_help: Retained<NSTextField>,
+        link_button: Retained<NSButton>,
+        url_label: Retained<NSTextField>,
+        url_help: Retained<NSTextField>,
+        status: Retained<NSTextField>,
+        model: String,
+        ollama_url: String,
+    }
+    let rows = STATE.with(|state| {
+        state.borrow().as_ref().map(|window_state| Rows {
+            provider: provider_at(window_state.provider_popup.indexOfSelectedItem()),
+            model_field: window_state.model_field.clone(),
+            key_field: window_state.field.clone(),
+            url_field: window_state.url_field.clone(),
+            key_label: window_state.key_label.clone(),
+            key_help: window_state.key_help.clone(),
+            link_button: window_state.link_button.clone(),
+            url_label: window_state.url_label.clone(),
+            url_help: window_state.url_help.clone(),
+            status: window_state.status.clone(),
+            model: window_state.settings.model_for(provider_at(
+                window_state.provider_popup.indexOfSelectedItem(),
+            )),
+            ollama_url: window_state.settings.ollama_url.clone(),
+        })
+    });
+    let Some(rows) = rows else { return };
+    rows.model_field
+        .setStringValue(&NSString::from_str(&rows.model));
+    rows.model_field
+        .setPlaceholderString(Some(&NSString::from_str(model_placeholder_for(
+            rows.provider,
+        ))));
+    let is_ollama = rows.provider == Provider::Ollama;
+    rows.key_label.setHidden(is_ollama);
+    rows.key_field.setHidden(is_ollama);
+    rows.key_help.setHidden(is_ollama);
+    rows.link_button.setHidden(is_ollama);
+    rows.url_label.setHidden(!is_ollama);
+    rows.url_field.setHidden(!is_ollama);
+    rows.url_help.setHidden(!is_ollama);
+    rows.key_label
+        .setStringValue(&NSString::from_str(key_title_for(rows.provider)));
+    rows.key_help
+        .setStringValue(&NSString::from_str(key_help_for(rows.provider)));
+    if let Some(page) = super::api_key_page_for(rows.provider) {
+        rows.link_button.setTitle(&NSString::from_str(page));
+    }
+    if !is_ollama {
+        match super::has_api_key_for(rows.provider) {
+            Ok(true) => rows
+                .key_field
+                .setPlaceholderString(Some(&NSString::from_str("••••••••"))),
+            Ok(false) => rows
+                .key_field
+                .setPlaceholderString(Some(&NSString::from_str("Paste your key here"))),
+            Err(error) => set_status(&rows.status, &error, true),
+        }
+    }
+    if rows.url_field.stringValue().to_string().is_empty() {
+        rows.url_field
+            .setStringValue(&NSString::from_str(&rows.ollama_url));
+    }
+    rows.url_field
+        .setPlaceholderString(Some(&NSString::from_str(crate::config::DEFAULT_OLLAMA_URL)));
+}
+
+/// Reads the draft provider, model, effort and Ollama URL from the controls.
+fn read_draft() -> Option<(Provider, String, Effort, String)> {
+    STATE.with(|state| {
+        state.borrow().as_ref().map(|window_state| {
+            (
+                provider_at(window_state.provider_popup.indexOfSelectedItem()),
+                window_state.model_field.stringValue().to_string(),
+                effort_at(window_state.effort_popup.indexOfSelectedItem()),
+                window_state.url_field.stringValue().to_string(),
+            )
+        })
+    })
+}
+
+/// Stores the current control values into the draft settings.
+fn stash_draft() {
+    if let Some((provider, model, effort, url)) = read_draft() {
+        STATE.with(|state| {
+            if let Some(window_state) = state.borrow_mut().as_mut() {
+                window_state.settings.provider = provider;
+                window_state.settings.set_model(provider, model.trim());
+                window_state.settings.effort = effort;
+                if !url.trim().is_empty() {
+                    window_state.settings.ollama_url = url.trim().to_string();
+                }
+            }
+        });
     }
 }
 
@@ -46,12 +222,44 @@ define_class!(
             let Some(status) = self.ivars().status.get() else {
                 return;
             };
+            let Some((provider, model, _, _)) = read_draft() else {
+                return;
+            };
+            if let Err(error) = crate::config::validate_model_name(&model) {
+                set_status(status, &error, true);
+                return;
+            }
+            stash_draft();
+            let save_result = STATE.with(|state| {
+                state.borrow().as_ref().map(|window_state| {
+                    crate::config::save_settings(&window_state.settings)
+                })
+            });
+            match save_result {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    set_status(status, &error, true);
+                    return;
+                }
+                None => return,
+            }
             let value = field.stringValue().to_string();
-            match super::save_api_key(&value) {
-                Ok(()) => {
-                    field.setStringValue(&NSString::from_str(""));
-                    field.setPlaceholderString(Some(&NSString::from_str("••••••••")));
-                    set_status(status, "Saved.", false);
+            if value.trim().is_empty() {
+                set_status(status, "Saved.", false);
+            } else {
+                match super::save_api_key_for(provider, &value) {
+                    Ok(()) => set_status(status, "Saved.", false),
+                    Err(error) => {
+                        set_status(status, &error, true);
+                        return;
+                    }
+                }
+            }
+            field.setStringValue(&NSString::from_str(""));
+            match super::has_api_key_for(provider) {
+                Ok(true) => field.setPlaceholderString(Some(&NSString::from_str("••••••••"))),
+                Ok(false) => {
+                    field.setPlaceholderString(Some(&NSString::from_str("Paste your key here")))
                 }
                 Err(error) => set_status(status, &error, true),
             }
@@ -65,7 +273,8 @@ define_class!(
             let Some(status) = self.ivars().status.get() else {
                 return;
             };
-            match super::remove_api_key() {
+            let provider = read_draft().map(|draft| draft.0).unwrap_or(Provider::Gemini);
+            match super::remove_api_key_for(provider) {
                 Ok(()) => {
                     field.setStringValue(&NSString::from_str(""));
                     field.setPlaceholderString(Some(&NSString::from_str("Paste your key here")));
@@ -80,7 +289,12 @@ define_class!(
             let Some(status) = self.ivars().status.get() else {
                 return;
             };
-            let url_string = NSString::from_str(super::API_KEY_PAGE);
+            let provider = read_draft().map(|draft| draft.0).unwrap_or(Provider::Gemini);
+            let Some(page) = super::api_key_page_for(provider) else {
+                set_status(status, "Ollama runs on your computer and needs no API key.", true);
+                return;
+            };
+            let url_string = NSString::from_str(page);
             let Some(url) = NSURL::URLWithString(&url_string) else {
                 set_status(
                     status,
@@ -96,6 +310,14 @@ define_class!(
                     true,
                 );
             }
+        }
+
+        #[unsafe(method(providerChanged:))]
+        fn provider_changed(&self, _sender: Option<&AnyObject>) {
+            // Stash the model text into the draft for the previous provider
+            // first, so switching providers keeps each one's model.
+            stash_draft();
+            refresh_provider_rows();
         }
 
         #[unsafe(method(openAccessibilitySettings:))]
@@ -159,6 +381,16 @@ struct WindowState {
     field: Retained<NSSecureTextField>,
     status: Retained<NSTextField>,
     accessibility_button: Option<Retained<NSButton>>,
+    provider_popup: Retained<NSPopUpButton>,
+    model_field: Retained<NSTextField>,
+    effort_popup: Retained<NSPopUpButton>,
+    url_field: Retained<NSTextField>,
+    key_label: Retained<NSTextField>,
+    key_help: Retained<NSTextField>,
+    link_button: Retained<NSButton>,
+    url_label: Retained<NSTextField>,
+    url_help: Retained<NSTextField>,
+    settings: AppSettings,
 }
 
 thread_local! {
@@ -250,14 +482,21 @@ pub fn show_settings() -> Result<(), String> {
                     if let Some(button) = window_state.accessibility_button.as_ref() {
                         button.setHidden(true);
                     }
-                    match super::has_api_key() {
-                        Ok(true) => window_state
-                            .field
-                            .setPlaceholderString(Some(&NSString::from_str("••••••••"))),
-                        Ok(false) => window_state
-                            .field
-                            .setPlaceholderString(Some(&NSString::from_str("Paste your key here"))),
-                        Err(error) => set_status(&window_state.status, &error, true),
+                    let provider = provider_at(window_state.provider_popup.indexOfSelectedItem());
+                    if provider != Provider::Ollama {
+                        match super::has_api_key_for(provider) {
+                            Ok(true) => window_state
+                                .field
+                                .setPlaceholderString(Some(&NSString::from_str("••••••••"))),
+                            Ok(false) => {
+                                window_state
+                                    .field
+                                    .setPlaceholderString(Some(&NSString::from_str(
+                                        "Paste your key here",
+                                    )))
+                            }
+                            Err(error) => set_status(&window_state.status, &error, true),
+                        }
                     }
                 }
                 NSApplication::sharedApplication(mtm).activate();
@@ -270,9 +509,9 @@ pub fn show_settings() -> Result<(), String> {
     let delegate = SettingsDelegate::new(mtm);
     let permission_text = super::permission_message();
     let window_height = if permission_text.is_some() {
-        260.0
+        538.0
     } else {
-        200.0
+        470.0
     };
     // SAFETY: the content rect, style mask and backing store are valid and mtm is the main thread.
     let window = unsafe {
@@ -296,40 +535,67 @@ pub fn show_settings() -> Result<(), String> {
         );
     };
 
-    // When Accessibility permission is missing the controls shift up to make room
-    // for the "Open Accessibility Settings" button row and a taller wrapping
-    // status label; otherwise the layout is unchanged from before.
-    let dy = if permission_text.is_some() { 52.0 } else { 0.0 };
+    // Top-down layout: each row takes its height plus a gap, so nothing overlaps.
+    let mut cursor = window_height - 16.0;
+    let mut row = |height: f64, gap: f64| -> NSRect {
+        cursor -= height;
+        let rect = NSRect::new(NSPoint::new(20.0, cursor), NSSize::new(380.0, height));
+        cursor -= gap;
+        rect
+    };
 
-    let title_label = NSTextField::labelWithString(ns_string!("Google Gemini API key"), mtm);
-    title_label.setFrame(NSRect::new(
-        NSPoint::new(20.0, 172.0 + dy),
-        NSSize::new(380.0, 18.0),
-    ));
+    let provider_label = NSTextField::labelWithString(ns_string!("Provider"), mtm);
+    provider_label.setFrame(row(18.0, 4.0));
 
-    let field = NSSecureTextField::initWithFrame(
-        NSSecureTextField::alloc(mtm),
-        NSRect::new(NSPoint::new(20.0, 142.0 + dy), NSSize::new(380.0, 24.0)),
-    );
-
-    let mut initial_error: Option<String> = None;
-    match super::has_api_key() {
-        Ok(true) => field.setPlaceholderString(Some(&NSString::from_str("••••••••"))),
-        Ok(false) => field.setPlaceholderString(Some(&NSString::from_str("Paste your key here"))),
-        Err(error) => {
-            field.setPlaceholderString(Some(&NSString::from_str("Paste your key here")));
-            initial_error = Some(error);
-        }
+    // SAFETY: the frame is valid and mtm is the main thread.
+    let provider_popup =
+        NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), row(26.0, 2.0), false);
+    for title in PROVIDER_TITLES {
+        provider_popup.addItemWithTitle(&NSString::from_str(title));
     }
 
-    let help_label = NSTextField::wrappingLabelWithString(
-        ns_string!("Writely sends the sentence you're editing to Google Gemini to check its grammar. Get a free key at "),
+    let provider_help = NSTextField::labelWithString(ns_string!("Who checks your grammar."), mtm);
+    provider_help.setFrame(row(16.0, 10.0));
+
+    let model_label = NSTextField::labelWithString(ns_string!("Model"), mtm);
+    model_label.setFrame(row(18.0, 4.0));
+
+    let model_field = NSTextField::initWithFrame(NSTextField::alloc(mtm), row(24.0, 2.0));
+
+    let model_help = NSTextField::wrappingLabelWithString(
+        ns_string!("Paste the model name, e.g. gemini-3.5-flash-lite / deepseek-ai/DeepSeek-V4.1-Flash / llama3.2"),
         mtm,
     );
-    help_label.setFrame(NSRect::new(
-        NSPoint::new(20.0, 104.0 + dy),
-        NSSize::new(380.0, 32.0),
-    ));
+    model_help.setFrame(row(44.0, 10.0));
+
+    let effort_label = NSTextField::labelWithString(ns_string!("Effort"), mtm);
+    effort_label.setFrame(row(18.0, 4.0));
+
+    // SAFETY: the frame is valid and mtm is the main thread.
+    let effort_popup =
+        NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), row(26.0, 2.0), false);
+    for title in EFFORT_TITLES {
+        effort_popup.addItemWithTitle(&NSString::from_str(title));
+    }
+
+    let effort_help = NSTextField::wrappingLabelWithString(
+        ns_string!("How hard the model thinks. Not every model supports every level; you'll see the model's error if not."),
+        mtm,
+    );
+    effort_help.setFrame(row(34.0, 10.0));
+
+    // The key rows and the Ollama-address rows share the same frames; only one
+    // set is visible at a time.
+    let key_label = NSTextField::labelWithString(ns_string!("Google Gemini API key"), mtm);
+    key_label.setFrame(row(18.0, 4.0));
+    let key_frame = key_label.frame();
+
+    let field = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), row(24.0, 2.0));
+    let key_field_frame = field.frame();
+
+    let key_help = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+    key_help.setFrame(row(34.0, 2.0));
+    let key_help_frame = key_help.frame();
 
     let target: &AnyObject = &delegate;
     // SAFETY: delegate implements openLink: and lives in STATE while the window is open.
@@ -341,11 +607,17 @@ pub fn show_settings() -> Result<(), String> {
             mtm,
         )
     };
-    link_button.setFrame(NSRect::new(
-        NSPoint::new(20.0, 86.0 + dy),
-        NSSize::new(280.0, 18.0),
-    ));
+    link_button.setFrame(row(18.0, 10.0));
     link_button.setBordered(false);
+
+    let url_label = NSTextField::labelWithString(ns_string!("Ollama address"), mtm);
+    url_label.setFrame(key_frame);
+    let url_field = NSTextField::initWithFrame(NSTextField::alloc(mtm), key_field_frame);
+    let url_help = NSTextField::wrappingLabelWithString(
+        ns_string!("Where Ollama runs on your computer. No key needed."),
+        mtm,
+    );
+    url_help.setFrame(key_help_frame);
 
     // SAFETY: delegate implements saveClicked: and lives in STATE while the window is open.
     let save_button = unsafe {
@@ -356,10 +628,8 @@ pub fn show_settings() -> Result<(), String> {
             mtm,
         )
     };
-    save_button.setFrame(NSRect::new(
-        NSPoint::new(20.0, 48.0 + dy),
-        NSSize::new(80.0, 24.0),
-    ));
+    let buttons_frame = row(26.0, 12.0);
+    save_button.setFrame(NSRect::new(buttons_frame.origin, NSSize::new(80.0, 26.0)));
 
     // SAFETY: delegate implements removeClicked: and lives in STATE while the window is open.
     let remove_button = unsafe {
@@ -371,8 +641,8 @@ pub fn show_settings() -> Result<(), String> {
         )
     };
     remove_button.setFrame(NSRect::new(
-        NSPoint::new(110.0, 48.0 + dy),
-        NSSize::new(110.0, 24.0),
+        NSPoint::new(buttons_frame.origin.x + 90.0, buttons_frame.origin.y),
+        NSSize::new(110.0, 26.0),
     ));
 
     // The Accessibility button gets its own row above the status line and only
@@ -387,30 +657,16 @@ pub fn show_settings() -> Result<(), String> {
                 mtm,
             )
         };
-        button.setFrame(NSRect::new(
-            NSPoint::new(20.0, 74.0),
-            NSSize::new(220.0, 24.0),
-        ));
+        button.setFrame(row(24.0, 8.0));
         content.addSubview(&button);
         Some(button)
     } else {
         None
     };
 
-    let status_label = if permission_text.is_some() {
-        NSTextField::wrappingLabelWithString(ns_string!(""), mtm)
-    } else {
-        NSTextField::labelWithString(ns_string!(""), mtm)
-    };
+    let status_label = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
     status_label.setFrame(NSRect::new(
-        NSPoint::new(
-            20.0,
-            if permission_text.is_some() {
-                14.0
-            } else {
-                18.0
-            },
-        ),
+        NSPoint::new(20.0, 14.0),
         NSSize::new(
             380.0,
             if permission_text.is_some() {
@@ -420,6 +676,54 @@ pub fn show_settings() -> Result<(), String> {
             },
         ),
     ));
+
+    // SAFETY: delegate implements providerChanged: and lives in STATE while the window is open.
+    unsafe {
+        provider_popup.setTarget(Some(target));
+        provider_popup.setAction(Some(sel!(providerChanged:)));
+    }
+
+    // Load the draft settings: a missing file means defaults; an unreadable
+    // or invalid file shows its error and starts from defaults (saving then
+    // overwrites it, which is explicit, not silent).
+    let mut initial_error: Option<String> = None;
+    let settings = match crate::config::load_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            initial_error = Some(error);
+            AppSettings::default()
+        }
+    };
+    provider_popup.selectItemAtIndex(provider_index(settings.provider));
+    effort_popup.selectItemAtIndex(effort_index(settings.effort));
+    model_field.setStringValue(&NSString::from_str(&settings.model_for(settings.provider)));
+    model_field.setPlaceholderString(Some(&NSString::from_str(model_placeholder_for(
+        settings.provider,
+    ))));
+    url_field.setStringValue(&NSString::from_str(&settings.ollama_url));
+    url_field.setPlaceholderString(Some(&NSString::from_str(crate::config::DEFAULT_OLLAMA_URL)));
+    key_help.setStringValue(&NSString::from_str(key_help_for(settings.provider)));
+    key_label.setStringValue(&NSString::from_str(key_title_for(settings.provider)));
+    if let Some(page) = super::api_key_page_for(settings.provider) {
+        link_button.setTitle(&NSString::from_str(page));
+    }
+    let is_ollama = settings.provider == Provider::Ollama;
+    key_label.setHidden(is_ollama);
+    field.setHidden(is_ollama);
+    key_help.setHidden(is_ollama);
+    link_button.setHidden(is_ollama);
+    url_label.setHidden(!is_ollama);
+    url_field.setHidden(!is_ollama);
+    url_help.setHidden(!is_ollama);
+    if !is_ollama {
+        match super::has_api_key_for(settings.provider) {
+            Ok(true) => field.setPlaceholderString(Some(&NSString::from_str("••••••••"))),
+            Ok(false) => {
+                field.setPlaceholderString(Some(&NSString::from_str("Paste your key here")))
+            }
+            Err(error) => initial_error = Some(error),
+        }
+    }
     if let Some(message) = permission_text.as_ref() {
         set_status(&status_label, message, true);
     } else if let Some(error) = &initial_error {
@@ -433,10 +737,22 @@ pub fn show_settings() -> Result<(), String> {
         eprintln!("Writely: could not store the Settings status label.");
     }
 
-    content.addSubview(&title_label);
+    content.addSubview(&provider_label);
+    content.addSubview(&provider_popup);
+    content.addSubview(&provider_help);
+    content.addSubview(&model_label);
+    content.addSubview(&model_field);
+    content.addSubview(&model_help);
+    content.addSubview(&effort_label);
+    content.addSubview(&effort_popup);
+    content.addSubview(&effort_help);
+    content.addSubview(&key_label);
     content.addSubview(&field);
-    content.addSubview(&help_label);
+    content.addSubview(&key_help);
     content.addSubview(&link_button);
+    content.addSubview(&url_label);
+    content.addSubview(&url_field);
+    content.addSubview(&url_help);
     content.addSubview(&save_button);
     content.addSubview(&remove_button);
     content.addSubview(&status_label);
@@ -448,6 +764,16 @@ pub fn show_settings() -> Result<(), String> {
             field: field.clone(),
             status: status_label.clone(),
             accessibility_button,
+            provider_popup: provider_popup.clone(),
+            model_field: model_field.clone(),
+            effort_popup: effort_popup.clone(),
+            url_field: url_field.clone(),
+            key_label: key_label.clone(),
+            key_help: key_help.clone(),
+            link_button: link_button.clone(),
+            url_label: url_label.clone(),
+            url_help: url_help.clone(),
+            settings,
         });
     });
 

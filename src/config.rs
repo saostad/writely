@@ -79,15 +79,6 @@ impl Provider {
             Provider::Ollama => "Ollama",
         }
     }
-
-    pub fn from_str(value: &str) -> Option<Provider> {
-        match value {
-            "gemini" => Some(Provider::Gemini),
-            "together" => Some(Provider::Together),
-            "ollama" => Some(Provider::Ollama),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -114,17 +105,6 @@ impl Effort {
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
-        }
-    }
-
-    pub fn from_str(value: &str) -> Option<Effort> {
-        match value {
-            "default" => Some(Effort::Default),
-            "minimal" => Some(Effort::Minimal),
-            "low" => Some(Effort::Low),
-            "medium" => Some(Effort::Medium),
-            "high" => Some(Effort::High),
-            _ => None,
         }
     }
 }
@@ -212,12 +192,8 @@ pub fn validate_model_name(model: &str) -> Result<String, String> {
 pub fn load_settings() -> Result<AppSettings, String> {
     let path = settings_path();
     match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str::<AppSettings>(&contents).map_err(|e| {
-            format!(
-                "Could not read the settings file ({}): {e}",
-                path.display()
-            )
-        }),
+        Ok(contents) => serde_json::from_str::<AppSettings>(&contents)
+            .map_err(|e| format!("Could not read the settings file ({}): {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AppSettings::default()),
         Err(e) => Err(format!(
             "Could not read the settings file ({}): {e}",
@@ -230,32 +206,16 @@ pub fn load_settings() -> Result<AppSettings, String> {
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
     let path = settings_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Could not save the settings file ({}): {e}",
-                path.display()
-            )
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Could not save the settings file ({}): {e}", path.display()))?;
     }
-    let contents = serde_json::to_string_pretty(settings).map_err(|e| {
-        format!(
-            "Could not save the settings file ({}): {e}",
-            path.display()
-        )
-    })?;
+    let contents = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("Could not save the settings file ({}): {e}", path.display()))?;
     let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, contents).map_err(|e| {
-        format!(
-            "Could not save the settings file ({}): {e}",
-            path.display()
-        )
-    })?;
-    std::fs::rename(&tmp_path, &path).map_err(|e| {
-        format!(
-            "Could not save the settings file ({}): {e}",
-            path.display()
-        )
-    })?;
+    std::fs::write(&tmp_path, contents)
+        .map_err(|e| format!("Could not save the settings file ({}): {e}", path.display()))?;
+    std::fs::rename(&tmp_path, &path)
+        .map_err(|e| format!("Could not save the settings file ({}): {e}", path.display()))?;
     Ok(())
 }
 
@@ -316,18 +276,6 @@ mod tests {
         );
         // Switching providers keeps each one's model.
         assert_eq!(back.model_for(Provider::Gemini), DEFAULT_GEMINI_MODEL);
-    }
-
-    #[test]
-    fn provider_and_effort_parse() {
-        assert_eq!(Provider::from_str("gemini"), Some(Provider::Gemini));
-        assert_eq!(Provider::from_str("together"), Some(Provider::Together));
-        assert_eq!(Provider::from_str("ollama"), Some(Provider::Ollama));
-        assert_eq!(Provider::from_str("other"), None);
-        assert_eq!(Effort::from_str("default"), Some(Effort::Default));
-        assert_eq!(Effort::from_str("minimal"), Some(Effort::Minimal));
-        assert_eq!(Effort::from_str("high"), Some(Effort::High));
-        assert_eq!(Effort::from_str("ultra"), None);
     }
 
     #[test]

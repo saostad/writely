@@ -1,7 +1,79 @@
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use gtk::prelude::*;
-use gtk::{Box as GtkBox, Button, Entry, Label, LinkButton, Orientation, Window, WindowType};
+use gtk::{
+    Box as GtkBox, Button, ComboBoxText, Entry, Label, LinkButton, Orientation, Window, WindowType,
+};
+
+use crate::config::{AppSettings, Effort, Provider};
+
+const PROVIDER_NAMES: [&str; 3] = [
+    "Google Gemini",
+    "Together AI",
+    "Ollama (local, no key needed)",
+];
+const EFFORT_NAMES: [&str; 5] = ["Default", "Minimal (fastest)", "Low", "Medium", "High"];
+
+fn provider_at(index: i32) -> Provider {
+    match index {
+        1 => Provider::Together,
+        2 => Provider::Ollama,
+        _ => Provider::Gemini,
+    }
+}
+
+fn provider_index(provider: Provider) -> u32 {
+    match provider {
+        Provider::Gemini => 0,
+        Provider::Together => 1,
+        Provider::Ollama => 2,
+    }
+}
+
+fn effort_at(index: i32) -> Effort {
+    match index {
+        1 => Effort::Minimal,
+        2 => Effort::Low,
+        3 => Effort::Medium,
+        4 => Effort::High,
+        _ => Effort::Default,
+    }
+}
+
+fn effort_index(effort: Effort) -> u32 {
+    match effort {
+        Effort::Default => 0,
+        Effort::Minimal => 1,
+        Effort::Low => 2,
+        Effort::Medium => 3,
+        Effort::High => 4,
+    }
+}
+
+fn model_placeholder_for(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Gemini => "gemini-3.5-flash-lite",
+        Provider::Together => "deepseek-ai/DeepSeek-V4.1-Flash",
+        Provider::Ollama => "llama3.2",
+    }
+}
+
+fn key_title_for(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Gemini => "Google Gemini API key",
+        Provider::Together => "Together AI API key",
+        Provider::Ollama => "Ollama address",
+    }
+}
+
+fn key_help_for(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Gemini => "Writely sends the sentence you're editing to Google Gemini to check its grammar. Get a free key at ",
+        Provider::Together => "Writely sends the sentence you're editing to Together AI to check its grammar. Get a key at ",
+        Provider::Ollama => "Where Ollama runs on your computer. No key needed.",
+    }
+}
 
 thread_local! {
     static STATE: RefCell<Option<Window>> = const { RefCell::new(None) };
@@ -21,6 +93,89 @@ fn set_status(status: &Label, text: &str, is_error: bool) {
         ));
     } else {
         status.set_text(text);
+    }
+}
+
+struct Controls {
+    provider_combo: ComboBoxText,
+    model_entry: Entry,
+    effort_combo: ComboBoxText,
+    key_entry: Entry,
+    url_entry: Entry,
+    key_label: Label,
+    key_help: Label,
+    link_box: GtkBox,
+    url_label: Label,
+    url_help: Label,
+    status_label: Label,
+    settings: AppSettings,
+}
+
+/// Refreshes the provider-dependent rows for the selected provider: the model
+/// text and placeholder, the key placeholder (•••• when a key is saved), the
+/// key page link, and key vs. Ollama-address visibility.
+fn refresh_provider_rows(controls: &Rc<RefCell<Controls>>) {
+    let borrowed = controls.borrow();
+    let provider = provider_at(borrowed.provider_combo.active().unwrap_or(0));
+    let model = borrowed.settings.model_for(provider);
+    let ollama_url = borrowed.settings.ollama_url.clone();
+    drop(borrowed);
+    let borrowed = controls.borrow();
+    borrowed.model_entry.set_text(&model);
+    borrowed
+        .model_entry
+        .set_placeholder_text(Some(model_placeholder_for(provider)));
+    let is_ollama = provider == Provider::Ollama;
+    borrowed.key_label.set_text(key_title_for(provider));
+    borrowed.key_help.set_text(key_help_for(provider));
+    borrowed.key_label.set_visible(!is_ollama);
+    borrowed.key_entry.set_visible(!is_ollama);
+    borrowed.key_help.set_visible(!is_ollama);
+    borrowed.link_box.set_visible(!is_ollama);
+    borrowed.url_label.set_visible(is_ollama);
+    borrowed.url_entry.set_visible(is_ollama);
+    borrowed.url_help.set_visible(is_ollama);
+    // The link follows the provider: rebuild it for the current key page.
+    for child in borrowed.link_box.children() {
+        borrowed.link_box.remove(&child);
+    }
+    if let Some(page) = super::api_key_page_for(provider) {
+        let link = LinkButton::with_label(page, page);
+        link.set_halign(gtk::Align::Start);
+        borrowed.link_box.pack_start(&link, false, false, 0);
+        link.show();
+    }
+    if borrowed.url_entry.text().to_string().is_empty() {
+        borrowed.url_entry.set_text(&ollama_url);
+    }
+    borrowed
+        .url_entry
+        .set_placeholder_text(Some(crate::config::DEFAULT_OLLAMA_URL));
+    if !is_ollama {
+        match super::has_api_key_for(provider) {
+            Ok(true) => borrowed.key_entry.set_placeholder_text(Some("••••••••")),
+            Ok(false) => borrowed
+                .key_entry
+                .set_placeholder_text(Some("Paste your key here")),
+            Err(error) => set_status(&borrowed.status_label, &error, true),
+        }
+    }
+}
+
+/// Stores the model/effort/URL values into the draft settings.
+fn stash_draft(controls: &Rc<RefCell<Controls>>) {
+    let borrowed = controls.borrow();
+    let provider = provider_at(borrowed.provider_combo.active().unwrap_or(0));
+    let model = borrowed.model_entry.text().to_string();
+    let effort = effort_at(borrowed.effort_combo.active().unwrap_or(0));
+    let url = borrowed.url_entry.text().to_string();
+    drop(borrowed);
+    let mut borrowed = controls.borrow_mut();
+    borrowed.settings.provider = provider;
+    borrowed.settings.set_model(provider, model.trim());
+    borrowed.settings.effort = effort;
+    if !url.trim().is_empty() {
+        borrowed.settings.ollama_url = url.trim().to_string();
     }
 }
 
@@ -44,9 +199,20 @@ pub fn show_settings() -> Result<(), String> {
         return Ok(());
     }
 
+    // Load the draft: a missing file means defaults; an unreadable or invalid
+    // file shows its error and starts from defaults.
+    let mut initial_error: Option<String> = None;
+    let settings = match crate::config::load_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            initial_error = Some(error);
+            AppSettings::default()
+        }
+    };
+
     let window = Window::new(WindowType::Toplevel);
     window.set_title("Writely Settings");
-    window.set_default_size(420, 200);
+    window.set_default_size(420, 560);
     window.set_resizable(false);
 
     let container = GtkBox::new(Orientation::Vertical, 8);
@@ -55,33 +221,96 @@ pub fn show_settings() -> Result<(), String> {
     container.set_margin_start(20);
     container.set_margin_end(20);
 
-    let title_label = Label::new(Some("Google Gemini API key"));
-    title_label.set_halign(gtk::Align::Start);
-    container.pack_start(&title_label, false, false, 0);
+    let provider_label = Label::new(Some("Provider"));
+    provider_label.set_halign(gtk::Align::Start);
+    container.pack_start(&provider_label, false, false, 0);
 
-    let entry = Entry::new();
-    entry.set_visibility(false);
-    let mut initial_error: Option<String> = None;
-    match super::has_api_key() {
-        Ok(true) => entry.set_placeholder_text(Some("••••••••")),
-        Ok(false) => entry.set_placeholder_text(Some("Paste your key here")),
+    let provider_combo = ComboBoxText::new();
+    for name in PROVIDER_NAMES {
+        provider_combo.append_text(name);
+    }
+    provider_combo.set_active(Some(provider_index(settings.provider)));
+    container.pack_start(&provider_combo, false, false, 0);
+
+    let provider_help = Label::new(Some("Who checks your grammar."));
+    provider_help.set_halign(gtk::Align::Start);
+    container.pack_start(&provider_help, false, false, 0);
+
+    let model_label = Label::new(Some("Model"));
+    model_label.set_halign(gtk::Align::Start);
+    container.pack_start(&model_label, false, false, 0);
+
+    let model_entry = Entry::new();
+    model_entry.set_text(&settings.model_for(settings.provider));
+    model_entry.set_placeholder_text(Some(model_placeholder_for(settings.provider)));
+    container.pack_start(&model_entry, false, false, 0);
+
+    let model_help = Label::new(Some(
+        "Paste the model name, e.g. gemini-3.5-flash-lite / deepseek-ai/DeepSeek-V4.1-Flash / llama3.2",
+    ));
+    model_help.set_halign(gtk::Align::Start);
+    model_help.set_line_wrap(true);
+    container.pack_start(&model_help, false, false, 0);
+
+    let effort_label = Label::new(Some("Effort"));
+    effort_label.set_halign(gtk::Align::Start);
+    container.pack_start(&effort_label, false, false, 0);
+
+    let effort_combo = ComboBoxText::new();
+    for name in EFFORT_NAMES {
+        effort_combo.append_text(name);
+    }
+    effort_combo.set_active(Some(effort_index(settings.effort)));
+    container.pack_start(&effort_combo, false, false, 0);
+
+    let effort_help = Label::new(Some(
+        "How hard the model thinks. Not every model supports every level; you'll see the model's error if not.",
+    ));
+    effort_help.set_halign(gtk::Align::Start);
+    effort_help.set_line_wrap(true);
+    container.pack_start(&effort_help, false, false, 0);
+
+    // The key rows and the Ollama-address rows share the same place; only one
+    // set is visible at a time.
+    let key_label = Label::new(Some(key_title_for(settings.provider)));
+    key_label.set_halign(gtk::Align::Start);
+    container.pack_start(&key_label, false, false, 0);
+
+    let key_entry = Entry::new();
+    key_entry.set_visibility(false);
+    match super::has_api_key_for(settings.provider) {
+        Ok(true) => key_entry.set_placeholder_text(Some("••••••••")),
+        Ok(false) => key_entry.set_placeholder_text(Some("Paste your key here")),
         Err(error) => {
-            entry.set_placeholder_text(Some("Paste your key here"));
-            initial_error = Some(error);
+            key_entry.set_placeholder_text(Some("Paste your key here"));
+            if initial_error.is_none() {
+                initial_error = Some(error);
+            }
         }
     }
-    container.pack_start(&entry, false, false, 0);
+    container.pack_start(&key_entry, false, false, 0);
 
-    let help_label = Label::new(Some(
-        "Writely sends the sentence you're editing to Google Gemini to check its grammar. Get a free key at ",
-    ));
-    help_label.set_halign(gtk::Align::Start);
-    help_label.set_line_wrap(true);
-    container.pack_start(&help_label, false, false, 0);
+    let key_help = Label::new(Some(key_help_for(settings.provider)));
+    key_help.set_halign(gtk::Align::Start);
+    key_help.set_line_wrap(true);
+    container.pack_start(&key_help, false, false, 0);
 
-    let link = LinkButton::with_label(super::API_KEY_PAGE, super::API_KEY_PAGE);
-    link.set_halign(gtk::Align::Start);
-    container.pack_start(&link, false, false, 0);
+    let link_box = GtkBox::new(Orientation::Vertical, 0);
+    container.pack_start(&link_box, false, false, 0);
+
+    let url_label = Label::new(Some("Ollama address"));
+    url_label.set_halign(gtk::Align::Start);
+    container.pack_start(&url_label, false, false, 0);
+
+    let url_entry = Entry::new();
+    url_entry.set_text(&settings.ollama_url);
+    url_entry.set_placeholder_text(Some(crate::config::DEFAULT_OLLAMA_URL));
+    container.pack_start(&url_entry, false, false, 0);
+
+    let url_help = Label::new(Some("Where Ollama runs on your computer. No key needed."));
+    url_help.set_halign(gtk::Align::Start);
+    url_help.set_line_wrap(true);
+    container.pack_start(&url_help, false, false, 0);
 
     let button_row = GtkBox::new(Orientation::Horizontal, 8);
     let save_button = Button::with_label("Save");
@@ -97,31 +326,103 @@ pub fn show_settings() -> Result<(), String> {
         set_status(&status_label, error, true);
     }
 
+    let controls = Rc::new(RefCell::new(Controls {
+        provider_combo: provider_combo.clone(),
+        model_entry: model_entry.clone(),
+        effort_combo: effort_combo.clone(),
+        key_entry: key_entry.clone(),
+        url_entry: url_entry.clone(),
+        key_label: key_label.clone(),
+        key_help: key_help.clone(),
+        link_box: link_box.clone(),
+        url_label: url_label.clone(),
+        url_help: url_help.clone(),
+        status_label: status_label.clone(),
+        settings,
+    }));
+    refresh_provider_rows(&controls);
+
     {
-        let entry_for_save = entry.clone();
-        let status_for_save = status_label.clone();
+        let controls_for_provider = controls.clone();
+        provider_combo.connect_changed(move |_| {
+            // Stash the model text for the previous provider first, so
+            // switching providers keeps each one's model.
+            stash_draft(&controls_for_provider);
+            refresh_provider_rows(&controls_for_provider);
+        });
+    }
+    {
+        let controls_for_save = controls.clone();
         save_button.connect_clicked(move |_| {
-            let value = entry_for_save.text().to_string();
-            match super::save_api_key(&value) {
-                Ok(()) => {
-                    entry_for_save.set_text("");
-                    entry_for_save.set_placeholder_text(Some("••••••••"));
-                    set_status(&status_for_save, "Saved.", false);
+            let snapshot = {
+                let borrowed = controls_for_save.borrow();
+                (
+                    provider_at(borrowed.provider_combo.active().unwrap_or(0)),
+                    borrowed.model_entry.text().to_string(),
+                    effort_at(borrowed.effort_combo.active().unwrap_or(0)),
+                    borrowed.url_entry.text().to_string(),
+                    borrowed.key_entry.text().to_string(),
+                )
+            };
+            let (provider, model, effort, url, key) = snapshot;
+            if let Err(error) = crate::config::validate_model_name(&model) {
+                let borrowed = controls_for_save.borrow();
+                set_status(&borrowed.status_label, &error, true);
+                return;
+            }
+            stash_draft(&controls_for_save);
+            let save_result = {
+                let borrowed = controls_for_save.borrow();
+                crate::config::save_settings(&borrowed.settings)
+            };
+            if let Err(error) = save_result {
+                let borrowed = controls_for_save.borrow();
+                set_status(&borrowed.status_label, &error, true);
+                return;
+            }
+            let _ = (effort, url);
+            let borrowed = controls_for_save.borrow();
+            if key.trim().is_empty() {
+                set_status(&borrowed.status_label, "Saved.", false);
+            } else {
+                match super::save_api_key_for(provider, &key) {
+                    Ok(()) => set_status(&borrowed.status_label, "Saved.", false),
+                    Err(error) => {
+                        set_status(&borrowed.status_label, &error, true);
+                        return;
+                    }
                 }
-                Err(error) => set_status(&status_for_save, &error, true),
+            }
+            drop(borrowed);
+            let borrowed = controls_for_save.borrow();
+            borrowed.key_entry.set_text("");
+            match super::has_api_key_for(provider) {
+                Ok(true) => borrowed.key_entry.set_placeholder_text(Some("••••••••")),
+                Ok(false) => borrowed
+                    .key_entry
+                    .set_placeholder_text(Some("Paste your key here")),
+                Err(error) => set_status(&borrowed.status_label, &error, true),
             }
         });
     }
     {
-        let entry_for_remove = entry.clone();
-        let status_for_remove = status_label.clone();
-        remove_button.connect_clicked(move |_| match super::remove_api_key() {
-            Ok(()) => {
-                entry_for_remove.set_text("");
-                entry_for_remove.set_placeholder_text(Some("Paste your key here"));
-                set_status(&status_for_remove, "Key removed.", false);
+        let controls_for_remove = controls.clone();
+        remove_button.connect_clicked(move |_| {
+            let provider = {
+                let borrowed = controls_for_remove.borrow();
+                provider_at(borrowed.provider_combo.active().unwrap_or(0))
+            };
+            let borrowed = controls_for_remove.borrow();
+            match super::remove_api_key_for(provider) {
+                Ok(()) => {
+                    borrowed.key_entry.set_text("");
+                    borrowed
+                        .key_entry
+                        .set_placeholder_text(Some("Paste your key here"));
+                    set_status(&borrowed.status_label, "Key removed.", false);
+                }
+                Err(error) => set_status(&borrowed.status_label, &error, true),
             }
-            Err(error) => set_status(&status_for_remove, &error, true),
         });
     }
 
@@ -136,6 +437,9 @@ pub fn show_settings() -> Result<(), String> {
         *state.borrow_mut() = Some(window.clone());
     });
     window.show_all();
+    // refresh_provider_rows ran before show_all; re-apply visibility now that
+    // everything is realized.
+    refresh_provider_rows(&controls);
     window.present();
     Ok(())
 }

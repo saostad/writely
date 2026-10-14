@@ -51,13 +51,14 @@ pub(crate) fn clean_reply(raw: &str) -> Option<String> {
     if without_think.is_empty() {
         return None;
     }
-    let unquoted =
-        if without_think.len() >= 2 && without_think.starts_with('"') && without_think.ends_with('"')
-        {
-            without_think[1..without_think.len() - 1].trim()
-        } else {
-            without_think
-        };
+    let unquoted = if without_think.len() >= 2
+        && without_think.starts_with('"')
+        && without_think.ends_with('"')
+    {
+        without_think[1..without_think.len() - 1].trim()
+    } else {
+        without_think
+    };
     if unquoted.is_empty() {
         None
     } else {
@@ -73,11 +74,7 @@ pub(crate) fn truncate_body(body: &str) -> String {
 /// One entry point for every provider: same system instruction, temperature 0
 /// and UNCLEAR handling. The key is `None` for Ollama (no key needed); for
 /// Gemini and Together a missing key or model is an error for the popup.
-pub fn suggest(
-    settings: &AppSettings,
-    key: Option<&str>,
-    text: &str,
-) -> Result<String, String> {
+pub fn suggest(settings: &AppSettings, key: Option<&str>, text: &str) -> Result<String, String> {
     match settings.provider {
         Provider::Gemini => gemini::suggest(settings, key, text),
         Provider::Together => together::suggest(settings, key, text),
@@ -123,9 +120,15 @@ mod tests {
         // No block: untouched.
         assert_eq!(strip_think_block("She goes."), "She goes.");
         // Unclosed block: untouched.
-        assert_eq!(strip_think_block("<think>hm She goes."), "<think>hm She goes.");
+        assert_eq!(
+            strip_think_block("<think>hm She goes."),
+            "<think>hm She goes."
+        );
         // Think block elsewhere is not stripped.
-        assert_eq!(strip_think_block("She <think>hm</think> goes."), "She <think>hm</think> goes.");
+        assert_eq!(
+            strip_think_block("She <think>hm</think> goes."),
+            "She <think>hm</think> goes."
+        );
     }
 
     #[test]
@@ -135,7 +138,10 @@ mod tests {
             Some("She goes.")
         );
         assert_eq!(clean_reply("   ").as_deref(), None);
-        assert_eq!(clean_reply("<think>only thinking</think>   ").as_deref(), None);
+        assert_eq!(
+            clean_reply("<think>only thinking</think>   ").as_deref(),
+            None
+        );
         assert_eq!(clean_reply("\"\"").as_deref(), None);
     }
 }

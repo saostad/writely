@@ -68,9 +68,7 @@ pub fn parse_response(status: u16, body: &str, model: &str) -> Result<String, St
 
     match clean_reply(text) {
         Some(reply) => Ok(reply),
-        None => Err(format!(
-            "Ollama returned no suggestion (model {model})."
-        )),
+        None => Err(format!("Ollama returned no suggestion (model {model}).")),
     }
 }
 

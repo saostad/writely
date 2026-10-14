@@ -7,16 +7,13 @@ mod windows;
 
 const SERVICE: &str = "writely";
 const USER: &str = "gemini-api-key";
-#[allow(dead_code)]
 const TOGETHER_USER: &str = "together-api-key";
 pub(crate) const API_KEY_PAGE: &str = "https://aistudio.google.com/apikey";
-#[allow(dead_code)]
 pub(crate) const TOGETHER_API_KEY_PAGE: &str = "https://api.together.ai/settings/api-keys";
 pub(crate) const ACCESSIBILITY_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
 
 /// The keychain page and storage for the provider that needs a key.
-#[allow(dead_code)]
 pub fn api_key_page_for(provider: crate::config::Provider) -> Option<&'static str> {
     match provider {
         crate::config::Provider::Gemini => Some(API_KEY_PAGE),
@@ -25,7 +22,6 @@ pub fn api_key_page_for(provider: crate::config::Provider) -> Option<&'static st
     }
 }
 
-#[allow(dead_code)]
 fn keychain_user_for(provider: crate::config::Provider) -> Option<&'static str> {
     match provider {
         crate::config::Provider::Gemini => Some(USER),
@@ -77,17 +73,13 @@ fn keyring_entry() -> Result<keyring::Entry, keyring::Error> {
     keyring::Entry::new(SERVICE, USER)
 }
 
-#[allow(dead_code)]
 fn keyring_entry_for(provider: crate::config::Provider) -> Result<keyring::Entry, keyring::Error> {
     let user = keychain_user_for(provider).unwrap_or(USER);
     keyring::Entry::new(SERVICE, user)
 }
 
 /// Loads the API key for the selected provider. Ollama has no key (`Ok(None)`).
-#[allow(dead_code)]
-pub fn load_api_key_for(
-    provider: crate::config::Provider,
-) -> Result<Option<String>, String> {
+pub fn load_api_key_for(provider: crate::config::Provider) -> Result<Option<String>, String> {
     if keychain_user_for(provider).is_none() {
         return Ok(None);
     }
@@ -103,7 +95,6 @@ pub fn load_api_key_for(
 }
 
 /// Saves the API key for the selected provider. Ollama has no key (a no-op).
-#[allow(dead_code)]
 pub fn save_api_key_for(provider: crate::config::Provider, key: &str) -> Result<(), String> {
     if keychain_user_for(provider).is_none() {
         return Ok(());
@@ -117,7 +108,6 @@ pub fn save_api_key_for(provider: crate::config::Provider, key: &str) -> Result<
 }
 
 /// Removes the selected provider's key. Ollama has no key (a no-op).
-#[allow(dead_code)]
 pub fn remove_api_key_for(provider: crate::config::Provider) -> Result<(), String> {
     if keychain_user_for(provider).is_none() {
         return Ok(());
@@ -133,10 +123,7 @@ pub fn remove_api_key_for(provider: crate::config::Provider) -> Result<(), Strin
     }
 }
 
-#[allow(dead_code)]
-pub fn has_api_key_for(
-    provider: crate::config::Provider,
-) -> Result<bool, String> {
+pub fn has_api_key_for(provider: crate::config::Provider) -> Result<bool, String> {
     load_api_key_for(provider).map(|key| key.is_some())
 }
 
@@ -152,6 +139,8 @@ pub fn load_api_key() -> Result<Option<String>, String> {
     }
 }
 
+// Kept for the Windows/Linux Settings windows (unused on macOS).
+#[allow(dead_code)]
 pub fn save_api_key(key: &str) -> Result<(), String> {
     let trimmed = validate_api_key(key)?;
     let entry = keyring_entry()
@@ -161,6 +150,8 @@ pub fn save_api_key(key: &str) -> Result<(), String> {
         .map_err(|e| format!("Could not save the key to the system keychain: {e}"))
 }
 
+// Kept for the Windows/Linux Settings windows (unused on macOS).
+#[allow(dead_code)]
 pub fn remove_api_key() -> Result<(), String> {
     let entry = keyring_entry()
         .map_err(|e| format!("Could not remove the key from the system keychain: {e}"))?;
@@ -173,6 +164,8 @@ pub fn remove_api_key() -> Result<(), String> {
     }
 }
 
+// Kept for the Windows/Linux Settings windows (unused on macOS).
+#[allow(dead_code)]
 pub fn has_api_key() -> Result<bool, String> {
     load_api_key().map(|key| key.is_some())
 }

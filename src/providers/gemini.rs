@@ -110,8 +110,10 @@ pub fn suggest(
         return Err("No model is set for Gemini. Choose a model first in Settings.".to_string());
     }
     let Some(api_key) = key else {
-        return Err("Add your Gemini API key first: click the Writely menu-bar icon › Settings…"
-            .to_string());
+        return Err(
+            "Add your Gemini API key first: click the Writely menu-bar icon › Settings…"
+                .to_string(),
+        );
     };
     let url =
         format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
