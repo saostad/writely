@@ -1062,6 +1062,34 @@ fn write_whole_field(
     }
 }
 
+/// Re-selects `range` (char indices into `snap.text`) via
+/// `AXSelectedTextRange`, so a paste replaces exactly the checked text. Used
+/// when an AX replace fails verification on a partial snapshot: the text is
+/// still selected from step 1 of the AX path, and this re-selects it first.
+pub(crate) fn reselect_range(snap: &FieldSnapshot, range: Range<usize>) -> Result<(), String> {
+    let element: &AXUIElement = &snap.handle.element;
+    set_messaging_timeout(element);
+    let name = app_name(snap.pid);
+    let start = snap.window_start_utf16 + char_to_utf16_offset(&snap.text, range.start);
+    let end = snap.window_start_utf16 + char_to_utf16_offset(&snap.text, range.end);
+    let length = end.saturating_sub(start);
+    let range_value = make_ax_range(start, length).ok_or_else(|| {
+        format!(
+            "{name} didn't accept the replacement text (AXError {}).",
+            AXError::Failure.0
+        )
+    })?;
+    let range_type: &CFType = &range_value;
+    let error = set_attr(element, "AXSelectedTextRange", range_type);
+    if error != AXError::Success {
+        return Err(format!(
+            "{name} didn't accept the replacement text (AXError {}).",
+            error.0
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn replace_range(
     snap: &FieldSnapshot,
     range: Range<usize>,

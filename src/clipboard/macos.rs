@@ -502,8 +502,9 @@ pub fn copy_selected_text(pid: u32) -> Result<CopyResult, String> {
 }
 
 /// Pastes `suggestion` into the frontmost app via ⌘V, then restores the
-/// saved pasteboard. The suggestion is marked transient + concealed so
-/// clipboard managers skip it.
+/// saved pasteboard only when nothing else changed it (WritingTools
+/// `restoreIfUnchanged`). The suggestion is marked transient + concealed so
+/// clipboard managers skip it. Held modifiers are released first (Pot rule).
 pub fn paste_suggestion(pid: u32, suggestion: &str) -> Result<(), String> {
     let pasteboard = NSPasteboard::generalPasteboard();
     let saved = save_clipboard(&pasteboard);
@@ -525,13 +526,15 @@ pub fn paste_suggestion(pid: u32, suggestion: &str) -> Result<(), String> {
     // fatal for the paste itself.
     pasteboard.setString_forType(&string, &transient);
     pasteboard.setString_forType(&string, &concealed);
+    release_modifiers();
     if let Err(error) = post_command_key(KEY_V) {
         restore_clipboard(&pasteboard, &saved);
         eprintln!("Writely: could not paste the suggestion: {error}");
         return Err(format!("Could not paste the suggestion: {error}"));
     }
     std::thread::sleep(Duration::from_millis(PASTE_WAIT_MS));
-    restore_clipboard(&pasteboard, &saved);
+    let our_change = pasteboard.changeCount();
+    restore_if_unchanged(&pasteboard, &saved, our_change);
     log_clipboard_once(
         pid,
         "replaced the text via copy-and-paste (pasteboard restored).",

@@ -664,11 +664,40 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
         eprintln!("Writely: no text to replace.");
         return;
     };
-    match text_access::replace_range(&snap, active.range, &active.suggestion) {
+    match text_access::replace_range(&snap, active.range.clone(), &active.suggestion) {
         Ok(()) => {
             popup::hide();
         }
         Err(error) => {
+            // Paste fallback for partial snapshots: the text is still
+            // selected from step 1 of the AX path, so re-select the snapshot
+            // range first and paste over it instead of showing an error.
+            #[cfg(target_os = "macos")]
+            if !active.via_clipboard && !text_access::covers_whole_field(&snap) {
+                match text_access::macos_helpers::reselect_range(&snap, active.range.clone()) {
+                    Ok(()) => {
+                        match clipboard::paste_suggestion(active.pid, &active.suggestion) {
+                            Ok(()) => {
+                                popup::hide();
+                            }
+                            Err(paste_error) => {
+                                show_popup(
+                                    &paste_error,
+                                    true,
+                                    false,
+                                    *last_anchor,
+                                    Some(snap.caret_rect),
+                                    last_anchor,
+                                );
+                            }
+                        }
+                        return;
+                    }
+                    Err(_) => {
+                        // Re-select failed: fall through to the AX error below.
+                    }
+                }
+            }
             show_popup(
                 &error,
                 true,
