@@ -69,6 +69,7 @@ pub fn desktop_entry(executable: &std::path::Path) -> String {
 
 /// Where the autostart file lives on macOS/Linux (`None` on Windows, which
 /// uses the registry instead).
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub fn autostart_file_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -120,6 +121,7 @@ fn file_contents_for(executable: &std::path::Path) -> String {
 
 /// Writes or removes the autostart file at `path`. Removing a file that is
 /// already gone is not an error.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn set_enabled_at(path: &std::path::Path, enabled: bool, contents: &str) -> Result<(), String> {
     if enabled {
         if let Some(parent) = path.parent() {
@@ -270,6 +272,7 @@ mod tests {
     #[test]
     fn autostart_path_ends_with_the_entry_file() {
         if let Some(path) = autostart_file_path() {
+            #[cfg_attr(target_os = "windows", allow(unused_variables))]
             let text = path.to_string_lossy();
             #[cfg(target_os = "macos")]
             assert!(text.ends_with("Library/LaunchAgents/dev.writely.Writely.plist"));

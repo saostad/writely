@@ -118,6 +118,12 @@ product-name = "Writely"
 identifier = "dev.writely.Writely"
 out-dir = "dist"
 binaries = [{ path = "writely", main = true }]
+icons = [
+    "packaging/icons/icon-32.png",
+    "packaging/icons/icon-128.png",
+    "packaging/icons/icon-256.png",
+    "packaging/icons/icon-512.png",
+]
 
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"
