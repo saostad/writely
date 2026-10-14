@@ -419,8 +419,8 @@ fn setup_for_pid(pid: u32) {
             let initial = read_bool_attr(&app_element, "AXEnhancedUserInterface");
             let set_error = set_bool_attr(&app_element, "AXEnhancedUserInterface", true);
             let sent = set_error == AXError::Success || set_error == AXError::CannotComplete;
-            let confirmed =
-                read_bool_attr(&app_element, "AXEnhancedUserInterface") == Some(true);
+            let readback = read_bool_attr(&app_element, "AXEnhancedUserInterface");
+            let confirmed = readback == Some(true);
             if sent && confirmed {
                 if initial == Some(false) {
                     inner.enhanced_pids.insert(pid);
@@ -432,8 +432,13 @@ fn setup_for_pid(pid: u32) {
                 }
                 newly_enabled = true;
             } else if inner.logged_report_pids.insert(pid) {
+                let readback_str = match readback {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "unreadable",
+                };
                 eprintln!(
-                    "Writely: could not turn on cursor reporting for {name}: AXManualAccessibility AXError {}, AXEnhancedUserInterface AXError {}.",
+                    "Writely: could not turn on cursor reporting for {name}: AXManualAccessibility AXError {}, AXEnhancedUserInterface AXError {} (readback {readback_str}).",
                     manual_error.0,
                     set_error.0
                 );
@@ -499,6 +504,18 @@ fn setup_for_pid(pid: u32) {
         FOCUS_DIRTY.store(true, Ordering::SeqCst);
         flag_caret_changed();
     });
+}
+
+/// Whether the cursor-reporting retry window is currently active for `pid`.
+/// `text_access` uses this to skip the premature "can't find the text
+/// cursor" message while a retry is still running; the window's own 4 s
+/// timeout line covers a lasting failure.
+pub(crate) fn retry_active_for(pid: u32) -> bool {
+    INNER.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|inner| inner.retry_pid == pid && inner.retry_timer.is_some())
+    })
 }
 
 /// The watcher's cached focused element, pid and per-focus editable flag for

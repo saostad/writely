@@ -32,6 +32,12 @@ static NO_CARET_LOGGED: LazyLock<Mutex<HashSet<u32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn log_no_caret_once(pid: u32) {
+    // While the cursor-reporting retry window is active for this pid, the
+    // "no text cursor appeared within 4 s" line at the end of the window
+    // covers it; don't log a premature message per caret event.
+    if crate::watcher::macos::retry_active_for(pid) {
+        return;
+    }
     let mut logged = NO_CARET_LOGGED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
