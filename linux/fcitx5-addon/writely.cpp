@@ -305,8 +305,19 @@ bool Writely::onSignal(fcitx::dbus::Message &msg) {
             return true;
         }
         onShowMessage(ctx, text, isError, canApply);
+    } else if (member == "Replace") {
+        uint32_t request = 0;
+        uint32_t start = 0;
+        uint32_t end = 0;
+        std::string text;
+        msg >> request >> start >> end >> text;
+        if (!msg) {
+            FCITX_WARN() << "Writely: ignoring a malformed Replace signal "
+                            "from Writely.";
+            return true;
+        }
+        onReplace(ctx, request, start, end, text);
     }
-    // Replace is handled in the next item; unknown members are ignored.
     return true;
 }
 
@@ -405,6 +416,50 @@ void Writely::onHide(const std::string &ctx) {
     if (hideWritelyPanel(ic, ctx)) {
         ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
     }
+}
+
+void Writely::onReplace(const std::string &ctx, uint32_t request,
+                         uint32_t start, uint32_t end, const std::string &text) {
+    fcitx::InputContext *ic = findContext(ctx);
+    if (!ic || !ic->surroundingText().isValid()) {
+        sendReplaceResult(ctx, request, false, "the text field is gone");
+        return;
+    }
+    const uint32_t cursor = ic->surroundingText().cursor();
+    if (!(start <= cursor && cursor <= end)) {
+        sendReplaceResult(ctx, request, false,
+                          "the cursor moved outside the text to replace; click "
+                          "inside the sentence and try again");
+        return;
+    }
+    try {
+        ic->deleteSurroundingText(static_cast<int>(start) -
+                                      static_cast<int>(cursor),
+                                  end - start);
+        ic->commitString(text);
+    } catch (const std::exception &e) {
+        sendReplaceResult(ctx, request, false, e.what());
+        return;
+    } catch (...) {
+        sendReplaceResult(ctx, request, false,
+                          "unknown error while replacing the text");
+        return;
+    }
+    sendReplaceResult(ctx, request, true, "");
+    if (hideWritelyPanel(ic, ctx)) {
+        ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+    }
+}
+
+void Writely::sendReplaceResult(const std::string &ctx, uint32_t request,
+                                bool ok, const std::string &error) {
+    if (!bus_) {
+        return;
+    }
+    fcitx::dbus::Message msg = bus_->createMethodCall(
+        kBusName, kObjectPath, kInterface, "ReplaceResult");
+    msg << ctx << request << ok << error;
+    send(std::move(msg), "ReplaceResult");
 }
 
 void Writely::sendClicked(fcitx::InputContext *ic, const std::string &action) {

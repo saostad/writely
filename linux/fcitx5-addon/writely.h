@@ -57,6 +57,10 @@ private:
     void onShowMessage(const std::string &ctx, const std::string &text,
                        bool isError, bool canApply);
     void onHide(const std::string &ctx);
+    void onReplace(const std::string &ctx, uint32_t request, uint32_t start,
+                   uint32_t end, const std::string &text);
+    void sendReplaceResult(const std::string &ctx, uint32_t request, bool ok,
+                           const std::string &error);
     // The user clicked one of Writely's candidates.
     void sendClicked(fcitx::InputContext *ic, const std::string &action);
 
