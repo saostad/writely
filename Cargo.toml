@@ -51,6 +51,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSScreen",
     "NSScrollView",
     "NSSecureTextField",
+    "NSSegmentedControl",
     "NSText",
     "NSTextContainer",
     "NSTextField",

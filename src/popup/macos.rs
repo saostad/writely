@@ -9,17 +9,19 @@ use objc2_app_kit::{
     NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventMask, NSFont, NSFontAttributeName,
     NSForegroundColorAttributeName, NSMutableParagraphStyle, NSPanel,
     NSParagraphStyleAttributeName, NSProgressIndicator, NSProgressIndicatorStyle, NSScreen,
-    NSScrollView, NSStatusWindowLevel, NSStrikethroughStyleAttributeName, NSTextField, NSTextView,
-    NSView, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSScrollView, NSSegmentSwitchTracking, NSSegmentedControl, NSStatusWindowLevel,
+    NSStrikethroughStyleAttributeName, NSTextField, NSTextView, NSView, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSAttributedString, NSAttributedStringKey, NSDictionary,
+    MainThreadMarker, NSAttributedString, NSAttributedStringKey, NSDictionary, NSInteger,
     NSMutableAttributedString, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
     NSString,
 };
 use tao::event_loop::EventLoopProxy;
 
+use super::{PopupTab, TabContent};
+use crate::providers::RewriteStyle;
 use crate::text_access::CaretRect;
 use crate::UserEvent;
 
@@ -27,6 +29,7 @@ use crate::UserEvent;
 const CARD_WIDTH: f64 = 440.0;
 const SIDE_PAD: f64 = 12.0;
 const HEADER_HEIGHT: f64 = 28.0;
+const TABS_ROW_HEIGHT: f64 = 30.0;
 const FOOTER_HEIGHT: f64 = 40.0;
 const BODY_MIN: f64 = 40.0;
 const BODY_MAX: f64 = 340.0;
@@ -104,6 +107,73 @@ impl DismissTarget {
 }
 
 define_class!(
+    // SAFETY: NSObject has no subclassing requirements and TabTarget does not implement Drop.
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    struct TabTarget;
+
+    // SAFETY: NSObjectProtocol has no safety requirements.
+    unsafe impl NSObjectProtocol for TabTarget {}
+
+    impl TabTarget {
+        #[unsafe(method(tabClicked:))]
+        fn tab_clicked(&self, _sender: Option<&AnyObject>) {
+            let tab = STATE.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .and_then(|popup| tab_for_segment(popup.tabs.selectedSegment()))
+            });
+            let Some(tab) = tab else {
+                return;
+            };
+            if let Some(proxy) = PROXY.get() {
+                if let Err(error) = proxy.send_event(UserEvent::TabClicked(tab)) {
+                    eprintln!("Writely: could not deliver the tab event: {error}");
+                }
+            }
+        }
+    }
+);
+
+impl TabTarget {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: NSObject init signature is correct.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// Segment 0 is `Correct`; segments 1..=5 follow `RewriteStyle::ALL`.
+/// Returns `None` for an unexpected segment (single selection always keeps
+/// one segment selected, so this is only defensive).
+fn tab_for_segment(selected: NSInteger) -> Option<PopupTab> {
+    if selected == 0 {
+        Some(PopupTab::Correct)
+    } else {
+        usize::try_from(selected)
+            .ok()
+            .and_then(|index| RewriteStyle::ALL.get(index - 1))
+            .map(|style| PopupTab::Rewrite(*style))
+    }
+}
+
+fn segment_for_tab(tab: PopupTab) -> NSInteger {
+    match tab {
+        PopupTab::Correct => 0,
+        PopupTab::Rewrite(style) => {
+            match RewriteStyle::ALL
+                .iter()
+                .position(|candidate| *candidate == style)
+            {
+                Some(index) => index as NSInteger + 1,
+                None => 0,
+            }
+        }
+    }
+}
+
+define_class!(
     // SAFETY: NSView has no subclassing requirements and SeparatorView does not implement Drop.
     #[unsafe(super = NSView)]
     #[thread_kind = MainThreadOnly]
@@ -141,10 +211,13 @@ struct PopupState {
     cancel_button: Retained<NSButton>,
     replace_button: Retained<NSButton>,
     spinner: Retained<NSProgressIndicator>,
+    tabs: Retained<NSSegmentedControl>,
     #[allow(dead_code)]
     replace_target: Retained<ReplaceTarget>,
     #[allow(dead_code)]
     dismiss_target: Retained<DismissTarget>,
+    #[allow(dead_code)]
+    tab_target: Retained<TabTarget>,
     visible: bool,
     /// Global keyDown monitor, installed only while the popup is visible so
     /// typing hides the popup even in apps that send no AX notifications
@@ -291,6 +364,38 @@ fn ensure_popup(mtm: MainThreadMarker) {
         spinner.setHidden(true);
         card.addSubview(&spinner);
 
+        // Tab row: "Correct" plus the five rewrite styles. Added last so the
+        // title/close views stay at subview indices 0 and 1.
+        let tab_target = TabTarget::new(mtm);
+        let tab_object: &AnyObject = &tab_target;
+        // SAFETY: initWithFrame: is the designated initializer and mtm is the main thread.
+        let tabs = NSSegmentedControl::initWithFrame(
+            NSSegmentedControl::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 24.0)),
+        );
+        tabs.setSegmentCount(6);
+        tabs.setTrackingMode(NSSegmentSwitchTracking::SelectOne);
+        tabs.setLabel_forSegment(&NSString::from_str("Correct"), 0);
+        for (index, style) in RewriteStyle::ALL.iter().enumerate() {
+            tabs.setLabel_forSegment(&NSString::from_str(style.label()), index as NSInteger + 1);
+        }
+        // Small control size and the small system font so all six labels
+        // (notably "Professional") fit the 416 pt content width.
+        // SAFETY: setControlSize: exists on NSControl; 1 is NSControlSizeSmall.
+        unsafe {
+            let _: () = msg_send![&tabs, setControlSize: 1usize];
+        }
+        tabs.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        // SAFETY: tab target implements tabClicked: and lives in STATE while the panel is alive.
+        unsafe {
+            tabs.setTarget(Some(tab_object));
+            tabs.setAction(Some(sel!(tabClicked:)));
+        }
+        tabs.setHidden(true);
+        card.addSubview(&tabs);
+
         panel.setContentView(Some(&card));
         *state.borrow_mut() = Some(PopupState {
             panel,
@@ -301,8 +406,10 @@ fn ensure_popup(mtm: MainThreadMarker) {
             cancel_button,
             replace_button,
             spinner,
+            tabs,
             replace_target,
             dismiss_target,
+            tab_target,
             visible: false,
             key_monitor: None,
         });
@@ -439,6 +546,7 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
             unsafe { popup.spinner.stopAnimation(None) };
             popup.spinner.setHidden(true);
         }
+        popup.tabs.setHidden(true);
         popup.separator.setHidden(!show_footer);
         if show_footer {
             popup.separator.setFrame(NSRect::new(
@@ -595,6 +703,7 @@ fn layout_attributed(body: &NSAttributedString) -> f64 {
             NSPoint::new(0.0, 0.0),
             NSSize::new(text_width, body_height.max(needed)),
         ));
+        popup.tabs.setHidden(true);
         popup.separator.setHidden(false);
         popup.separator.setFrame(NSRect::new(
             NSPoint::new(0.0, FOOTER_HEIGHT),
@@ -606,6 +715,209 @@ fn layout_attributed(body: &NSAttributedString) -> f64 {
             NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
             NSSize::new(90.0, 24.0),
         ));
+        popup.cancel_button.setFrame(NSRect::new(
+            NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
+            NSSize::new(90.0, 24.0),
+        ));
+        panel_height
+    })
+}
+
+/// Lays out the card for a tabbed diff body (today's diff view with the tab
+/// row above it). Cancel + Replace are visible. Returns the panel height.
+fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(popup) = state.as_mut() else {
+            return 0.0;
+        };
+        // SAFETY: the text storage exists for a freshly created NSTextView.
+        unsafe {
+            if let Some(storage) = popup.text.textStorage() {
+                storage.setAttributedString(body);
+            }
+        }
+        // SAFETY: the spinner is alive in STATE for the life of the popup.
+        unsafe {
+            popup.spinner.stopAnimation(None);
+        }
+        popup.spinner.setHidden(true);
+        popup.text.setEditable(false);
+        popup.text.setSelectable(false);
+        let text_width = CARD_WIDTH - 2.0 * SIDE_PAD;
+        // SAFETY: the text container exists for a freshly created NSTextView.
+        unsafe {
+            if let Some(container) = popup.text.textContainer() {
+                container.setWidthTracksTextView(false);
+                container.setContainerSize(NSSize::new(text_width, 1_000_000.0));
+            }
+        }
+        popup.text.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(text_width, 1_000_000.0),
+        ));
+        // SAFETY: the layout manager exists for a freshly created NSTextView.
+        let mut needed: f64 = BODY_MIN;
+        unsafe {
+            if let (Some(layout), Some(container)) =
+                (popup.text.layoutManager(), popup.text.textContainer())
+            {
+                layout.ensureLayoutForTextContainer(&container);
+                needed = layout.usedRectForTextContainer(&container).size.height;
+            }
+        }
+        let body_height = needed.clamp(BODY_MIN, BODY_MAX);
+        let panel_height = HEADER_HEIGHT + TABS_ROW_HEIGHT + body_height + FOOTER_HEIGHT;
+
+        popup.card.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(CARD_WIDTH, panel_height),
+        ));
+        let subviews = popup.card.subviews();
+        if subviews.count() >= 2 {
+            let title_view = subviews.objectAtIndex(0);
+            title_view.setFrame(NSRect::new(
+                NSPoint::new(SIDE_PAD, panel_height - HEADER_HEIGHT + 4.0),
+                NSSize::new(300.0, 20.0),
+            ));
+            let close_view = subviews.objectAtIndex(1);
+            close_view.setFrame(NSRect::new(
+                NSPoint::new(CARD_WIDTH - 36.0, panel_height - HEADER_HEIGHT + 2.0),
+                NSSize::new(24.0, 24.0),
+            ));
+        }
+        popup.tabs.setHidden(false);
+        popup.tabs.setSelectedSegment(segment_for_tab(selected));
+        popup.tabs.setFrame(NSRect::new(
+            NSPoint::new(
+                SIDE_PAD,
+                panel_height - HEADER_HEIGHT - TABS_ROW_HEIGHT + 3.0,
+            ),
+            NSSize::new(CARD_WIDTH - 2.0 * SIDE_PAD, 24.0),
+        ));
+        popup.scroll.setFrame(NSRect::new(
+            NSPoint::new(4.0, FOOTER_HEIGHT),
+            NSSize::new(CARD_WIDTH - 8.0, body_height),
+        ));
+        popup.text.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(text_width, body_height.max(needed)),
+        ));
+        popup.separator.setHidden(false);
+        popup.separator.setFrame(NSRect::new(
+            NSPoint::new(0.0, FOOTER_HEIGHT),
+            NSSize::new(CARD_WIDTH, 1.0),
+        ));
+        popup.cancel_button.setHidden(false);
+        popup.replace_button.setHidden(false);
+        popup.replace_button.setFrame(NSRect::new(
+            NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
+            NSSize::new(90.0, 24.0),
+        ));
+        popup.cancel_button.setFrame(NSRect::new(
+            NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
+            NSSize::new(90.0, 24.0),
+        ));
+        panel_height
+    })
+}
+
+/// Lays out the card for a tabbed plain-text body (a rewrite state: loading,
+/// error, or an informational note). The footer shows Cancel only. Returns
+/// the panel height.
+fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: PopupTab) -> f64 {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(popup) = state.as_mut() else {
+            return 0.0;
+        };
+        popup.text.setString(&NSString::from_str(text));
+        popup.text.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        if is_error {
+            popup.text.setTextColor(Some(&NSColor::systemRedColor()));
+        } else {
+            popup.text.setTextColor(Some(&NSColor::labelColor()));
+        }
+        let text_indent = if loading { 18.0 } else { 0.0 };
+        let text_width = CARD_WIDTH - 2.0 * SIDE_PAD - text_indent;
+        // SAFETY: the text container exists for a freshly created NSTextView.
+        unsafe {
+            if let Some(container) = popup.text.textContainer() {
+                container.setWidthTracksTextView(false);
+                container.setContainerSize(NSSize::new(text_width, 1_000_000.0));
+            }
+        }
+        popup.text.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(text_width, 1_000_000.0),
+        ));
+        // SAFETY: the layout manager exists for a freshly created NSTextView.
+        let mut needed: f64 = BODY_MIN;
+        unsafe {
+            if let (Some(layout), Some(container)) =
+                (popup.text.layoutManager(), popup.text.textContainer())
+            {
+                layout.ensureLayoutForTextContainer(&container);
+                needed = layout.usedRectForTextContainer(&container).size.height;
+            }
+        }
+        let body_height = needed.clamp(BODY_MIN, BODY_MAX);
+        let panel_height = HEADER_HEIGHT + TABS_ROW_HEIGHT + body_height + FOOTER_HEIGHT;
+
+        popup.card.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(CARD_WIDTH, panel_height),
+        ));
+        let subviews = popup.card.subviews();
+        if subviews.count() >= 2 {
+            let title_view = subviews.objectAtIndex(0);
+            title_view.setFrame(NSRect::new(
+                NSPoint::new(SIDE_PAD, panel_height - HEADER_HEIGHT + 4.0),
+                NSSize::new(300.0, 20.0),
+            ));
+            let close_view = subviews.objectAtIndex(1);
+            close_view.setFrame(NSRect::new(
+                NSPoint::new(CARD_WIDTH - 36.0, panel_height - HEADER_HEIGHT + 2.0),
+                NSSize::new(24.0, 24.0),
+            ));
+        }
+        popup.tabs.setHidden(false);
+        popup.tabs.setSelectedSegment(segment_for_tab(selected));
+        popup.tabs.setFrame(NSRect::new(
+            NSPoint::new(
+                SIDE_PAD,
+                panel_height - HEADER_HEIGHT - TABS_ROW_HEIGHT + 3.0,
+            ),
+            NSSize::new(CARD_WIDTH - 2.0 * SIDE_PAD, 24.0),
+        ));
+        popup.scroll.setFrame(NSRect::new(
+            NSPoint::new(4.0 + text_indent, FOOTER_HEIGHT),
+            NSSize::new(CARD_WIDTH - 8.0 - text_indent, body_height),
+        ));
+        popup.text.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(text_width, body_height.max(needed)),
+        ));
+        if loading {
+            popup.spinner.setHidden(false);
+            popup.spinner.setFrame(NSRect::new(
+                NSPoint::new(SIDE_PAD, FOOTER_HEIGHT + body_height - 16.0),
+                NSSize::new(14.0, 14.0),
+            ));
+            // SAFETY: the spinner is alive in STATE for the life of the popup.
+            unsafe { popup.spinner.startAnimation(None) };
+        } else {
+            // SAFETY: the spinner is alive in STATE for the life of the popup.
+            unsafe { popup.spinner.stopAnimation(None) };
+            popup.spinner.setHidden(true);
+        }
+        popup.separator.setHidden(false);
+        popup.separator.setFrame(NSRect::new(
+            NSPoint::new(0.0, FOOTER_HEIGHT),
+            NSSize::new(CARD_WIDTH, 1.0),
+        ));
+        popup.cancel_button.setHidden(false);
+        popup.replace_button.setHidden(true);
         popup.cancel_button.setFrame(NSRect::new(
             NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
             NSSize::new(90.0, 24.0),
@@ -627,6 +939,36 @@ pub fn show_suggestion(original: &str, suggestion: &str, caret: &CaretRect) {
     let text_width = CARD_WIDTH - 2.0 * SIDE_PAD;
     let body = build_diff_attributed(original, suggestion, text_width);
     show_body(layout_attributed(&body), caret, mtm);
+}
+
+/// Shows the popup with the tab row, `selected` highlighted: a word diff for
+/// `Diff` (Cancel + Replace), plain text for `Message` (Cancel only, with the
+/// spinner while `loading`). Positioned like every other body: the same anchor
+/// and height-driven sizing, so switching tabs never moves the popup.
+pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        eprintln!(
+            "Writely: could not show the suggestion: Writely must update it on the main thread."
+        );
+        return;
+    };
+    ensure_popup(mtm);
+    let panel_height = match content {
+        TabContent::Diff {
+            original,
+            suggestion,
+        } => {
+            let text_width = CARD_WIDTH - 2.0 * SIDE_PAD;
+            let body = build_diff_attributed(original, suggestion, text_width);
+            layout_tabbed_diff(&body, selected)
+        }
+        TabContent::Message {
+            text,
+            is_error,
+            loading,
+        } => layout_tabbed_message(text, is_error, loading, selected),
+    };
+    show_body(panel_height, caret, mtm);
 }
 
 /// Shows the popup with `text`, 4 pt below the anchor (or above the caret

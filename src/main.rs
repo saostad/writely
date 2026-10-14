@@ -30,6 +30,10 @@ pub enum UserEvent {
     IconClicked,
     HotkeyPressed,
     ReplaceClicked,
+    // Fired only by the macOS tab row; the handler lands with the rewrite
+    // wiring, so off macOS (no tabs) this is never constructed.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    TabClicked(popup::PopupTab),
     PermissionGranted,
     #[cfg(target_os = "macos")]
     CopiedText {
