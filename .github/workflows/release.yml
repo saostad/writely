@@ -1,0 +1,139 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency: release
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            formats: dmg
+            asset_os: macos
+            asset_arch: arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            formats: dmg
+            asset_os: macos
+            asset_arch: x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            formats: nsis
+            asset_os: windows
+            asset_arch: x64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            formats: deb,appimage
+            asset_os: linux
+            asset_arch: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+      - name: Check formatting
+        if: matrix.os == 'macos-14'
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { choco install nsis -y }
+      - name: Set build version
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_VERSION=$(sed -n -E 's/^version = "([0-9]+\.[0-9]+)\.[0-9]+".*/\1/p' Cargo.toml | head -n 1)
+          if [ -z "$BASE_VERSION" ]; then echo "error: could not read version from Cargo.toml"; exit 1; fi
+          VERSION="${BASE_VERSION}.${{ github.run_number }}"
+          sed -i.bak -E "s/^version = \"[0-9]+\\.[0-9]+\\.[0-9]+\"/version = \"${VERSION}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "Building version ${VERSION}"
+      - name: Install cargo-packager
+        shell: bash
+        run: cargo install cargo-packager --locked --version "^0.11"
+      - name: Package
+        shell: bash
+        run: cargo packager --release --formats ${{ matrix.formats }} --target ${{ matrix.target }}
+      - name: Rename installers
+        shell: bash
+        env:
+          ASSET_OS: ${{ matrix.asset_os }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=()
+          for f in dist/*.dmg; do
+            dest="dist/Writely_${VERSION}_${ASSET_OS}_${ASSET_ARCH}.dmg"
+            mv "$f" "$dest"; files+=("$dest")
+          done
+          for f in dist/*.exe; do
+            dest="dist/Writely_${VERSION}_windows_x64-setup.exe"
+            mv "$f" "$dest"; files+=("$dest")
+          done
+          for f in dist/*.deb; do
+            dest="dist/Writely_${VERSION}_linux_amd64.deb"
+            mv "$f" "$dest"; files+=("$dest")
+          done
+          for f in dist/*.AppImage dist/*.appimage; do
+            dest="dist/Writely_${VERSION}_linux_x86_64.AppImage"
+            mv "$f" "$dest"; files+=("$dest")
+          done
+          if [ "${#files[@]}" -eq 0 ]; then echo "error: no installers produced in dist/:"; ls -la dist; exit 1; fi
+          printf 'Built %s\n' "${files[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.asset_os }}-${{ matrix.asset_arch }}
+          path: dist/Writely_*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          merge-multiple: true
+          path: dist
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          BASE_VERSION=$(sed -n -E 's/^version = "([0-9]+\.[0-9]+)\.[0-9]+".*/\1/p' Cargo.toml | head -n 1)
+          if [ -z "$BASE_VERSION" ]; then echo "error: could not read version from Cargo.toml"; exit 1; fi
+          VERSION="${BASE_VERSION}.${{ github.run_number }}"
+          files=(dist/*)
+          if [ "${#files[@]}" -eq 0 ]; then echo "error: no installer artifacts downloaded"; exit 1; fi
+          printf 'Releasing %s\n' "${files[@]}"
+          gh release create "v${VERSION}" "${files[@]}" --target "$GITHUB_SHA" --title "Writely ${VERSION}" --generate-notes

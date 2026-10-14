@@ -2,6 +2,7 @@
 name = "writely"
 version = "0.1.0"
 edition = "2021"
+description = "A minimal menu-bar app that checks English grammar in any app."
 
 [[bin]]
 name = "writely"
@@ -111,3 +112,13 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[package.metadata.packager]
+product-name = "Writely"
+identifier = "dev.writely.Writely"
+out-dir = "dist"
+binaries = [{ path = "writely", main = true }]
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
+info-plist-path = "packaging/Info.plist"
