@@ -2,13 +2,10 @@
 
 #[cfg(target_os = "macos")]
 mod clipboard;
-#[allow(dead_code)]
 mod config;
-mod gemini;
-#[allow(dead_code)]
-mod providers;
 mod overlay;
 mod popup;
+mod providers;
 mod settings;
 mod text_access;
 mod watcher;
@@ -73,9 +70,11 @@ fn show_popup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_check_thread(
     proxy: &EventLoopProxy<UserEvent>,
-    key: String,
+    app_settings: config::AppSettings,
+    key: Option<String>,
     sentence: String,
     my_generation: u64,
     checking: &mut Option<Checking>,
@@ -84,11 +83,11 @@ fn spawn_check_thread(
 ) {
     let worker_proxy = proxy.clone();
     if let Err(error) = std::thread::Builder::new()
-        .name("writely-gemini".to_string())
+        .name("writely-suggest".to_string())
         .spawn(move || {
             // The key lives only in this thread's request; it is never
             // logged or put in an error.
-            let result = gemini::suggest(&key, &sentence);
+            let result = providers::suggest(&app_settings, key.as_deref(), &sentence);
             if let Err(error) = worker_proxy.send_event(UserEvent::Suggestion {
                 generation: my_generation,
                 result,
@@ -122,7 +121,8 @@ fn handle_icon_clipboard(
     checking: &mut Option<Checking>,
     pending: &mut Option<Pending>,
     last_anchor: &mut Option<CaretRect>,
-    key: String,
+    app_settings: config::AppSettings,
+    key: Option<String>,
 ) {
     let copied = match clipboard::copy_selected_text(pid) {
         Ok(copied) => copied,
@@ -180,6 +180,7 @@ fn handle_icon_clipboard(
     *pending = None;
     spawn_check_thread(
         proxy,
+        app_settings,
         key,
         text,
         my_generation,
@@ -209,24 +210,50 @@ fn handle_icon_clicked(
             (None, None)
         }
     };
-    let key = match settings::load_api_key() {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            show_popup(
-                "Add your Gemini API key first: click the Writely menu-bar icon › Settings…",
-                false,
-                false,
-                live_anchor,
-                None,
-                last_anchor,
-            );
-            return;
-        }
+    let app_settings = match config::load_settings() {
+        Ok(app_settings) => app_settings,
         Err(error) => {
             show_popup(&error, true, false, live_anchor, None, last_anchor);
             return;
         }
     };
+    if app_settings.current_model().is_empty() {
+        show_popup(
+            "Choose a model first: click the Writely menu-bar icon › Settings…",
+            false,
+            false,
+            live_anchor,
+            None,
+            last_anchor,
+        );
+        return;
+    }
+    // Ollama runs locally and needs no key; the other providers read the
+    // selected provider's key from the keychain (never shown or logged).
+    let key: Option<String> = match app_settings.provider {
+        config::Provider::Ollama => None,
+        provider => match settings::load_api_key_for(provider) {
+            Ok(key) => key,
+            Err(error) => {
+                show_popup(&error, true, false, live_anchor, None, last_anchor);
+                return;
+            }
+        },
+    };
+    if key.is_none() && app_settings.provider != config::Provider::Ollama {
+        show_popup(
+            &format!(
+                "Add your {} API key first: click the Writely menu-bar icon › Settings…",
+                app_settings.provider.display_name()
+            ),
+            false,
+            false,
+            live_anchor,
+            None,
+            last_anchor,
+        );
+        return;
+    }
     let Some(snap) = (match text_access::focused_field() {
         Ok(snap) => snap,
         Err(error) => {
@@ -247,6 +274,7 @@ fn handle_icon_clicked(
                     checking,
                     pending,
                     last_anchor,
+                    app_settings.clone(),
                     key,
                 );
                 return;
@@ -331,6 +359,7 @@ fn handle_icon_clicked(
                         checking,
                         pending,
                         last_anchor,
+                        app_settings.clone(),
                         key,
                     );
                     return;
@@ -392,6 +421,7 @@ fn handle_icon_clicked(
     });
     spawn_check_thread(
         proxy,
+        app_settings,
         key,
         sentence,
         my_generation,
@@ -423,10 +453,10 @@ fn handle_suggestion(
             let Some(active) = checking.take() else {
                 return;
             };
-            match gemini::classify_suggestion(&suggestion, &active.sentence) {
-                gemini::SuggestionOutcome::Unclear => {
+            match providers::classify_suggestion(&suggestion, &active.sentence) {
+                providers::SuggestionOutcome::Unclear => {
                     show_popup(
-                        gemini::UNCLEAR_MESSAGE,
+                        providers::UNCLEAR_MESSAGE,
                         false,
                         false,
                         *last_anchor,
@@ -434,7 +464,7 @@ fn handle_suggestion(
                         last_anchor,
                     );
                 }
-                gemini::SuggestionOutcome::Unchanged => {
+                providers::SuggestionOutcome::Unchanged => {
                     show_popup(
                         "Looks good — no changes needed.",
                         false,
@@ -444,7 +474,7 @@ fn handle_suggestion(
                         last_anchor,
                     );
                 }
-                gemini::SuggestionOutcome::Suggestion => {
+                providers::SuggestionOutcome::Suggestion => {
                     show_popup(
                         &suggestion,
                         false,
