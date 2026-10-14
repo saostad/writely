@@ -1,12 +1,14 @@
 use std::cell::RefCell;
+use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSFont, NSPanel, NSScreen,
-    NSStatusWindowLevel, NSTextField, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSEvent, NSEventMask, NSFont, NSPanel,
+    NSScreen, NSStatusWindowLevel, NSTextField, NSView, NSWindowCollectionBehavior,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -104,6 +106,10 @@ struct PopupState {
     #[allow(dead_code)]
     target: Retained<ReplaceTarget>,
     visible: bool,
+    /// Global keyDown monitor, installed only while the popup is visible so
+    /// typing hides the popup even in apps that send no AX notifications
+    /// (e.g. Warp). Removed when the popup hides: zero cost at idle.
+    key_monitor: Option<Retained<AnyObject>>,
 }
 
 thread_local! {
@@ -164,7 +170,53 @@ fn ensure_popup(mtm: MainThreadMarker) {
             button,
             target,
             visible: false,
+            key_monitor: None,
         });
+    });
+}
+
+/// Installs the global keyDown monitor while the popup is visible. Any key
+/// gets the same handling as `CaretChanged` while visible (which hides the
+/// popup and drops the in-flight suggestion).
+fn install_key_monitor() {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(popup) = state.as_mut() else {
+            return;
+        };
+        if popup.key_monitor.is_some() {
+            return;
+        }
+        let block = block2::RcBlock::new(|_event: NonNull<NSEvent>| {
+            if crate::popup::is_visible() {
+                if let Some(proxy) = PROXY.get() {
+                    if let Err(error) = proxy.send_event(UserEvent::CaretChanged) {
+                        eprintln!("Writely: could not deliver the key event: {error}");
+                    }
+                }
+            }
+        });
+        match NSEvent::addGlobalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block) {
+            Some(token) => {
+                popup.key_monitor = Some(token);
+            }
+            None => {
+                eprintln!("Writely: could not watch key presses; typing may not hide the popup.");
+            }
+        }
+    });
+}
+
+fn remove_key_monitor() {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(popup) = state.as_mut() else {
+            return;
+        };
+        if let Some(token) = popup.key_monitor.take() {
+            // SAFETY: token is the monitor returned when it was installed.
+            unsafe { NSEvent::removeMonitor(&token) };
+        }
     });
 }
 
@@ -278,10 +330,13 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         // NonactivatingPanel never takes focus from the user's text field.
         popup.panel.orderFront(None);
         popup.visible = true;
+        drop(state);
+        install_key_monitor();
     });
 }
 
 pub fn hide() {
+    remove_key_monitor();
     STATE.with(|state| {
         if let Some(popup) = state.borrow_mut().as_mut() {
             popup.panel.orderOut(None);

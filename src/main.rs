@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+mod clipboard;
 mod gemini;
 mod overlay;
 mod popup;
@@ -30,18 +32,23 @@ pub enum UserEvent {
 }
 
 /// The in-flight click: snapshot + sentence range + sentence text, waiting
-/// for the Gemini reply.
+/// for the Gemini reply. The snapshot is `None` on the copy-and-paste path
+/// (there is no AX snapshot; Replace pastes instead).
 struct Checking {
-    snap: FieldSnapshot,
+    snap: Option<FieldSnapshot>,
     range: Range<usize>,
     sentence: String,
+    pid: u32,
+    via_clipboard: bool,
 }
 
 /// A shown suggestion waiting for Replace.
 struct Pending {
-    snap: FieldSnapshot,
+    snap: Option<FieldSnapshot>,
     range: Range<usize>,
     suggestion: String,
+    pid: u32,
+    via_clipboard: bool,
 }
 
 /// Shows the popup at `anchor` (falling back to `fallback`), remembers the
@@ -62,6 +69,122 @@ fn show_popup(
     }
 }
 
+fn spawn_check_thread(
+    proxy: &EventLoopProxy<UserEvent>,
+    key: String,
+    sentence: String,
+    my_generation: u64,
+    checking: &mut Option<Checking>,
+    anchor: Option<CaretRect>,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    let worker_proxy = proxy.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("writely-gemini".to_string())
+        .spawn(move || {
+            // The key lives only in this thread's request; it is never
+            // logged or put in an error.
+            let result = gemini::suggest(&key, &sentence);
+            if let Err(error) = worker_proxy.send_event(UserEvent::Suggestion {
+                generation: my_generation,
+                result,
+            }) {
+                eprintln!("Writely: could not deliver the suggestion: {error}");
+            }
+        })
+    {
+        *checking = None;
+        show_popup(
+            &format!("Could not check the sentence: {error}"),
+            true,
+            false,
+            anchor,
+            None,
+            last_anchor,
+        );
+    }
+}
+
+/// Copy-and-paste flow (macOS): copies the frontmost app's selection via ⌘C
+/// and starts a check on it. Never runs for a secure field (the caller
+/// checks that first).
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn handle_icon_clipboard(
+    proxy: &EventLoopProxy<UserEvent>,
+    pid: u32,
+    anchor: Option<CaretRect>,
+    generation: &mut u64,
+    checking: &mut Option<Checking>,
+    pending: &mut Option<Pending>,
+    last_anchor: &mut Option<CaretRect>,
+    key: String,
+) {
+    let copied = match clipboard::copy_selected_text(pid) {
+        Ok(copied) => copied,
+        Err(error) => {
+            show_popup(&error, true, false, anchor, None, last_anchor);
+            return;
+        }
+    };
+    let text = match copied {
+        clipboard::CopyResult::Text(text) => text,
+        clipboard::CopyResult::NothingNew => {
+            show_popup(
+                "Select the text you want to check, then click W.",
+                false,
+                false,
+                anchor,
+                None,
+                last_anchor,
+            );
+            return;
+        }
+    };
+    if text.trim().is_empty() {
+        show_popup(
+            "Select the text you want to check, then click W.",
+            false,
+            false,
+            anchor,
+            None,
+            last_anchor,
+        );
+        return;
+    }
+    if text.chars().count() > text_access::MAX_SELECTION_CHARS {
+        show_popup(
+            text_access::SELECTION_TOO_LONG_MESSAGE,
+            false,
+            false,
+            anchor,
+            None,
+            last_anchor,
+        );
+        return;
+    }
+    let my_generation = *generation;
+    let end = text.chars().count();
+    show_popup("Checking…", false, false, anchor, None, last_anchor);
+    *checking = Some(Checking {
+        snap: None,
+        range: 0..end,
+        sentence: text.clone(),
+        pid,
+        via_clipboard: true,
+    });
+    *pending = None;
+    spawn_check_thread(
+        proxy,
+        key,
+        text,
+        my_generation,
+        checking,
+        anchor,
+        last_anchor,
+    );
+}
+
 fn handle_icon_clicked(
     proxy: &EventLoopProxy<UserEvent>,
     generation: &mut u64,
@@ -74,12 +197,12 @@ fn handle_icon_clicked(
     let my_generation = *generation;
     *pending = None;
     *checking = None;
-    let live_anchor = match text_access::caret_info() {
-        Ok(Some(info)) => Some(info.caret_rect),
-        Ok(None) => None,
+    let (live_anchor, live_pid) = match text_access::caret_info() {
+        Ok(Some(info)) => (Some(info.caret_rect), Some(info.pid)),
+        Ok(None) => (None, None),
         Err(error) => {
             eprintln!("Writely: {error}");
-            None
+            (None, None)
         }
     };
     let key = match settings::load_api_key() {
@@ -107,6 +230,24 @@ fn handle_icon_clicked(
             return;
         }
     }) else {
+        // No AX text for the focused element (e.g. Warp): on macOS fall back
+        // to copy-and-paste, but never for a secure field.
+        #[cfg(target_os = "macos")]
+        if !text_access::macos_helpers::focused_is_secure() {
+            if let Some(pid) = live_pid {
+                handle_icon_clipboard(
+                    proxy,
+                    pid,
+                    live_anchor,
+                    generation,
+                    checking,
+                    pending,
+                    last_anchor,
+                    key,
+                );
+                return;
+            }
+        }
         show_popup(
             "Writely can't read this text field.",
             false,
@@ -174,6 +315,22 @@ fn handle_icon_clicked(
                 return;
             }
             text_access::NoCaretDecision::TooLong => {
+                // The whole field doesn't fit: on macOS try the clipboard
+                // (which re-applies the limit to the copied text).
+                #[cfg(target_os = "macos")]
+                if let Some(pid) = live_pid.or(Some(snap.pid)) {
+                    handle_icon_clipboard(
+                        proxy,
+                        pid,
+                        anchor,
+                        generation,
+                        checking,
+                        pending,
+                        last_anchor,
+                        key,
+                    );
+                    return;
+                }
                 show_popup(
                     text_access::SELECTION_TOO_LONG_MESSAGE,
                     false,
@@ -221,36 +378,23 @@ fn handle_icon_clicked(
         return;
     }
     show_popup("Checking…", false, false, anchor, None, last_anchor);
+    let pid = snap.pid;
     *checking = Some(Checking {
-        snap,
+        snap: Some(snap),
         range,
         sentence: sentence.clone(),
+        pid,
+        via_clipboard: false,
     });
-    let worker_proxy = proxy.clone();
-    if let Err(error) = std::thread::Builder::new()
-        .name("writely-gemini".to_string())
-        .spawn(move || {
-            // The key lives only in this thread's request; it is never
-            // logged or put in an error.
-            let result = gemini::suggest(&key, &sentence);
-            if let Err(error) = worker_proxy.send_event(UserEvent::Suggestion {
-                generation: my_generation,
-                result,
-            }) {
-                eprintln!("Writely: could not deliver the suggestion: {error}");
-            }
-        })
-    {
-        *checking = None;
-        show_popup(
-            &format!("Could not check the sentence: {error}"),
-            true,
-            false,
-            anchor,
-            None,
-            last_anchor,
-        );
-    }
+    spawn_check_thread(
+        proxy,
+        key,
+        sentence,
+        my_generation,
+        checking,
+        anchor,
+        last_anchor,
+    );
 }
 
 fn handle_suggestion(
@@ -282,7 +426,7 @@ fn handle_suggestion(
                         false,
                         false,
                         *last_anchor,
-                        Some(active.snap.caret_rect),
+                        active.snap.as_ref().map(|snap| snap.caret_rect),
                         last_anchor,
                     );
                 }
@@ -292,7 +436,7 @@ fn handle_suggestion(
                         false,
                         false,
                         *last_anchor,
-                        Some(active.snap.caret_rect),
+                        active.snap.as_ref().map(|snap| snap.caret_rect),
                         last_anchor,
                     );
                 }
@@ -302,13 +446,15 @@ fn handle_suggestion(
                         false,
                         true,
                         *last_anchor,
-                        Some(active.snap.caret_rect),
+                        active.snap.as_ref().map(|snap| snap.caret_rect),
                         last_anchor,
                     );
                     *pending = Some(Pending {
                         snap: active.snap,
                         range: active.range,
                         suggestion,
+                        pid: active.pid,
+                        via_clipboard: active.via_clipboard,
                     });
                 }
             }
@@ -320,7 +466,24 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
     let Some(active) = pending.take() else {
         return;
     };
-    match text_access::replace_range(&active.snap, active.range, &active.suggestion) {
+    // The copy-and-paste path pastes the suggestion over the selection.
+    #[cfg(target_os = "macos")]
+    if active.via_clipboard {
+        match clipboard::paste_suggestion(active.pid, &active.suggestion) {
+            Ok(()) => {
+                popup::hide();
+            }
+            Err(error) => {
+                show_popup(&error, true, false, *last_anchor, None, last_anchor);
+            }
+        }
+        return;
+    }
+    let Some(snap) = active.snap else {
+        eprintln!("Writely: no text to replace.");
+        return;
+    };
+    match text_access::replace_range(&snap, active.range, &active.suggestion) {
         Ok(()) => {
             popup::hide();
         }
@@ -330,7 +493,7 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
                 true,
                 false,
                 *last_anchor,
-                Some(active.snap.caret_rect),
+                Some(snap.caret_rect),
                 last_anchor,
             );
         }

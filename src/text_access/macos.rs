@@ -176,14 +176,77 @@ fn box_anchor_for(element: &AXUIElement, pid: u32) -> Option<CaretRect> {
     Some(box_anchor_rect(&frame))
 }
 
-/// The caret rectangle, falling back to the text-box anchor when there is no
-/// valid caret position. Returns `None` only when neither exists (the caller
-/// then logs the no-caret message and hides the icon).
+/// Pids already told the icon is at the app window, so the message below
+/// logs once per pid instead of on every keystroke.
+static WINDOW_ANCHOR_LOGGED: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn log_window_anchor_once(pid: u32, app: &str) {
+    let mut logged = WINDOW_ANCHOR_LOGGED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if logged.insert(pid) {
+        eprintln!(
+            "Writely: {app}: caret position unavailable; showing the icon at the app window."
+        );
+    }
+}
+
+/// Last-resort icon anchor for apps whose element has no usable frame: the
+/// top-right corner of the focused window's frame, or `None` when that is
+/// missing or absurd too.
+fn window_anchor_for(element: &AXUIElement, pid: u32) -> Option<CaretRect> {
+    let window_value = copy_attr(element, "AXWindow").ok()?;
+    let ptr = CFRetained::as_ptr(&window_value).cast::<AXUIElement>();
+    // SAFETY: AXWindow yields an AXUIElement valid while window_value is alive.
+    let window: &AXUIElement = unsafe { ptr.as_ref() };
+    let frame = element_frame(window).ok()?;
+    let usable = match max_screen_size() {
+        Some(max) => frame_usable(&frame, max),
+        None => frame.size.width > 0.0 && frame.size.height > 0.0,
+    };
+    if !usable {
+        return None;
+    }
+    let name = app_name(pid);
+    log_window_anchor_once(pid, &name);
+    Some(box_anchor_rect(&frame))
+}
+
+/// The caret rectangle, falling back to the text-box anchor and then the app
+/// window anchor when there is no valid caret position. Returns `None` only
+/// when none exists (the caller then logs the no-caret message and hides the
+/// icon).
 fn caret_or_box_anchor(element: &AXUIElement, pid: u32, caret_utf16: usize) -> Option<CaretRect> {
     if let Some(rect) = caret_rect(element, caret_utf16) {
         return Some(rect);
     }
-    box_anchor_for(element, pid)
+    if let Some(anchor) = box_anchor_for(element, pid) {
+        return Some(anchor);
+    }
+    window_anchor_for(element, pid)
+}
+
+/// Whether the currently focused element is a secure (password) field.
+/// Unknown or unreadable focus counts as secure: the copy-and-paste fallback
+/// must never run for a password field.
+pub(crate) fn focused_is_secure() -> bool {
+    // SAFETY: creating the system-wide element is a plain FFI call with no arguments.
+    let system = unsafe { AXUIElement::new_system_wide() };
+    set_messaging_timeout(&system);
+    let focused = match copy_attr(&system, "AXFocusedUIElement") {
+        Ok(value) => value,
+        // Unknown focus: assume secure so the fallback never runs.
+        Err(_) => return true,
+    };
+    let ptr = CFRetained::as_ptr(&focused).cast::<AXUIElement>();
+    // SAFETY: AXFocusedUIElement yields an AXUIElement valid while focused is alive.
+    let element: &AXUIElement = unsafe { ptr.as_ref() };
+    match copy_string(element, "AXSubrole") {
+        Ok(Some(subrole)) => subrole == "AXSecureTextField",
+        // Unreadable subrole: assume secure so the fallback never runs.
+        _ => true,
+    }
 }
 
 /// Whether the two verification reads show the `AXSelectedText` write was
@@ -626,7 +689,9 @@ fn snapshot_without_caret(
     if utf16_len(&text) > WHOLE_READ_LIMIT_UTF16 {
         return Err("This text field is too large for Writely.".to_string());
     }
-    let Some(caret_rect) = box_anchor_for(&element, pid) else {
+    let Some(caret_rect) =
+        box_anchor_for(&element, pid).or_else(|| window_anchor_for(&element, pid))
+    else {
         log_no_caret_once(pid);
         return Ok(None);
     };
@@ -708,9 +773,9 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
             // No caret offset (e.g. Firefox): the icon can still anchor to
             // the text box when the element has a usable frame.
             Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
-                return Ok(
-                    box_anchor_for(&element, pid).map(|caret_rect| CaretInfo { pid, caret_rect })
-                );
+                return Ok(box_anchor_for(&element, pid)
+                    .or_else(|| window_anchor_for(&element, pid))
+                    .map(|caret_rect| CaretInfo { pid, caret_rect }));
             }
             Err(error) => return Err(read_error(error)),
         };
@@ -773,12 +838,12 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
         // No caret offset (e.g. Firefox): the icon can still anchor to the
         // text box when the element has a usable frame.
         Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
-            return Ok(
-                box_anchor_for(&element, pid as u32).map(|caret_rect| CaretInfo {
+            return Ok(box_anchor_for(&element, pid as u32)
+                .or_else(|| window_anchor_for(&element, pid as u32))
+                .map(|caret_rect| CaretInfo {
                     pid: pid as u32,
                     caret_rect,
-                }),
-            );
+                }));
         }
         Err(error) => return Err(read_error(error)),
     };
