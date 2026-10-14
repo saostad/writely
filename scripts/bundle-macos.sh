@@ -82,11 +82,21 @@ plutil -lint "$APP/Contents/Info.plist" || {
   exit 1
 }
 
-echo "bundle-macos: ad-hoc signing the bundle..."
-codesign --force --sign - --identifier dev.writely.Writely "$APP" || {
-  echo "bundle-macos: codesign failed for $APP (exit $?)" >&2
-  exit 1
-}
+echo "bundle-macos: signing the bundle..."
+if security find-identity -p codesigning 2>/dev/null | grep -q "Writely Local"; then
+  echo "bundle-macos: signing with the 'Writely Local' certificate..."
+  codesign --force --sign "Writely Local" --identifier dev.writely.Writely "$APP" || {
+    echo "bundle-macos: codesign failed for $APP (exit $?)" >&2
+    exit 1
+  }
+else
+  echo "bundle-macos: ad-hoc signing the bundle..."
+  codesign --force --sign - --identifier dev.writely.Writely "$APP" || {
+    echo "bundle-macos: codesign failed for $APP (exit $?)" >&2
+    exit 1
+  }
+  echo "WARNING: macOS will forget the Accessibility permission after every rebuild; run scripts/create-signing-cert-macos.sh once to fix this."
+fi
 
 echo "bundle-macos: verifying the signature..."
 codesign --verify --strict "$APP" || {
@@ -99,4 +109,4 @@ echo
 echo "Next steps:"
 echo "1. Run: open target/release/Writely.app (or drag it to Applications first, then open it from there)."
 echo "2. Turn on Writely in System Settings > Privacy & Security > Accessibility."
-echo "3. Quit and reopen Writely."
+echo "3. Writely starts working by itself once the switch is on (no restart needed)."
