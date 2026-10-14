@@ -2,6 +2,7 @@
 
 mod autostart;
 mod check_text;
+mod check_window;
 #[cfg(target_os = "macos")]
 mod clipboard;
 mod config;
@@ -44,6 +45,10 @@ pub enum UserEvent {
         from_hotkey: bool,
     },
     Suggestion {
+        generation: u64,
+        result: Result<String, String>,
+    },
+    TextCheckResult {
         generation: u64,
         result: Result<String, String>,
     },
@@ -789,6 +794,7 @@ fn main() {
     ime_bridge::start(watcher_proxy.clone());
     overlay::init(watcher_proxy.clone());
     popup::init(watcher_proxy.clone());
+    check_window::init(watcher_proxy.clone());
 
     let mut tray_icon: Option<TrayIcon> = None;
     #[cfg(target_os = "macos")]
@@ -1027,6 +1033,12 @@ fn main() {
                     &mut pending,
                     &mut last_anchor,
                 );
+            }
+            Event::UserEvent(UserEvent::TextCheckResult {
+                generation: event_generation,
+                result,
+            }) => {
+                check_window::handle_result(event_generation, result);
             }
             _ => {}
         }
