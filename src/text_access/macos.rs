@@ -68,6 +68,59 @@ fn element_frame(element: &AXUIElement) -> Result<CGRect, AXError> {
     let value = copy_ax_value(element, "AXFrame")?;
     ax_rect(&value).ok_or(AXError::Failure)
 }
+
+/// Picks the input area for caret validation: the scroll-area parent's frame
+/// when the parent role is `AXScrollArea`, else the element's own frame.
+/// Pure so it can be unit-tested.
+pub(crate) fn choose_input_area(
+    element_frame: CGRect,
+    parent: Option<(&str, CGRect)>,
+) -> CGRect {
+    match parent {
+        Some(("AXScrollArea", parent_frame)) => parent_frame,
+        _ => element_frame,
+    }
+}
+
+/// The input-area frame for `element`: its scroll-area parent's frame when
+/// there is one, else its own frame. `None` when no frame is readable.
+fn input_area_frame(element: &AXUIElement) -> Option<CGRect> {
+    let own = element_frame(element).ok()?;
+    let parent_value = copy_attr(element, "AXParent").ok()?;
+    let ptr = CFRetained::as_ptr(&parent_value).cast::<AXUIElement>();
+    // SAFETY: AXParent yields an AXUIElement valid while parent_value is alive.
+    let parent: &AXUIElement = unsafe { ptr.as_ref() };
+    let role = copy_string(parent, "AXRole").ok().flatten();
+    let parent_frame = element_frame(parent).ok();
+    match (role.as_deref(), parent_frame) {
+        (Some(role), Some(frame)) => Some(choose_input_area(own, Some((role, frame)))),
+        _ => Some(own),
+    }
+}
+
+/// The caret rectangle via text markers (`AXSelectedTextMarkerRange` →
+/// `AXBoundsForTextMarkerRange`), which works for Safari/Chrome/Firefox/
+/// Electron web content. The marker range is an opaque `CFType` passed
+/// straight back as the parameter.
+fn marker_bounds(element: &AXUIElement) -> Result<CGRect, AXError> {
+    let marker = copy_attr(element, "AXSelectedTextMarkerRange")?;
+    let marker_type: &CFType = &marker;
+    let attr = CFString::from_str("AXBoundsForTextMarkerRange");
+    let mut raw: *const CFType = std::ptr::null();
+    let out = NonNull::from(&mut raw);
+    // SAFETY: element and attr are valid and out points at a live local slot.
+    let error = unsafe { element.copy_parameterized_attribute_value(&attr, marker_type, out) };
+    if error != AXError::Success {
+        return Err(error);
+    }
+    let Some(ptr) = NonNull::new(raw.cast_mut()) else {
+        return Err(AXError::Failure);
+    };
+    // SAFETY: a successful copy returns a +1-retained CF object owned by the caller.
+    let value = unsafe { CFRetained::from_raw(ptr) };
+    let ax_value = value.downcast::<AXValue>().map_err(|_| AXError::Failure)?;
+    ax_rect(&ax_value).ok_or(AXError::Failure)
+}
 /// Whether setting `AXSelectedText` was silently ignored: the verification
 /// read still shows the snapshot text instead of the expected text.
 pub(crate) fn selected_write_ignored(actual: &str, snapshot_text: &str, expected: &str) -> bool {
@@ -144,8 +197,9 @@ fn max_screen_size() -> Option<(f64, f64)> {
 }
 
 /// The text-box anchor for `element` when there is no valid caret rect:
-/// the top-right corner of its `AXFrame`, or `None` when the element isn't
-/// a text element, is secure, or has no usable frame.
+/// the top-right corner of its input area (the scroll-area parent's frame
+/// when there is one, else its own `AXFrame`), or `None` when the element
+/// isn't a text element, is secure, or has no usable frame.
 fn box_anchor_for(element: &AXUIElement, pid: u32) -> Option<CaretRect> {
     match copy_string(element, "AXSubrole") {
         Ok(Some(subrole)) if subrole == "AXSecureTextField" => return None,
@@ -163,7 +217,7 @@ fn box_anchor_for(element: &AXUIElement, pid: u32) -> Option<CaretRect> {
     if !is_text {
         return None;
     }
-    let frame = element_frame(element).ok()?;
+    let frame = input_area_frame(element)?;
     let usable = match max_screen_size() {
         Some(max) => frame_usable(&frame, max),
         None => frame.size.width > 0.0 && frame.size.height > 0.0,
@@ -910,15 +964,33 @@ pub(crate) fn pick_valid_caret_rect(
     None
 }
 
-/// The caret screen rectangle, or `None` when neither bounds lookup yields a
-/// real caret position. If the zero-length rect at the caret fails
-/// `caret_rect_valid`, the `(caret-1, 1)` rect's right edge is tried and
-/// validated the same way; only if both fail is there no position. A lookup
-/// that yields a rect outside the focused element's frame (or with zero
-/// height) is bogus and ignored; when the frame itself can't be read, today's
-/// behaviour is kept. Without a real position the icon stays hidden.
+/// The caret screen rectangle, in this order (Input Source Pro):
+/// 1. text markers (`AXSelectedTextMarkerRange` → `AXBoundsForTextMarkerRange`,
+///    works for Safari/Chrome/Firefox/Electron web content);
+/// 2. `AXBoundsForRange` (zero length, then the previous-char fallback);
+/// 3. validated against the input area (the scroll-area parent's frame when
+///    there is one, else the element's frame);
+/// 4. otherwise `None` (the caller falls back to the container anchor).
+///
+/// A rect outside the input area (or with zero height) is bogus and ignored;
+/// when no input-area frame is readable, today's behaviour is kept.
 fn caret_rect(element: &AXUIElement, caret_utf16: usize) -> Option<CaretRect> {
-    let frame = element_frame(element).ok();
+    let frame = input_area_frame(element);
+    if let Ok(marker_rect) = marker_bounds(element) {
+        let valid = match frame {
+            Some(frame) => caret_rect_valid(&marker_rect, &frame),
+            None => marker_rect.size.height != 0.0,
+        };
+        if valid {
+            return Some(CaretRect {
+                x: marker_rect.origin.x,
+                y: marker_rect.origin.y,
+                width: marker_rect.size.width,
+                height: marker_rect.size.height,
+                physical: false,
+            });
+        }
+    }
     let zero = bounds_for_range(element, caret_utf16, 0).ok();
     let prev_raw = if caret_utf16 > 0 {
         bounds_for_range(element, caret_utf16 - 1, 1).ok()
@@ -1169,8 +1241,8 @@ pub(crate) fn read_at(
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_rect_valid, pick_valid_caret_rect, read_error, selected_write_ignored,
-        selected_write_ignored_reread, timeout_error,
+        caret_rect_valid, choose_input_area, pick_valid_caret_rect, read_error,
+        selected_write_ignored, selected_write_ignored_reread, timeout_error,
     };
     use objc2_application_services::AXError;
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -1378,5 +1450,44 @@ mod tests {
         assert!(!selected_write_ignored_reread(
             expected, snapshot, snapshot, expected
         ));
+    }
+
+    #[test]
+    fn input_area_prefers_the_scroll_area_parent() {
+        let element = CGRect {
+            origin: CGPoint { x: 200.0, y: 200.0 },
+            size: CGSize {
+                width: 300.0,
+                height: 100.0,
+            },
+        };
+        let parent = CGRect {
+            origin: CGPoint { x: 100.0, y: 100.0 },
+            size: CGSize {
+                width: 500.0,
+                height: 400.0,
+            },
+        };
+        // A scroll-area parent wins over the element frame.
+        let picked = choose_input_area(element, Some(("AXScrollArea", parent)));
+        assert_eq!(picked.origin.x, 100.0);
+        assert_eq!(picked.size.width, 500.0);
+        // Any other parent role keeps the element frame.
+        let kept = choose_input_area(element, Some(("AXWindow", parent)));
+        assert_eq!(kept.origin.x, 200.0);
+        // No parent keeps the element frame.
+        let none = choose_input_area(element, None);
+        assert_eq!(none.origin.x, 200.0);
+        // Validation runs against the input area: a marker inside the
+        // scroll area is valid even when outside the element frame.
+        let marker = CGRect {
+            origin: CGPoint { x: 150.0, y: 150.0 },
+            size: CGSize {
+                width: 1.0,
+                height: 14.0,
+            },
+        };
+        assert!(!caret_rect_valid(&marker, &element));
+        assert!(caret_rect_valid(&marker, &parent));
     }
 }
