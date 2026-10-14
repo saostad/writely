@@ -223,25 +223,22 @@ impl ImeBridge {
     }
 }
 
-fn emit<B>(signal: &str, destination: &str, body: &B)
+fn emit<B>(signal: &str, destination: &str, body: &B) -> Result<(), String>
 where
     B: serde::Serialize + zbus::zvariant::DynamicType,
 {
     let Some(connection) = CONNECTION.get() else {
-        eprintln!(
-            "Writely: could not emit the {signal} signal: the input method bridge is not running."
-        );
-        return;
+        return Err(format!(
+            "could not emit the {signal} signal: the input method bridge is not running."
+        ));
     };
-    if let Err(error) =
-        connection.emit_signal(Some(destination), OBJECT_PATH, INTERFACE_NAME, signal, body)
-    {
-        eprintln!("Writely: could not emit the {signal} signal: {error}");
-    }
+    connection
+        .emit_signal(Some(destination), OBJECT_PATH, INTERFACE_NAME, signal, body)
+        .map_err(|error| format!("could not emit the {signal} signal: {error}"))
 }
 
-pub fn emit_show_icon(destination: &str, context: &str) {
-    emit("ShowIcon", destination, &(context,));
+pub fn emit_show_icon(destination: &str, context: &str) -> Result<(), String> {
+    emit("ShowIcon", destination, &(context,))
 }
 
 pub fn emit_show_message(
@@ -250,16 +247,16 @@ pub fn emit_show_message(
     text: &str,
     is_error: bool,
     can_apply: bool,
-) {
+) -> Result<(), String> {
     emit(
         "ShowMessage",
         destination,
         &(context, text, is_error, can_apply),
-    );
+    )
 }
 
-pub fn emit_hide(destination: &str, context: &str) {
-    emit("Hide", destination, &(context,));
+pub fn emit_hide(destination: &str, context: &str) -> Result<(), String> {
+    emit("Hide", destination, &(context,))
 }
 
 pub fn emit_replace(
@@ -269,12 +266,12 @@ pub fn emit_replace(
     start: u32,
     end: u32,
     text: &str,
-) {
+) -> Result<(), String> {
     emit(
         "Replace",
         destination,
         &(context, request, start, end, text),
-    );
+    )
 }
 
 fn shared() -> Option<Arc<Shared>> {
@@ -365,7 +362,12 @@ pub(crate) fn replace_and_wait(
     // Mark the request pending before emitting, so a fast answer can't be
     // missed between the emit and the wait.
     lock(&shared.replace_wait).begin(sender, context, request);
-    emit_replace(sender, context, request, start, end, text);
+    if let Err(error) = emit_replace(sender, context, request, start, end, text) {
+        lock(&shared.replace_wait).clear();
+        return Err(format!(
+            "Could not send the replacement to the input method: {error}"
+        ));
+    }
     wait_for_replace(
         &shared.replace_wait,
         &shared.replace_cv,

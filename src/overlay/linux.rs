@@ -79,7 +79,9 @@ pub fn show_at(rect: &CaretRect) {
             hide();
             return;
         };
-        crate::ime_bridge::emit_show_icon(&sender, &context);
+        if let Err(error) = crate::ime_bridge::emit_show_icon(&sender, &context) {
+            eprintln!("Writely: {error}");
+        }
         SHOWN_ON.with(|shown| *shown.borrow_mut() = Some((sender, context)));
         return;
     }
@@ -112,7 +114,9 @@ pub fn hide() {
     if crate::text_access::uses_ime_bridge() {
         SHOWN_ON.with(|shown| {
             if let Some((sender, context)) = shown.borrow_mut().take() {
-                crate::ime_bridge::emit_hide(&sender, &context);
+                if let Err(error) = crate::ime_bridge::emit_hide(&sender, &context) {
+                    eprintln!("Writely: {error}");
+                }
             }
         });
         return;

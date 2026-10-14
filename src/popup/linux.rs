@@ -109,11 +109,18 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         // `show_suggestion` reaches here via `popup::show_message`, so it
         // emits ShowMessage(suggestion, false, true).
         let Some((sender, context, _)) = crate::ime_bridge::focused_snapshot() else {
+            eprintln!(
+                "Writely: could not show the message in the input method panel: no text field has focus. Message: {text}"
+            );
             hide();
             return;
         };
         let _ = caret;
-        crate::ime_bridge::emit_show_message(&sender, &context, text, is_error, show_button);
+        if let Err(error) =
+            crate::ime_bridge::emit_show_message(&sender, &context, text, is_error, show_button)
+        {
+            eprintln!("Writely: {error}");
+        }
         SHOWN_ON.with(|shown| *shown.borrow_mut() = Some((sender, context)));
         return;
     }
@@ -150,7 +157,9 @@ pub fn hide() {
     if crate::text_access::uses_ime_bridge() {
         SHOWN_ON.with(|shown| {
             if let Some((sender, context)) = shown.borrow_mut().take() {
-                crate::ime_bridge::emit_hide(&sender, &context);
+                if let Err(error) = crate::ime_bridge::emit_hide(&sender, &context) {
+                    eprintln!("Writely: {error}");
+                }
             }
         });
         return;

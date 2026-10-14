@@ -88,14 +88,17 @@ human-readable `error` when it didn't.
 Signals are **unicast**: each one is sent with the D-Bus destination set to
 the unique name of the bridge that owns the context, never broadcast.
 
-- `ShowIcon(context: s)` — show the "W" in the input panel.
+- `ShowIcon(context: s)` — show the "W" in the input panel. May arrive on
+  every caret change; bridges must treat it as idempotent.
 - `ShowMessage(context: s, text: s, is_error: b, can_apply: b)` — show text;
   `can_apply` true means an Apply action is available.
-- `Hide(context: s)` — hide the panel.
+- `Hide(context: s)` — hide everything Writely shows for this context
+  (the icon and any message).
 - `Replace(context: s, request: u, start: u, end: u, text: s)` — replace
   chars `start..end` of that context's latest surrounding text with `text`.
   `request` increases by 1 per `Replace`, starting at 1; answer with
-  `ReplaceResult`.
+  `ReplaceResult`. After `ReplaceResult(ok=true)` send a fresh
+  `SurroundingText` with the new text.
 
 Watch them with e.g.:
 
