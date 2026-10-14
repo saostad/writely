@@ -1,6 +1,9 @@
 //! Shared logic for the "Check text" window: input validation and mapping a
 //! provider reply to what the window shows. Pure and platform-neutral.
 
+// Used only by the Linux Check text window until the Windows/macOS windows exist.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use crate::{providers, text_access};
 
 /// What the window shows for a provider reply.
