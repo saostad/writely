@@ -64,7 +64,6 @@ struct Inner {
     focused_element: Option<CFRetained<AXUIElement>>,
     /// Cached with `focused_element`, refreshed only when focus changes.
     focused_editable: bool,
-    logged_manual_pids: HashSet<u32>,
     /// Pids where Writely set `AXEnhancedUserInterface` to true after
     /// reading false, so quit can put them back.
     enhanced_pids: HashSet<u32>,
@@ -90,27 +89,43 @@ struct Inner {
 const RETRY_INTERVAL_SECS: f64 = 0.5;
 const RETRY_ATTEMPTS: u8 = 24;
 
-/// Whether the app reports a focused element, for `needs_enhanced_ui`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FocusedPresence {
-    Present,
-    Absent,
-    NoValue,
+/// Whether Writely may turn on accessibility attributes for an app, the
+/// Input Source Pro rule: every app whose bundle id does NOT start with
+/// `com.apple.` is managed. Apple apps (TextEdit, Notes, Safari) already
+/// report what Writely needs and must never be touched (setting
+/// `AXEnhancedUserInterface` there slows window animations). `None`
+/// (unknown bundle) is managed: it can't be told it's an Apple app.
+pub(crate) fn should_manage_accessibility(bundle_id: Option<&str>) -> bool {
+    match bundle_id {
+        Some(id) => !id.starts_with("com.apple."),
+        None => true,
+    }
+}
+
+fn bundle_id_for_pid(pid: u32) -> Option<String> {
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32)
+        .and_then(|app| app.bundleIdentifier())
+        .map(|id| id.to_string())
+}
+
+/// Whether `name` is settable on `app` (one IPC). Used to avoid setting
+/// attributes the app doesn't expose.
+fn is_settable(app: &AXUIElement, name: &str) -> bool {
+    let attr = CFString::from_str(name);
+    let mut flag: u8 = 0;
+    let Some(out) = NonNull::new(&mut flag as *mut u8).map(|ptr| ptr.cast()) else {
+        return false;
+    };
+    // SAFETY: app and attr are valid, and out points at a writable u8 with
+    // the same layout as the Darwin Boolean the call writes.
+    let error = unsafe { app.is_attribute_settable(&attr, out) };
+    error == AXError::Success && flag != 0
 }
 
 /// Whether `now` is still within the suppression window for a pid whose
 /// cursor reporting was enabled at `enabled_at`: the full retry window.
 pub(crate) fn within_grace(now: f64, enabled_at: f64) -> bool {
     now - enabled_at < RETRY_ATTEMPTS as f64 * RETRY_INTERVAL_SECS
-}
-
-/// Whether Writely should set `AXEnhancedUserInterface` on the app: the app
-/// reports no focused element and `AXManualAccessibility` did not succeed.
-/// Never set it on apps that already report a focused element (it slows
-/// window animations), so `Present` is always false.
-pub(crate) fn needs_enhanced_ui(manual: AXError, focused: FocusedPresence) -> bool {
-    matches!(focused, FocusedPresence::Absent | FocusedPresence::NoValue)
-        && manual != AXError::Success
 }
 
 thread_local! {
@@ -361,7 +376,6 @@ fn setup_for_pid(pid: u32) {
             app_pid: 0,
             focused_element: None,
             focused_editable: false,
-            logged_manual_pids: HashSet::new(),
             enhanced_pids: HashSet::new(),
             logged_report_pids: HashSet::new(),
             logged_timeout_pids: HashSet::new(),
@@ -388,84 +402,64 @@ fn setup_for_pid(pid: u32) {
         // SAFETY: pid comes from NSWorkspace and identifies a live process.
         let app_element = unsafe { AXUIElement::new_application(pid as i32) };
         macos_helpers::set_messaging_timeout(&app_element);
-        let manual_attr = CFString::from_str("AXManualAccessibility");
-        let manual_value: &CFType = CFBoolean::new(true);
-        // SAFETY: app_element and manual_value are valid CF objects of the expected kinds.
-        let manual_error = unsafe { app_element.set_attribute_value(&manual_attr, manual_value) };
-        // Read the focused element before deciding about cursor reporting:
-        // apps that already report one (TextEdit, Notes) are never touched.
-        let presence = match focused_element_for_app(&app_element) {
-            Ok(Some(_)) => FocusedPresence::Present,
-            Ok(None) => FocusedPresence::Absent,
-            Err(error)
-                if error == AXError::NoValue || error == AXError::AttributeUnsupported =>
-            {
-                if error == AXError::NoValue {
-                    FocusedPresence::NoValue
+        // Input Source Pro rule: on every activation, for every non-Apple
+        // app, set both AXManualAccessibility and AXEnhancedUserInterface to
+        // true — but only when the attribute is settable and not already
+        // true. com.apple.* apps (TextEdit, Notes, Safari) and Writely
+        // itself are never touched.
+        let bundle_id = bundle_id_for_pid(pid);
+        let managed = should_manage_accessibility(bundle_id.as_deref());
+        let mut newly_enabled: Vec<&str> = Vec::new();
+        let mut set_errors: Vec<(String, i32)> = Vec::new();
+        if managed {
+            for attr_name in ["AXManualAccessibility", "AXEnhancedUserInterface"] {
+                if read_bool_attr(&app_element, attr_name) == Some(true) {
+                    continue;
+                }
+                if !is_settable(&app_element, attr_name) {
+                    set_errors.push((attr_name.to_string(), AXError::AttributeUnsupported.0));
+                    continue;
+                }
+                let initial = read_bool_attr(&app_element, attr_name);
+                let set_error = set_bool_attr(&app_element, attr_name, true);
+                // The set call's return is unreliable (Chrome answers
+                // `NotImplemented` yet still applies it), so the readback
+                // alone decides whether cursor reporting is on.
+                let readback = read_bool_attr(&app_element, attr_name);
+                if readback == Some(true) {
+                    if attr_name == "AXEnhancedUserInterface" && initial == Some(false) {
+                        inner.enhanced_pids.insert(pid);
+                    }
+                    newly_enabled.push(attr_name);
                 } else {
-                    FocusedPresence::Absent
+                    set_errors.push((attr_name.to_string(), set_error.0));
                 }
             }
-            Err(_) => FocusedPresence::Present,
-        };
-        let mut newly_enabled = false;
-        if presence == FocusedPresence::Present {
-            if manual_error == AXError::AttributeUnsupported {
-                // Apps that already report focus and do not expose this
-                // attribute (e.g. Electron) need no action.
-            } else if manual_error != AXError::Success && inner.logged_manual_pids.insert(pid) {
-                eprintln!(
-                    "Writely: could not enable manual accessibility for pid {pid}: AXError {}",
-                    manual_error.0
-                );
-            }
-        } else if manual_error == AXError::Success {
             let name = app_display_name(pid, &app_element);
-            if inner.logged_report_pids.insert(pid) {
-                eprintln!(
-                    "Writely: turned on cursor reporting (AXManualAccessibility) for {name}."
-                );
-            }
-            newly_enabled = true;
-        } else if needs_enhanced_ui(manual_error, presence) {
-            let name = app_display_name(pid, &app_element);
-            let initial = read_bool_attr(&app_element, "AXEnhancedUserInterface");
-            let set_error = set_bool_attr(&app_element, "AXEnhancedUserInterface", true);
-            // The set call's return is unreliable (Chrome answers
-            // `NotImplemented` yet still applies it), so the readback alone
-            // decides whether cursor reporting is on.
-            let readback = read_bool_attr(&app_element, "AXEnhancedUserInterface");
-            let confirmed = readback == Some(true);
-            if confirmed {
-                if initial == Some(false) {
-                    inner.enhanced_pids.insert(pid);
-                }
+            if !newly_enabled.is_empty() {
                 if inner.logged_report_pids.insert(pid) {
                     eprintln!(
-                        "Writely: turned on cursor reporting (AXEnhancedUserInterface) for {name}."
+                        "Writely: turned on cursor reporting ({}) for {name}.",
+                        newly_enabled.join(", ")
                     );
                 }
-                newly_enabled = true;
             } else if inner.logged_report_pids.insert(pid) {
-                let readback_str = match readback {
-                    Some(true) => "true",
-                    Some(false) => "false",
-                    None => "unreadable",
-                };
-                eprintln!(
-                    "Writely: could not turn on cursor reporting for {name}: AXManualAccessibility AXError {}, AXEnhancedUserInterface AXError {} (readback {readback_str}).",
-                    manual_error.0,
-                    set_error.0
-                );
+                if set_errors.is_empty() {
+                    eprintln!("Writely: cursor reporting already on for {name}.");
+                } else {
+                    let details = set_errors
+                        .iter()
+                        .map(|(attr, code)| format!("{attr} AXError {code}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    eprintln!(
+                        "Writely: could not turn on cursor reporting for {name}: {details}."
+                    );
+                }
             }
-        } else if inner.logged_report_pids.insert(pid) {
-            let name = app_display_name(pid, &app_element);
-            eprintln!(
-                "Writely: could not turn on cursor reporting for {name}: AXManualAccessibility AXError {}.",
-                manual_error.0
-            );
         }
-        if newly_enabled {
+        let newly_enabled_flag = !newly_enabled.is_empty();
+        if newly_enabled_flag {
             // The retry below can end early once a focused element appears,
             // but the caret position may lag behind it; keep suppressing the
             // "can't find the text cursor" message for the full window.
@@ -519,7 +513,7 @@ fn setup_for_pid(pid: u32) {
         // Chrome builds its accessibility tree asynchronously with no
         // focus-change event, so poll the focused element on the main run
         // loop for up to 12 s after newly enabling cursor reporting.
-        if newly_enabled && inner.retried_pids.insert(pid) {
+        if newly_enabled_flag && inner.retried_pids.insert(pid) {
             start_retry(inner, pid);
         }
         // A re-activation was consumed above; allow a later activation of
@@ -585,7 +579,6 @@ impl WatcherInner {
                     app_pid: 0,
                     focused_element: None,
                     focused_editable: false,
-                    logged_manual_pids: HashSet::new(),
                     enhanced_pids: HashSet::new(),
                     logged_report_pids: HashSet::new(),
                     logged_timeout_pids: HashSet::new(),
@@ -691,46 +684,26 @@ impl Drop for WatcherInner {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_enhanced_ui, FocusedPresence};
-    use objc2_application_services::AXError;
+    use super::should_manage_accessibility;
 
     #[test]
-    fn never_sets_enhanced_ui_when_focus_is_reported() {
-        for manual in [
-            AXError::Success,
-            AXError::Failure,
-            AXError::AttributeUnsupported,
-            AXError::CannotComplete,
-        ] {
-            assert!(
-                !needs_enhanced_ui(manual, FocusedPresence::Present),
-                "manual {manual:?} with a focused element must not set enhanced UI"
-            );
-        }
+    fn apple_apps_are_never_touched() {
+        assert!(!should_manage_accessibility(Some("com.apple.TextEdit")));
+        assert!(!should_manage_accessibility(Some("com.apple.Notes")));
+        assert!(!should_manage_accessibility(Some("com.apple.Safari")));
+        assert!(!should_manage_accessibility(Some("com.apple.dt.Xcode")));
     }
 
     #[test]
-    fn sets_enhanced_ui_only_when_manual_did_not_succeed() {
-        assert!(needs_enhanced_ui(
-            AXError::AttributeUnsupported,
-            FocusedPresence::NoValue
-        ));
-        assert!(needs_enhanced_ui(
-            AXError::AttributeUnsupported,
-            FocusedPresence::Absent
-        ));
-        assert!(needs_enhanced_ui(
-            AXError::Failure,
-            FocusedPresence::NoValue
-        ));
-        assert!(!needs_enhanced_ui(
-            AXError::Success,
-            FocusedPresence::NoValue
-        ));
-        assert!(!needs_enhanced_ui(
-            AXError::Success,
-            FocusedPresence::Absent
-        ));
+    fn non_apple_apps_are_managed() {
+        assert!(should_manage_accessibility(Some(
+            "com.google.Chrome"
+        )));
+        assert!(should_manage_accessibility(Some("com.microsoft.VSCode")));
+        assert!(should_manage_accessibility(Some("org.mozilla.firefox")));
+        assert!(should_manage_accessibility(None));
+        // A bundle id that merely contains the Apple prefix elsewhere is managed.
+        assert!(should_manage_accessibility(Some("com.notapple.app")));
     }
 
     #[test]
