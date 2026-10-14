@@ -139,19 +139,37 @@ async fn focused_field_async() -> Result<Option<FieldSnapshot>, String> {
         }
     };
 
+    // Chromium answers an all-zero box (not an error) for the offset past the
+    // last character, i.e. while typing at the end of a field; treat that like
+    // an error and measure from the previous character instead.
     let (x, y, width, height) = match text_proxy
         .get_character_extents(caret_offset, CoordType::Screen)
         .await
     {
-        Ok(extents) => extents,
-        Err(_) if caret_offset > 0 => {
+        Ok(extents) if extents != (0, 0, 0, 0) => extents,
+        _ if caret_offset > 0 => {
             let (px, py, pwidth, pheight) = text_proxy
                 .get_character_extents(caret_offset - 1, CoordType::Screen)
                 .await
                 .map_err(read_error)?;
             (px + pwidth, py, 0, pheight)
         }
+        Ok(extents) => extents,
         Err(error) => return Err(read_error(error)),
+    };
+    // Some toolkits (Qt Quick) never report character boxes; anchor to the
+    // field's top-right corner instead. Native Wayland apps report no screen
+    // position at all, so this stays all-zero and the icon is not shown.
+    let (x, y, width, height) = if (x, y, width, height) == (0, 0, 0, 0) {
+        match proxies.component().await {
+            Ok(component) => match component.get_extents(CoordType::Screen).await {
+                Ok((fx, fy, fwidth, _)) if fwidth > 0 => (fx + fwidth - 28, fy + 2, 0, 20),
+                _ => (0, 0, 0, 0),
+            },
+            Err(_) => (0, 0, 0, 0),
+        }
+    } else {
+        (x, y, width, height)
     };
     let pid = pid_for(&conn, &element).await;
     if pid != 0 && pid == std::process::id() {
