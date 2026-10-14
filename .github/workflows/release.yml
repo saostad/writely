@@ -82,6 +82,15 @@ jobs:
       - name: Package
         shell: bash
         run: cargo packager --release --formats ${{ matrix.formats }} --target ${{ matrix.target }}
+      - name: Verify macOS bundle signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(dist/*.dmg)
+          if [ "${#dmgs[@]}" -eq 0 ]; then echo "error: no dmg found in dist/ to verify"; ls -la dist; exit 1; fi
+          for dmg in "${dmgs[@]}"; do scripts/verify-macos-dmg.sh "$dmg"; done
       - name: Rename installers
         shell: bash
         env:

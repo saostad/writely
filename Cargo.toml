@@ -128,3 +128,9 @@ icons = [
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"
 info-plist-path = "packaging/Info.plist"
+# Ad-hoc sign the bundle ("-") so it has a valid, sealed signature. Without
+# this the packaged app keeps only the linker's signature on the bare binary,
+# which does not cover Info.plist or resources, so macOS reports the
+# downloaded app as damaged. Ad-hoc signing is free but is not notarization:
+# users get a one-time "Open Anyway" prompt on first launch (see README).
+signing-identity = "-"

@@ -14,9 +14,13 @@ Note: without the signing certificate the build is ad-hoc signed, so macOS may f
 Get the latest installer from the Releases section of the GitHub repo. Every push to
 the `main` branch builds the installers and creates a new release
 (version `<major>.<minor>.<run-number>`), so the list keeps growing. The builds are
-unsigned, so expect a warning on first run:
+not notarized by Apple, so expect a warning on first run:
 
-- macOS (`.dmg`): right-click the app › Open the first time. Accessibility must be
-  re-granted after each update, because ad-hoc builds get a new identity.
+- macOS (`.dmg`): the app is ad-hoc signed (no paid Apple Developer ID), so macOS
+  blocks the first launch. Open it once, then go to System Settings › Privacy &
+  Security, scroll down to the Security section, and click "Open Anyway" for
+  Writely; confirm "Open" in the dialog. Later launches open normally.
+  Accessibility must be re-granted after each update, because ad-hoc builds get
+  a new identity.
 - Windows (`.exe` installer): SmartScreen shows "More info › Run anyway".
 - Linux (`.deb` or `.AppImage`): on X11 the caret icon works in any app; on Wayland, use Check text… in the Writely menu and paste your text there.
