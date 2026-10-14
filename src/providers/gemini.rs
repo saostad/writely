@@ -6,7 +6,7 @@ use crate::providers::{clean_reply, truncate_body};
 
 pub const SYSTEM_INSTRUCTION: &str = "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged. Keep line breaks and paragraph breaks as they are. If the text is not understandable English (random letters or gibberish), reply with exactly UNCLEAR and nothing else.";
 
-pub fn build_request_body(sentence: &str, effort: Effort) -> serde_json::Value {
+pub fn build_request_body(sentence: &str, effort: Effort, instruction: &str) -> serde_json::Value {
     let mut generation_config = serde_json::json!({ "temperature": 0 });
     if effort != Effort::Default {
         generation_config["thinkingConfig"] = serde_json::json!({
@@ -15,7 +15,7 @@ pub fn build_request_body(sentence: &str, effort: Effort) -> serde_json::Value {
     }
     serde_json::json!({
         "systemInstruction": {
-            "parts": [{ "text": SYSTEM_INSTRUCTION }]
+            "parts": [{ "text": instruction }]
         },
         "contents": [
             { "parts": [{ "text": sentence }] }
@@ -104,6 +104,7 @@ pub fn suggest(
     settings: &AppSettings,
     key: Option<&str>,
     sentence: &str,
+    instruction: &str,
 ) -> Result<String, String> {
     let model = settings.current_model();
     if model.is_empty() {
@@ -121,7 +122,7 @@ pub fn suggest(
     let mut response = agent()
         .post(&url)
         .header("x-goog-api-key", api_key)
-        .send_json(build_request_body(sentence, settings.effort))
+        .send_json(build_request_body(sentence, settings.effort, instruction))
         .map_err(|e| format!("Could not reach Gemini: {e}"))?;
 
     let status = response.status().as_u16();
@@ -142,7 +143,7 @@ mod tests {
 
     #[test]
     fn request_body_shape() {
-        let body = build_request_body("She go to school.", Effort::Default);
+        let body = build_request_body("She go to school.", Effort::Default, SYSTEM_INSTRUCTION);
         assert_eq!(
             body["systemInstruction"]["parts"][0]["text"],
             SYSTEM_INSTRUCTION
@@ -153,9 +154,18 @@ mod tests {
     }
 
     #[test]
+    fn request_body_uses_given_instruction() {
+        let body = build_request_body("She go.", Effort::Default, "Be friendly.");
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "Be friendly."
+        );
+    }
+
+    #[test]
     fn request_body_effort_levels() {
         for effort in [Effort::Minimal, Effort::Low, Effort::Medium, Effort::High] {
-            let body = build_request_body("She go.", effort);
+            let body = build_request_body("She go.", effort, SYSTEM_INSTRUCTION);
             assert_eq!(
                 body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
                 effort.as_str(),

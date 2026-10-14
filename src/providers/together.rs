@@ -2,16 +2,20 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::config::{AppSettings, Effort};
-use crate::providers::gemini::SYSTEM_INSTRUCTION;
 use crate::providers::{clean_reply, truncate_body};
 
 const ENDPOINT: &str = "https://api.together.ai/v1/chat/completions";
 
-pub fn build_request_body(model: &str, text: &str, effort: Effort) -> serde_json::Value {
+pub fn build_request_body(
+    model: &str,
+    text: &str,
+    effort: Effort,
+    instruction: &str,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
         "messages": [
-            { "role": "system", "content": SYSTEM_INSTRUCTION },
+            { "role": "system", "content": instruction },
             { "role": "user", "content": text }
         ],
         "temperature": 0
@@ -89,7 +93,12 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
-pub fn suggest(settings: &AppSettings, key: Option<&str>, text: &str) -> Result<String, String> {
+pub fn suggest(
+    settings: &AppSettings,
+    key: Option<&str>,
+    text: &str,
+    instruction: &str,
+) -> Result<String, String> {
     let model = settings.current_model();
     if model.is_empty() {
         return Err(
@@ -106,7 +115,12 @@ pub fn suggest(settings: &AppSettings, key: Option<&str>, text: &str) -> Result<
     let mut response = agent()
         .post(ENDPOINT)
         .header("Authorization", format!("Bearer {api_key}"))
-        .send_json(build_request_body(&model, text, settings.effort))
+        .send_json(build_request_body(
+            &model,
+            text,
+            settings.effort,
+            instruction,
+        ))
         .map_err(|e| format!("Could not reach Together AI: {e}"))?;
 
     let status = response.status().as_u16();
@@ -127,9 +141,10 @@ mod tests {
 
     #[test]
     fn request_body_shape_default() {
-        let body = build_request_body(MODEL, "She go.", Effort::Default);
+        let body = build_request_body(MODEL, "She go.", Effort::Default, "Fix it.");
         assert_eq!(body["model"], MODEL);
         assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "Fix it.");
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "She go.");
         assert_eq!(body["temperature"], 0);
@@ -138,12 +153,18 @@ mod tests {
     }
 
     #[test]
+    fn request_body_uses_given_instruction() {
+        let body = build_request_body(MODEL, "She go.", Effort::Default, "Be formal.");
+        assert_eq!(body["messages"][0]["content"], "Be formal.");
+    }
+
+    #[test]
     fn request_body_effort_levels() {
-        let minimal = build_request_body(MODEL, "She go.", Effort::Minimal);
+        let minimal = build_request_body(MODEL, "She go.", Effort::Minimal, "Fix it.");
         assert_eq!(minimal["reasoning"]["enabled"], false);
         assert!(minimal.get("reasoning_effort").is_none());
         for effort in [Effort::Low, Effort::Medium, Effort::High] {
-            let body = build_request_body(MODEL, "She go.", effort);
+            let body = build_request_body(MODEL, "She go.", effort, "Fix it.");
             assert_eq!(
                 body["reasoning_effort"],
                 effort.as_str(),

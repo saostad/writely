@@ -2,7 +2,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::config::{AppSettings, Effort, DEFAULT_OLLAMA_URL};
-use crate::providers::gemini::SYSTEM_INSTRUCTION;
 use crate::providers::{clean_reply, truncate_body};
 
 pub fn base_url(settings: &AppSettings) -> String {
@@ -15,11 +14,16 @@ pub fn base_url(settings: &AppSettings) -> String {
     base.trim_end_matches('/').to_string()
 }
 
-pub fn build_request_body(model: &str, text: &str, effort: Effort) -> serde_json::Value {
+pub fn build_request_body(
+    model: &str,
+    text: &str,
+    effort: Effort,
+    instruction: &str,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
         "messages": [
-            { "role": "system", "content": SYSTEM_INSTRUCTION },
+            { "role": "system", "content": instruction },
             { "role": "user", "content": text }
         ],
         "stream": false,
@@ -84,7 +88,7 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
-pub fn suggest(settings: &AppSettings, text: &str) -> Result<String, String> {
+pub fn suggest(settings: &AppSettings, text: &str, instruction: &str) -> Result<String, String> {
     let model = settings.current_model();
     if model.is_empty() {
         return Err("No model is set for Ollama. Choose a model first in Settings.".to_string());
@@ -94,7 +98,12 @@ pub fn suggest(settings: &AppSettings, text: &str) -> Result<String, String> {
 
     let mut response = agent()
         .post(&url)
-        .send_json(build_request_body(&model, text, settings.effort))
+        .send_json(build_request_body(
+            &model,
+            text,
+            settings.effort,
+            instruction,
+        ))
         .map_err(|e| format!("Could not reach Ollama at {base} — is Ollama running? ({e})"))?;
 
     let status = response.status().as_u16();
@@ -115,8 +124,9 @@ mod tests {
 
     #[test]
     fn request_body_shape_default() {
-        let body = build_request_body(MODEL, "She go.", Effort::Default);
+        let body = build_request_body(MODEL, "She go.", Effort::Default, "Fix it.");
         assert_eq!(body["model"], MODEL);
+        assert_eq!(body["messages"][0]["content"], "Fix it.");
         assert_eq!(body["messages"][1]["content"], "She go.");
         assert_eq!(body["stream"], false);
         assert_eq!(body["options"]["temperature"], 0);
@@ -124,11 +134,17 @@ mod tests {
     }
 
     #[test]
+    fn request_body_uses_given_instruction() {
+        let body = build_request_body(MODEL, "She go.", Effort::Default, "Make it shorter.");
+        assert_eq!(body["messages"][0]["content"], "Make it shorter.");
+    }
+
+    #[test]
     fn request_body_effort_levels() {
-        let minimal = build_request_body(MODEL, "She go.", Effort::Minimal);
+        let minimal = build_request_body(MODEL, "She go.", Effort::Minimal, "Fix it.");
         assert_eq!(minimal["think"], false);
         for effort in [Effort::Low, Effort::Medium, Effort::High] {
-            let body = build_request_body(MODEL, "She go.", effort);
+            let body = build_request_body(MODEL, "She go.", effort, "Fix it.");
             assert_eq!(body["think"], effort.as_str(), "effort {effort:?}");
         }
     }

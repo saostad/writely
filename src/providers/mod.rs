@@ -9,6 +9,52 @@ pub const UNCLEAR_MARKER: &str = "UNCLEAR";
 pub const UNCLEAR_MESSAGE: &str =
     "Writely couldn't understand this text, so there's no suggestion.";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RewriteStyle {
+    Friendly,
+    Formal,
+    Professional,
+    Shorter,
+    Longer,
+}
+
+impl RewriteStyle {
+    pub const ALL: [RewriteStyle; 5] = [
+        RewriteStyle::Friendly,
+        RewriteStyle::Formal,
+        RewriteStyle::Professional,
+        RewriteStyle::Shorter,
+        RewriteStyle::Longer,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RewriteStyle::Friendly => "Friendly",
+            RewriteStyle::Formal => "Formal",
+            RewriteStyle::Professional => "Professional",
+            RewriteStyle::Shorter => "Shorter",
+            RewriteStyle::Longer => "Longer",
+        }
+    }
+
+    pub fn instruction(self) -> String {
+        let goal = match self {
+            RewriteStyle::Friendly => "to sound warm, friendly and conversational",
+            RewriteStyle::Formal => "to sound formal and polite",
+            RewriteStyle::Professional => {
+                "to sound clear, confident and professional, suitable for work"
+            }
+            RewriteStyle::Shorter => {
+                "to be noticeably shorter and more concise, keeping the key points"
+            }
+            RewriteStyle::Longer => {
+                "to be somewhat longer and more detailed, expanding only on what is already said"
+            }
+        };
+        format!("You rewrite English text. Fix its grammar, spelling and punctuation, and rewrite it {goal}. Keep the original meaning and every fact; never add new facts. Keep line breaks and paragraph breaks as they are. Return only the rewritten text, with no quotes or explanation. If the text is not understandable English (random letters or gibberish), reply with exactly UNCLEAR and nothing else.")
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum SuggestionOutcome {
     Unclear,
@@ -76,15 +122,34 @@ pub(crate) fn truncate_body(body: &str) -> String {
 /// Gemini and Together a missing key or model is an error for the popup.
 pub fn suggest(settings: &AppSettings, key: Option<&str>, text: &str) -> Result<String, String> {
     match settings.provider {
-        Provider::Gemini => gemini::suggest(settings, key, text),
-        Provider::Together => together::suggest(settings, key, text),
-        Provider::Ollama => ollama::suggest(settings, text),
+        Provider::Gemini => gemini::suggest(settings, key, text, gemini::SYSTEM_INSTRUCTION),
+        Provider::Together => together::suggest(settings, key, text, gemini::SYSTEM_INSTRUCTION),
+        Provider::Ollama => ollama::suggest(settings, text, gemini::SYSTEM_INSTRUCTION),
+    }
+}
+
+/// Same dispatch as [`suggest`], but with the given rewrite style's system
+/// instruction instead of the grammar one. Everything else (model, effort,
+/// temperature 0, key header, error parsing) stays the same.
+pub fn rewrite(
+    settings: &AppSettings,
+    key: Option<&str>,
+    text: &str,
+    style: RewriteStyle,
+) -> Result<String, String> {
+    let instruction = style.instruction();
+    match settings.provider {
+        Provider::Gemini => gemini::suggest(settings, key, text, &instruction),
+        Provider::Together => together::suggest(settings, key, text, &instruction),
+        Provider::Ollama => ollama::suggest(settings, text, &instruction),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_suggestion, clean_reply, strip_think_block, SuggestionOutcome};
+    use super::{
+        classify_suggestion, clean_reply, strip_think_block, RewriteStyle, SuggestionOutcome,
+    };
 
     #[test]
     fn classify_suggestion_distinguishes_three_outcomes() {
@@ -143,5 +208,51 @@ mod tests {
             None
         );
         assert_eq!(clean_reply("\"\"").as_deref(), None);
+    }
+
+    #[test]
+    fn rewrite_style_labels_and_order() {
+        assert_eq!(
+            RewriteStyle::ALL.map(RewriteStyle::label),
+            ["Friendly", "Formal", "Professional", "Shorter", "Longer"]
+        );
+    }
+
+    #[test]
+    fn rewrite_instructions_carry_goal_and_unclear() {
+        let goals = [
+            (
+                RewriteStyle::Friendly,
+                "to sound warm, friendly and conversational",
+            ),
+            (RewriteStyle::Formal, "to sound formal and polite"),
+            (
+                RewriteStyle::Professional,
+                "to sound clear, confident and professional, suitable for work",
+            ),
+            (
+                RewriteStyle::Shorter,
+                "to be noticeably shorter and more concise, keeping the key points",
+            ),
+            (
+                RewriteStyle::Longer,
+                "to be somewhat longer and more detailed, expanding only on what is already said",
+            ),
+        ];
+        for (style, goal) in goals {
+            let instruction = style.instruction();
+            assert!(
+                instruction.contains(goal),
+                "instruction for {style:?} misses its goal"
+            );
+            assert!(
+                instruction.contains("UNCLEAR"),
+                "instruction for {style:?} misses UNCLEAR"
+            );
+            assert!(
+                instruction.starts_with("You rewrite English text."),
+                "instruction for {style:?} has the wrong shape"
+            );
+        }
     }
 }
