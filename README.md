@@ -19,4 +19,4 @@ unsigned, so expect a warning on first run:
 - macOS (`.dmg`): right-click the app › Open the first time. Accessibility must be
   re-granted after each update, because ad-hoc builds get a new identity.
 - Windows (`.exe` installer): SmartScreen shows "More info › Run anyway".
-- Linux (`.deb` or `.AppImage`): X11 only for the caret icon; on Wayland use an X11 session.
+- Linux (`.deb` or `.AppImage`): on X11 the caret icon works in any app; on Wayland, use Check text… in the Writely menu and paste your text there.
