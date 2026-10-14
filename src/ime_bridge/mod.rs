@@ -6,6 +6,8 @@
 pub(crate) mod service;
 mod state;
 
-pub(crate) use service::{current_text, focused_snapshot, replace_and_wait};
+pub(crate) use service::{
+    current_text, focused_snapshot, replace_and_wait, replace_selection_and_wait, select_and_wait,
+};
 pub use service::{emit_hide, emit_show_icon, emit_show_message, start};
-pub use state::{BridgeState, ClickAction, FocusedKind, FocusedText, ReplaceWait};
+pub use state::{BridgeState, ClickAction, FocusedKind, ReplaceWait};

@@ -48,8 +48,16 @@ pub(crate) fn uses_ime_bridge() -> bool {
 }
 
 pub(crate) enum PlatformHandle {
-    Atspi { object: ObjectRefOwned },
-    Bridge { sender: String, context: String },
+    Atspi {
+        object: ObjectRefOwned,
+    },
+    Bridge {
+        sender: String,
+        context: String,
+        /// True when the snapshot holds selected text because the app
+        /// doesn't share its text (select fallback).
+        selection: bool,
+    },
 }
 
 fn read_error(error: impl std::fmt::Display) -> String {
@@ -273,6 +281,9 @@ async fn replace_range_async(
 }
 
 pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
+    if uses_ime_bridge() {
+        return caret_info_bridge();
+    }
     match focused_field()? {
         Some(snap) => Ok(Some(CaretInfo {
             pid: snap.pid,
@@ -282,28 +293,75 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
     }
 }
 
+/// Bridge-mode caret: the W shows whenever a context offers text or the
+/// select fallback. Never selects anything: selection happens only on
+/// click, in `focused_field_bridge`.
+fn caret_info_bridge() -> Result<Option<CaretInfo>, String> {
+    match crate::ime_bridge::focused_snapshot() {
+        Some(_) => Ok(Some(CaretInfo {
+            pid: 0,
+            // The bridge panel is placed by the input method, not by Writely.
+            caret_rect: CaretRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+                physical: false,
+            },
+        })),
+        None => Ok(None),
+    }
+}
+
 fn focused_field_bridge() -> Result<Option<FieldSnapshot>, String> {
-    let Some((sender, context, focused)) = crate::ime_bridge::focused_snapshot() else {
+    let Some((sender, context, kind)) = crate::ime_bridge::focused_snapshot() else {
         return Ok(None);
     };
-    Ok(Some(FieldSnapshot {
-        pid: 0,
-        text: focused.text.clone(),
-        caret: focused.caret,
-        caret_known: true,
-        // The bridge panel is placed by the input method, not by Writely.
-        caret_rect: CaretRect {
-            x: 0.0,
-            y: 0.0,
-            width: 0.0,
-            height: 0.0,
-            physical: false,
-        },
-        selection: focused.selection,
-        window_start_utf16: 0,
-        field_len_utf16: super::utf16_len(&focused.text),
-        handle: PlatformHandle::Bridge { sender, context },
-    }))
+    // The bridge panel is placed by the input method, not by Writely.
+    let caret_rect = CaretRect {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+        physical: false,
+    };
+    match kind {
+        crate::ime_bridge::FocusedKind::Text(focused) => Ok(Some(FieldSnapshot {
+            pid: 0,
+            text: focused.text.clone(),
+            caret: focused.caret,
+            caret_known: true,
+            caret_rect,
+            selection: focused.selection,
+            window_start_utf16: 0,
+            field_len_utf16: super::utf16_len(&focused.text),
+            handle: PlatformHandle::Bridge {
+                sender,
+                context,
+                selection: false,
+            },
+        })),
+        crate::ime_bridge::FocusedKind::SelectOnly => {
+            // Errors propagate as Err(..) so the existing popup shows them.
+            let text = crate::ime_bridge::select_and_wait(&sender, &context)?;
+            let len = text.chars().count();
+            Ok(Some(FieldSnapshot {
+                pid: 0,
+                text: text.clone(),
+                caret: len,
+                caret_known: true,
+                caret_rect,
+                selection: if len > 0 { Some(0..len) } else { None },
+                window_start_utf16: 0,
+                field_len_utf16: super::utf16_len(&text),
+                handle: PlatformHandle::Bridge {
+                    sender,
+                    context,
+                    selection: true,
+                },
+            }))
+        }
+    }
 }
 
 fn replace_range_bridge(
@@ -311,8 +369,20 @@ fn replace_range_bridge(
     range: Range<usize>,
     sender: &str,
     context: &str,
+    selection: bool,
     new_text: &str,
 ) -> Result<(), String> {
+    if selection {
+        // The bridge replaces the whole active selection; a partial range
+        // (e.g. after trimming) can't be mapped onto it.
+        let len = snap.text.chars().count();
+        if range != (0..len) {
+            return Err(
+                "Writely can only replace the whole selected text in this app.".to_string(),
+            );
+        }
+        return crate::ime_bridge::replace_selection_and_wait(sender, context, new_text);
+    }
     let Some(current) = crate::ime_bridge::current_text(sender, context) else {
         return Err(
             "The input method closed the text field before the replacement finished.".to_string(),
@@ -342,7 +412,18 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
 }
 
 pub(crate) fn read_text(handle: &PlatformHandle) -> Result<String, String> {
-    if let PlatformHandle::Bridge { sender, context } = handle {
+    if let PlatformHandle::Bridge {
+        sender,
+        context,
+        selection,
+    } = handle
+    {
+        if *selection {
+            return Err(
+                "This app doesn't share its text; Writely works on the selection instead."
+                    .to_string(),
+            );
+        }
         return crate::ime_bridge::current_text(sender, context)
             .ok_or_else(|| "The text field is no longer available.".to_string());
     }
@@ -354,8 +435,13 @@ pub(crate) fn replace_range(
     range: Range<usize>,
     new_text: &str,
 ) -> Result<(), String> {
-    if let PlatformHandle::Bridge { sender, context } = &snap.handle {
-        return replace_range_bridge(snap, range, sender, context, new_text);
+    if let PlatformHandle::Bridge {
+        sender,
+        context,
+        selection,
+    } = &snap.handle
+    {
+        return replace_range_bridge(snap, range, sender, context, *selection, new_text);
     }
     pollster::block_on(replace_range_async(snap, range, new_text))
 }

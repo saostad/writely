@@ -20,7 +20,7 @@ use zbus::DBusError;
 
 use crate::UserEvent;
 
-use super::{BridgeState, ClickAction, FocusedKind, FocusedText, ReplaceWait};
+use super::{BridgeState, ClickAction, FocusedKind, ReplaceWait};
 
 const WELL_KNOWN_NAME: &str = "dev.writely.Writely";
 const OBJECT_PATH: &str = "/dev/writely/ImeBridge";
@@ -321,14 +321,10 @@ pub fn emit_replace(
     )
 }
 
-// Used from item 2 wiring.
-#[allow(dead_code)]
 pub fn emit_select_request(destination: &str, context: &str, request: u32) -> Result<(), String> {
     emit("SelectRequest", destination, &(context, request))
 }
 
-// Used from item 2 wiring.
-#[allow(dead_code)]
 pub fn emit_replace_selection(
     destination: &str,
     context: &str,
@@ -342,15 +338,15 @@ fn shared() -> Option<Arc<Shared>> {
     SHARED.get().cloned()
 }
 
-/// The focused bridge context and its text, for bridge-mode reads.
-/// `None` when nothing is focused, the field is a password, or no
-/// surrounding text arrived yet — or when the bridge isn't serving.
-pub(crate) fn focused_snapshot() -> Option<(String, String, FocusedText)> {
+/// The focused bridge context and what it offers, for bridge-mode reads.
+/// `None` when nothing is focused or usable — or when the bridge isn't
+/// serving.
+pub(crate) fn focused_snapshot() -> Option<(String, String, FocusedKind)> {
     let shared = shared()?;
     let state = lock(&shared.state);
     let (sender, context) = state.focused_key()?;
-    let focused = state.focused_text()?;
-    Some((sender.to_string(), context.to_string(), focused))
+    let kind = state.focused_kind()?;
+    Some((sender.to_string(), context.to_string(), kind))
 }
 
 /// The latest surrounding text for one context, if it exists.
@@ -470,7 +466,6 @@ pub(crate) fn replace_and_wait(
 /// for the matching `Selected`, returning the selected text. Shares the one
 /// in-flight wait with `replace_and_wait`; both run on the event-loop
 /// thread, so they never overlap. Never holds the state lock while waiting.
-#[allow(dead_code)] // Used from item 2 wiring.
 pub(crate) fn select_and_wait(sender: &str, context: &str) -> Result<String, String> {
     let shared = shared().ok_or_else(select_closed_error)?;
     let request = lock(&shared.state).next_request();
@@ -504,7 +499,6 @@ pub(crate) fn select_and_wait(sender: &str, context: &str) -> Result<String, Str
 /// Emits `ReplaceSelection` with the next request id and waits up to
 /// 3 seconds for the matching `ReplaceResult`. Same messages as
 /// `replace_and_wait`.
-#[allow(dead_code)] // Used from item 2 wiring.
 pub(crate) fn replace_selection_and_wait(
     sender: &str,
     context: &str,
