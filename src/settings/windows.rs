@@ -8,10 +8,11 @@ use windows::Win32::UI::Controls::EM_SETCUEBANNER;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowTextLengthW, GetWindowTextW, IsWindow,
-    RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, BS_PUSHBUTTON,
-    CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, ES_PASSWORD, HMENU,
-    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC,
-    WM_DESTROY, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+    RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, BM_GETCHECK,
+    BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING,
+    CB_GETCURSEL, CB_SETCURSEL, ES_PASSWORD, HMENU, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WNDCLASSW, WS_CAPTION,
+    WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{AppSettings, Effort, Provider};
@@ -24,6 +25,7 @@ const ID_PROVIDER: i32 = 1005;
 const ID_MODEL: i32 = 1006;
 const ID_EFFORT: i32 = 1007;
 const ID_URL: i32 = 1008;
+const ID_AUTOSTART: i32 = 1009;
 
 const PROVIDER_NAMES: [&str; 3] = [
     "Google Gemini",
@@ -88,6 +90,7 @@ struct Handles {
     link: HWND,
     url_label: HWND,
     url_help: HWND,
+    autostart_checkbox: HWND,
     status: HWND,
     error: bool,
     settings: AppSettings,
@@ -123,6 +126,23 @@ fn set_combo_selection(combo: HWND, index: usize) {
     // SAFETY: combo is a live COMBOBOX while the window is open.
     unsafe {
         SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(index)), Some(LPARAM(0)));
+    }
+}
+
+fn checkbox_checked(checkbox: HWND) -> bool {
+    // SAFETY: checkbox is a live BUTTON while the window is open.
+    unsafe { SendMessageW(checkbox, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))) }.0 == 1
+}
+
+fn set_checkbox(checkbox: HWND, checked: bool) {
+    // SAFETY: checkbox is a live BUTTON while the window is open.
+    unsafe {
+        SendMessageW(
+            checkbox,
+            BM_SETCHECK,
+            Some(WPARAM(if checked { 1 } else { 0 })),
+            Some(LPARAM(0)),
+        );
     }
 }
 
@@ -252,6 +272,7 @@ fn stash_draft() {
             handles.settings.provider = provider;
             handles.settings.set_model(provider, model.trim());
             handles.settings.effort = effort;
+            handles.settings.launch_at_login = checkbox_checked(handles.autostart_checkbox);
             if !url.trim().is_empty() {
                 handles.settings.ollama_url = url.trim().to_string();
             }
@@ -323,11 +344,20 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                             handles.model_edit,
                             handles.effort_combo,
                             handles.url_edit,
+                            handles.autostart_checkbox,
                             provider_at(combo_selection(handles.provider_combo)),
                         )
                     })
                 });
-                if let Some((edit, model_edit, effort_combo, url_edit, provider)) = snapshot {
+                if let Some((
+                    edit,
+                    model_edit,
+                    effort_combo,
+                    url_edit,
+                    autostart_checkbox,
+                    provider,
+                )) = snapshot
+                {
                     let model = read_edit_text(model_edit);
                     if let Err(error) = crate::config::validate_model_name(&model) {
                         set_status(&error, true);
@@ -335,11 +365,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     }
                     let effort = effort_at(combo_selection(effort_combo));
                     let url = read_edit_text(url_edit);
+                    let launch_at_login = checkbox_checked(autostart_checkbox);
                     STATE.with(|state| {
                         if let Some(handles) = state.borrow_mut().as_mut() {
                             handles.settings.provider = provider;
                             handles.settings.set_model(provider, model.trim());
                             handles.settings.effort = effort;
+                            handles.settings.launch_at_login = launch_at_login;
                             if !url.trim().is_empty() {
                                 handles.settings.ollama_url = url.trim().to_string();
                             }
@@ -359,6 +391,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         }
                         None => return LRESULT(0),
                     }
+                    if let Err(error) = crate::autostart::set_enabled(launch_at_login) {
+                        set_status(&error, true);
+                        return LRESULT(0);
+                    }
+                    super::set_autostart_message(None);
                     let value = read_edit_text(edit);
                     if value.trim().is_empty() {
                         set_status("Saved.", false);
@@ -480,7 +517,7 @@ pub fn show_settings() -> Result<(), String> {
             100,
             100,
             460,
-            560,
+            620,
             None,
             None,
             Some(instance),
@@ -638,12 +675,32 @@ pub fn show_settings() -> Result<(), String> {
         36,
         0,
     )?;
+    let autostart_checkbox = make_child(
+        "BUTTON",
+        "Start Writely at login",
+        WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+        20,
+        394,
+        400,
+        22,
+        ID_AUTOSTART,
+    )?;
+    let _autostart_help = make_child(
+        "STATIC",
+        "Writely starts automatically when you log in.",
+        WINDOW_STYLE(0),
+        20,
+        418,
+        400,
+        16,
+        0,
+    )?;
     let _save = make_child(
         "BUTTON",
         "Save",
         WINDOW_STYLE(BS_PUSHBUTTON as u32),
         20,
-        394,
+        442,
         80,
         26,
         ID_SAVE,
@@ -653,12 +710,12 @@ pub fn show_settings() -> Result<(), String> {
         "Remove key",
         WINDOW_STYLE(BS_PUSHBUTTON as u32),
         110,
-        394,
+        442,
         110,
         26,
         ID_REMOVE,
     )?;
-    let status = make_child("STATIC", "", WINDOW_STYLE(0), 20, 428, 400, 36, 0)?;
+    let status = make_child("STATIC", "", WINDOW_STYLE(0), 20, 476, 400, 36, 0)?;
 
     // Load the draft: a missing file means defaults; an unreadable or invalid
     // file shows its error and starts from defaults.
@@ -684,6 +741,7 @@ pub fn show_settings() -> Result<(), String> {
             link,
             url_label,
             url_help,
+            autostart_checkbox,
             status,
             error: false,
             settings,
@@ -708,8 +766,18 @@ pub fn show_settings() -> Result<(), String> {
     set_combo_selection(effort_combo, effort_index(effort));
     set_edit_text(model_edit, &model);
     set_edit_text(url_edit, &url);
+    let launch_at_login = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|handles| handles.settings.launch_at_login)
+            .unwrap_or(true)
+    });
+    set_checkbox(autostart_checkbox, launch_at_login);
     refresh_provider_rows();
     if let Some(error) = initial_error {
+        set_status(&error, true);
+    } else if let Some(error) = super::autostart_message() {
         set_status(&error, true);
     }
     // SAFETY: window is a live top-level window on this thread.

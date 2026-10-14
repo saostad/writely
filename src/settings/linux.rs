@@ -3,7 +3,8 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk::{
-    Box as GtkBox, Button, ComboBoxText, Entry, Label, LinkButton, Orientation, Window, WindowType,
+    Box as GtkBox, Button, CheckButton, ComboBoxText, Entry, Label, LinkButton, Orientation,
+    Window, WindowType,
 };
 
 use crate::config::{AppSettings, Effort, Provider};
@@ -107,6 +108,7 @@ struct Controls {
     link_box: GtkBox,
     url_label: Label,
     url_help: Label,
+    autostart_check: CheckButton,
     status_label: Label,
     settings: AppSettings,
 }
@@ -174,6 +176,7 @@ fn stash_draft(controls: &Rc<RefCell<Controls>>) {
     borrowed.settings.provider = provider;
     borrowed.settings.set_model(provider, model.trim());
     borrowed.settings.effort = effort;
+    borrowed.settings.launch_at_login = borrowed.autostart_check.is_active();
     if !url.trim().is_empty() {
         borrowed.settings.ollama_url = url.trim().to_string();
     }
@@ -212,7 +215,7 @@ pub fn show_settings() -> Result<(), String> {
 
     let window = Window::new(WindowType::Toplevel);
     window.set_title("Writely Settings");
-    window.set_default_size(420, 560);
+    window.set_default_size(420, 620);
     window.set_resizable(false);
 
     let container = GtkBox::new(Orientation::Vertical, 8);
@@ -312,6 +315,16 @@ pub fn show_settings() -> Result<(), String> {
     url_help.set_line_wrap(true);
     container.pack_start(&url_help, false, false, 0);
 
+    let autostart_check = CheckButton::with_label("Start Writely at login");
+    autostart_check.set_active(settings.launch_at_login);
+    autostart_check.set_halign(gtk::Align::Start);
+    container.pack_start(&autostart_check, false, false, 0);
+
+    let autostart_help = Label::new(Some("Writely starts automatically when you log in."));
+    autostart_help.set_halign(gtk::Align::Start);
+    autostart_help.set_line_wrap(true);
+    container.pack_start(&autostart_help, false, false, 0);
+
     let button_row = GtkBox::new(Orientation::Horizontal, 8);
     let save_button = Button::with_label("Save");
     let remove_button = Button::with_label("Remove key");
@@ -324,6 +337,8 @@ pub fn show_settings() -> Result<(), String> {
     container.pack_start(&status_label, false, false, 0);
     if let Some(error) = &initial_error {
         set_status(&status_label, error, true);
+    } else if let Some(error) = super::autostart_message() {
+        set_status(&status_label, &error, true);
     }
 
     let controls = Rc::new(RefCell::new(Controls {
@@ -337,6 +352,7 @@ pub fn show_settings() -> Result<(), String> {
         link_box: link_box.clone(),
         url_label: url_label.clone(),
         url_help: url_help.clone(),
+        autostart_check: autostart_check.clone(),
         status_label: status_label.clone(),
         settings,
     }));
@@ -380,6 +396,16 @@ pub fn show_settings() -> Result<(), String> {
                 set_status(&borrowed.status_label, &error, true);
                 return;
             }
+            let launch_at_login = {
+                let borrowed = controls_for_save.borrow();
+                borrowed.settings.launch_at_login
+            };
+            if let Err(error) = crate::autostart::set_enabled(launch_at_login) {
+                let borrowed = controls_for_save.borrow();
+                set_status(&borrowed.status_label, &error, true);
+                return;
+            }
+            super::set_autostart_message(None);
             let _ = (effort, url);
             let borrowed = controls_for_save.borrow();
             if key.trim().is_empty() {

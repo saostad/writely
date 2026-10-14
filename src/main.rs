@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 #[cfg(target_os = "macos")]
 mod clipboard;
 mod config;
@@ -799,6 +800,17 @@ fn main() {
 
         match event {
             Event::NewEvents(StartCause::Init) => {
+                // Apply the start-at-login setting (on by default): this
+                // also heals the entry if the app moved since last launch.
+                match config::load_settings() {
+                    Ok(app_settings) => {
+                        if let Err(error) = autostart::sync(app_settings.launch_at_login) {
+                            eprintln!("Writely: {error}");
+                            settings::set_autostart_message(Some(error));
+                        }
+                    }
+                    Err(error) => eprintln!("Writely: {error}"),
+                }
                 let settings_item = MenuItem::with_id("settings", "Settings…", true, None);
                 let quit_item = MenuItem::with_id("quit", "Quit Writely", true, None);
                 settings_id = settings_item.id().clone();

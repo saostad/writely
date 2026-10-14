@@ -124,6 +124,10 @@ fn default_ollama_url() -> String {
     DEFAULT_OLLAMA_URL.to_string()
 }
 
+fn default_launch_at_login() -> bool {
+    true
+}
+
 fn default_models() -> HashMap<String, String> {
     let mut models = HashMap::new();
     models.insert("gemini".to_string(), DEFAULT_GEMINI_MODEL.to_string());
@@ -145,6 +149,10 @@ pub struct AppSettings {
     pub effort: Effort,
     #[serde(default = "default_ollama_url")]
     pub ollama_url: String,
+    /// Start Writely automatically at login (on by default; files written
+    /// before this setting existed also get `true`).
+    #[serde(default = "default_launch_at_login")]
+    pub launch_at_login: bool,
 }
 
 impl Default for AppSettings {
@@ -154,6 +162,7 @@ impl Default for AppSettings {
             models: default_models(),
             effort: Effort::Default,
             ollama_url: DEFAULT_OLLAMA_URL.to_string(),
+            launch_at_login: true,
         }
     }
 }
@@ -232,6 +241,19 @@ mod tests {
         assert_eq!(settings.model_for(Provider::Ollama), "");
         assert_eq!(settings.effort, Effort::Default);
         assert_eq!(settings.ollama_url, DEFAULT_OLLAMA_URL);
+        assert!(settings.launch_at_login);
+    }
+
+    #[test]
+    fn launch_at_login_defaults_on_for_old_files() {
+        // A settings file written before the setting existed has no key.
+        let old =
+            r#"{"provider":"gemini","effort":"default","ollama_url":"http://localhost:11434"}"#;
+        let settings: AppSettings = serde_json::from_str(old).expect("old file should parse");
+        assert!(settings.launch_at_login);
+        let off: AppSettings =
+            serde_json::from_str(r#"{"launch_at_login":false}"#).expect("should parse");
+        assert!(!off.launch_at_login);
     }
 
     #[test]

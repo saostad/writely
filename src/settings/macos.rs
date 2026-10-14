@@ -173,8 +173,9 @@ fn refresh_provider_rows() {
         .setPlaceholderString(Some(&NSString::from_str(crate::config::DEFAULT_OLLAMA_URL)));
 }
 
-/// Reads the draft provider, model, effort and Ollama URL from the controls.
-fn read_draft() -> Option<(Provider, String, Effort, String)> {
+/// Reads the draft provider, model, effort, Ollama URL and start-at-login
+/// checkbox from the controls.
+fn read_draft() -> Option<(Provider, String, Effort, String, bool)> {
     STATE.with(|state| {
         state.borrow().as_ref().map(|window_state| {
             (
@@ -182,6 +183,7 @@ fn read_draft() -> Option<(Provider, String, Effort, String)> {
                 window_state.model_field.stringValue().to_string(),
                 effort_at(window_state.effort_popup.indexOfSelectedItem()),
                 window_state.url_field.stringValue().to_string(),
+                window_state.autostart_checkbox.state() == 1,
             )
         })
     })
@@ -189,12 +191,13 @@ fn read_draft() -> Option<(Provider, String, Effort, String)> {
 
 /// Stores the current control values into the draft settings.
 fn stash_draft() {
-    if let Some((provider, model, effort, url)) = read_draft() {
+    if let Some((provider, model, effort, url, launch_at_login)) = read_draft() {
         STATE.with(|state| {
             if let Some(window_state) = state.borrow_mut().as_mut() {
                 window_state.settings.provider = provider;
                 window_state.settings.set_model(provider, model.trim());
                 window_state.settings.effort = effort;
+                window_state.settings.launch_at_login = launch_at_login;
                 if !url.trim().is_empty() {
                     window_state.settings.ollama_url = url.trim().to_string();
                 }
@@ -222,7 +225,7 @@ define_class!(
             let Some(status) = self.ivars().status.get() else {
                 return;
             };
-            let Some((provider, model, _, _)) = read_draft() else {
+            let Some((provider, model, _, _, launch_at_login)) = read_draft() else {
                 return;
             };
             if let Err(error) = crate::config::validate_model_name(&model) {
@@ -243,6 +246,11 @@ define_class!(
                 }
                 None => return,
             }
+            if let Err(error) = crate::autostart::set_enabled(launch_at_login) {
+                set_status(status, &error, true);
+                return;
+            }
+            super::set_autostart_message(None);
             let value = field.stringValue().to_string();
             if value.trim().is_empty() {
                 set_status(status, "Saved.", false);
@@ -390,6 +398,7 @@ struct WindowState {
     link_button: Retained<NSButton>,
     url_label: Retained<NSTextField>,
     url_help: Retained<NSTextField>,
+    autostart_checkbox: Retained<NSButton>,
     settings: AppSettings,
 }
 
@@ -509,9 +518,9 @@ pub fn show_settings() -> Result<(), String> {
     let delegate = SettingsDelegate::new(mtm);
     let permission_text = super::permission_message();
     let window_height = if permission_text.is_some() {
-        566.0
+        604.0
     } else {
-        498.0
+        536.0
     };
     // SAFETY: the content rect, style mask and backing store are valid and mtm is the main thread.
     let window = unsafe {
@@ -619,6 +628,23 @@ pub fn show_settings() -> Result<(), String> {
     );
     url_help.setFrame(key_help_frame);
 
+    // SAFETY: a checkbox with no target/action is valid; its state is read on Save.
+    let autostart_checkbox = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            ns_string!("Start Writely at login"),
+            None,
+            None,
+            mtm,
+        )
+    };
+    autostart_checkbox.setFrame(row(22.0, 2.0));
+
+    let autostart_help = NSTextField::wrappingLabelWithString(
+        ns_string!("Writely starts automatically when you log in."),
+        mtm,
+    );
+    autostart_help.setFrame(row(16.0, 10.0));
+
     // SAFETY: delegate implements saveClicked: and lives in STATE while the window is open.
     let save_button = unsafe {
         NSButton::buttonWithTitle_target_action(
@@ -706,6 +732,7 @@ pub fn show_settings() -> Result<(), String> {
     model_field.setPlaceholderString(Some(&NSString::from_str(model_placeholder_for(
         settings.provider,
     ))));
+    autostart_checkbox.setState(if settings.launch_at_login { 1 } else { 0 });
     url_field.setStringValue(&NSString::from_str(&settings.ollama_url));
     url_field.setPlaceholderString(Some(&NSString::from_str(crate::config::DEFAULT_OLLAMA_URL)));
     key_help.setStringValue(&NSString::from_str(key_help_for(settings.provider)));
@@ -736,6 +763,8 @@ pub fn show_settings() -> Result<(), String> {
         set_status(&status_label, error, true);
     } else if let Some(hotkey_error) = super::hotkey_message() {
         set_status(&status_label, &hotkey_error, true);
+    } else if let Some(autostart_error) = super::autostart_message() {
+        set_status(&status_label, &autostart_error, true);
     }
 
     if delegate.ivars().field.set(field.clone()).is_err() {
@@ -761,6 +790,8 @@ pub fn show_settings() -> Result<(), String> {
     content.addSubview(&url_label);
     content.addSubview(&url_field);
     content.addSubview(&url_help);
+    content.addSubview(&autostart_checkbox);
+    content.addSubview(&autostart_help);
     content.addSubview(&save_button);
     content.addSubview(&remove_button);
     content.addSubview(&hotkey_hint);
@@ -782,6 +813,7 @@ pub fn show_settings() -> Result<(), String> {
             link_button: link_button.clone(),
             url_label: url_label.clone(),
             url_help: url_help.clone(),
+            autostart_checkbox: autostart_checkbox.clone(),
             settings,
         });
     });
