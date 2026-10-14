@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -545,6 +545,42 @@ pub(crate) fn no_caret_suppressed(pid: u32) -> bool {
             .as_ref()
             .and_then(|inner| inner.grace_enabled_at.get(&pid).copied())
             .is_some_and(|enabled_at| within_grace(CFAbsoluteTimeGetCurrent(), enabled_at))
+    })
+}
+
+/// Pids already told the focused element was stale and re-read, so the
+/// retry below logs once per pid instead of on every keystroke.
+static STALE_LOGGED: LazyLock<Mutex<HashSet<u32>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Drops the cached focused element and re-queries the app's focused element
+/// once, for AX calls that failed with `InvalidUIElement` on a stale cache
+/// (e.g. a system dialog briefly took focus). Returns the refreshed cache
+/// entry, if any. The caller retries the failed call once and only then
+/// reports an error. Logs the retry once per pid.
+pub(crate) fn refresh_focused_after_invalid() -> Option<(CFRetained<AXUIElement>, u32, bool)> {
+    INNER.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let inner = borrow.as_mut()?;
+        let pid = inner.app_pid;
+        if pid == 0 || inner.observer.is_none() {
+            return None;
+        }
+        inner.focused_element = None;
+        inner.focused_editable = false;
+        refresh_focused_registration(inner);
+        let element = inner.focused_element.clone()?;
+        let name = inner
+            .app_element
+            .as_ref()
+            .map(|app| app_display_name(pid, app))
+            .unwrap_or_else(|| format!("pid {pid}"));
+        let mut logged = STALE_LOGGED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if logged.insert(pid) {
+            eprintln!("Writely: the focused element for {name} was stale; re-read it.");
+        }
+        Some((element, pid, inner.focused_editable))
     })
 }
 

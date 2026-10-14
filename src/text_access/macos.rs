@@ -47,6 +47,20 @@ fn log_no_caret_once(pid: u32) {
     }
 }
 
+/// Pids already told the focused element was stale and re-read, so the retry
+/// below logs once per pid instead of on every keystroke.
+static STALE_RETRY_LOGGED: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn log_stale_retry_once(pid: u32) {
+    let mut logged = STALE_RETRY_LOGGED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if logged.insert(pid) {
+        eprintln!("Writely: the focused element was stale; re-read it.");
+    }
+}
+
 /// Whether a caret rectangle from `AXBoundsForRange` is a real caret
 /// position: it must have a non-zero height and its origin must lie inside
 /// the focused element's `AXFrame`, grown by 4 pt on each side. Some apps
@@ -581,7 +595,11 @@ pub(crate) fn check_permission(prompt: bool) -> Result<(), String> {
     }
 }
 
-pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
+/// Queries the system-wide focused element and its pid: `Ok(None)` when
+/// nothing is focused, Writely itself is focused, or focus is unavailable.
+/// `focused_field` calls this again for a one-time retry when the element
+/// goes stale between this query and the first read.
+fn query_focused_element() -> Result<Option<(CFRetained<AXUIElement>, u32)>, String> {
     // SAFETY: creating the system-wide element is a plain FFI call with no arguments.
     let system = unsafe { AXUIElement::new_system_wide() };
     set_messaging_timeout(&system);
@@ -610,6 +628,13 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
     if pid < 0 || pid as u32 == std::process::id() {
         return Ok(None);
     }
+    Ok(Some((element, pid as u32)))
+}
+
+pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
+    let Some((mut element, pid_u32)) = query_focused_element()? else {
+        return Ok(None);
+    };
 
     match copy_string(&element, "AXSubrole") {
         Ok(Some(subrole)) if subrole == "AXSecureTextField" => return Ok(None),
@@ -623,7 +648,31 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
         // No caret offset (e.g. Firefox): fall back to a whole-field
         // snapshot when the text itself is readable.
         Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
-            return snapshot_without_caret(element, pid as u32);
+            return snapshot_without_caret(element, pid_u32);
+        }
+        // The element went stale between the focus query and this read
+        // (e.g. a system dialog briefly took focus): re-query the app's
+        // focused element once and retry the call once; only then report
+        // an error.
+        Err(error) if error == AXError::InvalidUIElement => {
+            log_stale_retry_once(pid_u32);
+            match query_focused_element()? {
+                Some((fresh, fresh_pid)) if fresh_pid == pid_u32 => {
+                    element = fresh;
+                    match copy_ax_value(&element, "AXSelectedTextRange") {
+                        Ok(value) => value,
+                        Err(error)
+                            if error == AXError::NoValue
+                                || error == AXError::AttributeUnsupported =>
+                        {
+                            return snapshot_without_caret(element, pid_u32);
+                        }
+                        Err(error) => return Err(read_error(error)),
+                    }
+                }
+                Some(_) => return Err(read_error(AXError::InvalidUIElement)),
+                None => return Ok(None),
+            }
         }
         Err(error) => return Err(read_error(error)),
     };
@@ -642,7 +691,6 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
         selected.length as usize
     };
     let sel_end_utf16 = caret_utf16.saturating_add(sel_len_utf16);
-    let pid_u32 = pid as u32;
 
     // Bounded read: only a window of text around the caret, never the whole
     // document on keystroke-adjacent paths. When there is a selection the
@@ -808,45 +856,71 @@ fn whole_field_snapshot(
     }))
 }
 
+/// Reads the caret from the watcher's cached focused element: no `AXValue`
+/// read and no pid/subrole re-reads, so a burst costs just
+/// `AXSelectedTextRange` + `AXBoundsForRange`. Raw AX errors are returned so
+/// the caller can retry once when the cache is stale.
+fn caret_info_with_element(
+    element: &AXUIElement,
+    pid: u32,
+    editable: bool,
+) -> Result<Option<CaretInfo>, AXError> {
+    if pid == std::process::id() {
+        return Ok(None);
+    }
+    if !editable {
+        return Ok(None);
+    }
+    let range_value = match copy_ax_value(element, "AXSelectedTextRange") {
+        Ok(value) => value,
+        // No caret offset (e.g. Firefox): the icon can still anchor to
+        // the text box when the element has a usable frame.
+        Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
+            return Ok(box_anchor_for(element, pid)
+                .or_else(|| window_anchor_for(element, pid))
+                .map(|caret_rect| CaretInfo { pid, caret_rect }));
+        }
+        Err(error) => return Err(error),
+    };
+    let selected = match ax_range(&range_value) {
+        Some(range) => range,
+        None => return Err(AXError::Failure),
+    };
+    let caret_utf16 = if selected.location < 0 {
+        0usize
+    } else {
+        selected.location as usize
+    };
+    let Some(rect) = caret_or_box_anchor(element, pid, caret_utf16) else {
+        log_no_caret_once(pid);
+        return Ok(None);
+    };
+    Ok(Some(CaretInfo {
+        pid,
+        caret_rect: rect,
+    }))
+}
+
 pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
     // Cheap path: reuse the watcher's cached focused element (no AXValue read,
     // no pid/subrole re-reads). A burst then costs just AXSelectedTextRange +
     // AXBoundsForRange.
     if let Some((element, pid, editable)) = crate::watcher::macos::cached_focused() {
-        if pid == std::process::id() {
-            return Ok(None);
-        }
-        if !editable {
-            return Ok(None);
-        }
-        let range_value = match copy_ax_value(&element, "AXSelectedTextRange") {
-            Ok(value) => value,
-            // No caret offset (e.g. Firefox): the icon can still anchor to
-            // the text box when the element has a usable frame.
-            Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
-                return Ok(box_anchor_for(&element, pid)
-                    .or_else(|| window_anchor_for(&element, pid))
-                    .map(|caret_rect| CaretInfo { pid, caret_rect }));
+        match caret_info_with_element(&element, pid, editable) {
+            // The cache went stale (e.g. a system dialog briefly took
+            // focus): drop it, re-query the app's focused element once and
+            // retry the call once; only then report an error.
+            Err(AXError::InvalidUIElement) => {
+                match crate::watcher::macos::refresh_focused_after_invalid() {
+                    Some((element, pid, editable)) => {
+                        return caret_info_with_element(&element, pid, editable)
+                            .map_err(read_error);
+                    }
+                    None => return Err(read_error(AXError::InvalidUIElement)),
+                }
             }
-            Err(error) => return Err(read_error(error)),
-        };
-        let selected = match ax_range(&range_value) {
-            Some(range) => range,
-            None => return Err(read_error(AXError::Failure)),
-        };
-        let caret_utf16 = if selected.location < 0 {
-            0usize
-        } else {
-            selected.location as usize
-        };
-        let Some(rect) = caret_or_box_anchor(&element, pid, caret_utf16) else {
-            log_no_caret_once(pid);
-            return Ok(None);
-        };
-        return Ok(Some(CaretInfo {
-            pid,
-            caret_rect: rect,
-        }));
+            result => return result.map_err(read_error),
+        }
     }
     // SAFETY: creating the system-wide element is a plain FFI call with no arguments.
     let system = unsafe { AXUIElement::new_system_wide() };
