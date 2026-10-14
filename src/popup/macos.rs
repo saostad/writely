@@ -6,24 +6,25 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSEvent, NSEventMask, NSFont, NSPanel,
-    NSScreen, NSStatusWindowLevel, NSTextField, NSView, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventMask, NSFont, NSPanel, NSScreen,
+    NSScrollView, NSTextField, NSTextView, NSVisualEffectMaterial, NSVisualEffectState,
+    NSVisualEffectView, NSStatusWindowLevel, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 use tao::event_loop::EventLoopProxy;
 
 use crate::text_access::CaretRect;
 use crate::UserEvent;
 
-/// Max width of the suggestion text; the panel is this plus padding.
-const MAX_TEXT_WIDTH: f64 = 360.0;
-const PADDING: f64 = 10.0;
-const BUTTON_WIDTH: f64 = 90.0;
-const BUTTON_HEIGHT: f64 = 24.0;
-const GAP: f64 = 8.0;
+/// Card width; the body wraps to this minus the side padding.
+const CARD_WIDTH: f64 = 440.0;
+const SIDE_PAD: f64 = 12.0;
+const HEADER_HEIGHT: f64 = 28.0;
+const FOOTER_HEIGHT: f64 = 40.0;
+const BODY_MIN: f64 = 40.0;
+const BODY_MAX: f64 = 340.0;
 /// Height of the icon panel, used to place the popup below the icon.
 const ICON_SIZE: f64 = 20.0;
 
@@ -67,30 +68,58 @@ impl ReplaceTarget {
 }
 
 define_class!(
-    // SAFETY: NSView has no subclassing requirements and PopupBackgroundView does not implement Drop.
-    #[unsafe(super = NSView)]
+    // SAFETY: NSObject has no subclassing requirements and DismissTarget does not implement Drop.
+    #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
-    struct PopupBackgroundView;
+    struct DismissTarget;
 
     // SAFETY: NSObjectProtocol has no safety requirements.
-    unsafe impl NSObjectProtocol for PopupBackgroundView {}
+    unsafe impl NSObjectProtocol for DismissTarget {}
 
-    impl PopupBackgroundView {
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty_rect: NSRect) {
-            let bounds = self.bounds();
-            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                bounds, 8.0, 8.0,
-            );
-            NSColor::colorWithWhite_alpha(0.15, 0.92).setFill();
-            path.fill();
+    impl DismissTarget {
+        #[unsafe(method(dismissClicked:))]
+        fn dismiss_clicked(&self, _sender: Option<&AnyObject>) {
+            // Exactly like typing: the main thread hides the popup, bumps
+            // the generation and clears the in-flight state.
+            if let Some(proxy) = PROXY.get() {
+                if let Err(error) = proxy.send_event(UserEvent::CaretChanged) {
+                    eprintln!("Writely: could not deliver the dismiss event: {error}");
+                }
+            }
         }
     }
 );
 
-impl PopupBackgroundView {
+impl DismissTarget {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 40.0));
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: NSObject init signature is correct.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+define_class!(
+    // SAFETY: NSView has no subclassing requirements and SeparatorView does not implement Drop.
+    #[unsafe(super = NSView)]
+    #[thread_kind = MainThreadOnly]
+    struct SeparatorView;
+
+    // SAFETY: NSObjectProtocol has no safety requirements.
+    unsafe impl NSObjectProtocol for SeparatorView {}
+
+    impl SeparatorView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty_rect: NSRect) {
+            NSColor::separatorColor().setFill();
+            let bounds = self.bounds();
+            objc2_app_kit::NSRectFill(bounds);
+        }
+    }
+);
+
+impl SeparatorView {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, 1.0));
         let this = Self::alloc(mtm).set_ivars(());
         // SAFETY: initWithFrame: is NSView's designated initializer and mtm is the main thread.
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -100,11 +129,16 @@ impl PopupBackgroundView {
 
 struct PopupState {
     panel: Retained<NSPanel>,
-    background: Retained<PopupBackgroundView>,
-    label: Retained<NSTextField>,
-    button: Retained<NSButton>,
+    card: Retained<NSVisualEffectView>,
+    scroll: Retained<NSScrollView>,
+    text: Retained<NSTextView>,
+    separator: Retained<SeparatorView>,
+    cancel_button: Retained<NSButton>,
+    replace_button: Retained<NSButton>,
     #[allow(dead_code)]
-    target: Retained<ReplaceTarget>,
+    replace_target: Retained<ReplaceTarget>,
+    #[allow(dead_code)]
+    dismiss_target: Retained<DismissTarget>,
     visible: bool,
     /// Global keyDown monitor, installed only while the popup is visible so
     /// typing hides the popup even in apps that send no AX notifications
@@ -114,6 +148,22 @@ struct PopupState {
 
 thread_local! {
     static STATE: RefCell<Option<PopupState>> = const { RefCell::new(None) };
+}
+
+/// Rounds the card's layer without a QuartzCore dependency: the layer is
+/// messaged dynamically as an `AnyObject`.
+fn round_card_corners(card: &NSVisualEffectView) {
+    let card_obj: &AnyObject = card;
+    // SAFETY: setWantsLayer: exists on NSView; layer/setCornerRadius:/setMasksToBounds:
+    // exist on the layer object once a layer is wanted.
+    unsafe {
+        let _: () = msg_send![card_obj, setWantsLayer: true];
+        let layer: *mut AnyObject = msg_send![card_obj, layer];
+        if !layer.is_null() {
+            let _: () = msg_send![layer, setCornerRadius: 10.0];
+            let _: () = msg_send![layer, setMasksToBounds: true];
+        }
+    }
 }
 
 fn ensure_popup(mtm: MainThreadMarker) {
@@ -142,33 +192,99 @@ fn ensure_popup(mtm: MainThreadMarker) {
         panel.setOpaque(false);
         panel.setBackgroundColor(Some(&NSColor::clearColor()));
 
-        let background = PopupBackgroundView::new(mtm);
-        let label = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
-        label.setTextColor(Some(&NSColor::whiteColor()));
-        label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-        background.addSubview(&label);
+        // SAFETY: initWithFrame: is the designated initializer and mtm is the main thread.
+        let card = NSVisualEffectView::initWithFrame(
+            NSVisualEffectView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CARD_WIDTH, 100.0)),
+        );
+        card.setMaterial(NSVisualEffectMaterial::Popover);
+        card.setState(NSVisualEffectState::Active);
+        round_card_corners(&card);
 
-        let target = ReplaceTarget::new(mtm);
-        let target_object: &AnyObject = &target;
-        // SAFETY: target implements replaceClicked: and lives in STATE while the panel is alive.
-        let button = unsafe {
+        let title = NSTextField::labelWithString(&NSString::from_str("Writely"), mtm);
+        title.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
+        title.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        card.addSubview(&title);
+
+        let dismiss_target = DismissTarget::new(mtm);
+        let dismiss_object: &AnyObject = &dismiss_target;
+        // SAFETY: dismiss target implements dismissClicked: and lives in STATE while the panel is alive.
+        let close_button = unsafe {
             NSButton::buttonWithTitle_target_action(
-                ns_string!("Replace"),
-                Some(target_object),
+                &NSString::from_str("\u{2715}"),
+                Some(dismiss_object),
+                Some(sel!(dismissClicked:)),
+                mtm,
+            )
+        };
+        close_button.setBordered(false);
+        close_button.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        card.addSubview(&close_button);
+
+        // SAFETY: initWithFrame: is the designated initializer and mtm is the main thread.
+        let scroll = NSScrollView::initWithFrame(
+            NSScrollView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 40.0)),
+        );
+        scroll.setHasVerticalScroller(true);
+        scroll.setHasHorizontalScroller(false);
+        scroll.setAutohidesScrollers(true);
+        scroll.setDrawsBackground(false);
+
+        // SAFETY: initWithFrame: is the designated initializer and mtm is the main thread.
+        let text = NSTextView::initWithFrame(
+            NSTextView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 40.0)),
+        );
+        text.setEditable(false);
+        text.setSelectable(false);
+        text.setDrawsBackground(false);
+        text.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        text.setTextColor(Some(&NSColor::labelColor()));
+        scroll.setDocumentView(Some(&text));
+        card.addSubview(&scroll);
+
+        let separator = SeparatorView::new(mtm);
+        card.addSubview(&separator);
+
+        // SAFETY: dismiss target implements dismissClicked: and lives in STATE while the panel is alive.
+        let cancel_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Cancel"),
+                Some(dismiss_object),
+                Some(sel!(dismissClicked:)),
+                mtm,
+            )
+        };
+        cancel_button.setKeyEquivalent(&NSString::from_str(""));
+        card.addSubview(&cancel_button);
+
+        let replace_target = ReplaceTarget::new(mtm);
+        let replace_object: &AnyObject = &replace_target;
+        // SAFETY: replace target implements replaceClicked: and lives in STATE while the panel is alive.
+        let replace_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Replace"),
+                Some(replace_object),
                 Some(sel!(replaceClicked:)),
                 mtm,
             )
         };
-        button.setHidden(true);
-        background.addSubview(&button);
+        replace_button.setBezelColor(Some(&NSColor::controlAccentColor()));
+        replace_button.setKeyEquivalent(&NSString::from_str(""));
+        card.addSubview(&replace_button);
 
-        panel.setContentView(Some(&background));
+        panel.setContentView(Some(&card));
         *state.borrow_mut() = Some(PopupState {
             panel,
-            background,
-            label,
-            button,
-            target,
+            card,
+            scroll,
+            text,
+            separator,
+            cancel_button,
+            replace_button,
+            replace_target,
+            dismiss_target,
             visible: false,
             key_monitor: None,
         });
@@ -220,10 +336,102 @@ fn remove_key_monitor() {
     });
 }
 
-/// Shows the popup with `text`, 4 pt below the icon (or above the caret line
-/// when there is no room below), clamped to the visible frame of the screen
-/// containing the caret. AX coords start at the top-left; AppKit at the
-/// bottom-left.
+/// Lays out the card for plain `text` (messages and, until the diff lands,
+/// suggestions). Returns the panel height.
+fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(popup) = state.as_mut() else {
+            return 0.0;
+        };
+        popup.text.setString(&NSString::from_str(text));
+        popup.text.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        if is_error {
+            popup.text.setTextColor(Some(&NSColor::systemRedColor()));
+        } else {
+            popup.text.setTextColor(Some(&NSColor::labelColor()));
+        }
+        let text_width = CARD_WIDTH - 2.0 * SIDE_PAD;
+        // SAFETY: the text container exists for a freshly created NSTextView.
+        unsafe {
+            if let Some(container) = popup.text.textContainer() {
+                container.setWidthTracksTextView(false);
+                container.setContainerSize(NSSize::new(text_width, 1_000_000.0));
+            }
+        }
+        popup.text.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(text_width, 1_000_000.0),
+        ));
+        // SAFETY: the layout manager exists for a freshly created NSTextView.
+        let mut needed: f64 = BODY_MIN;
+        unsafe {
+            if let (Some(layout), Some(container)) =
+                (popup.text.layoutManager(), popup.text.textContainer())
+            {
+                layout.ensureLayoutForTextContainer(&container);
+                needed = layout.usedRectForTextContainer(&container).size.height;
+            }
+        }
+        let body_height = needed.clamp(BODY_MIN, BODY_MAX);
+        let footer = if show_footer { FOOTER_HEIGHT } else { 0.0 };
+        let panel_height = HEADER_HEIGHT + body_height + footer;
+
+        popup.card.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(CARD_WIDTH, panel_height),
+        ));
+        // Header (origin is bottom-left): title left, ✕ right.
+        // Title and close button frames are set by index below via stored
+        // subviews: title is subview 0, close is subview 1.
+        let subviews = popup.card.subviews();
+        if subviews.count() >= 2 {
+            let title_view = subviews.objectAtIndex(0);
+            title_view.setFrame(NSRect::new(
+                NSPoint::new(SIDE_PAD, panel_height - HEADER_HEIGHT + 4.0),
+                NSSize::new(300.0, 20.0),
+            ));
+            let close_view = subviews.objectAtIndex(1);
+            close_view.setFrame(NSRect::new(
+                NSPoint::new(CARD_WIDTH - 36.0, panel_height - HEADER_HEIGHT + 2.0),
+                NSSize::new(24.0, 24.0),
+            ));
+        }
+        popup.scroll.setFrame(NSRect::new(
+            NSPoint::new(4.0, footer),
+            NSSize::new(CARD_WIDTH - 8.0, body_height),
+        ));
+        popup.text.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(text_width, body_height.max(needed)),
+        ));
+        popup.separator.setHidden(!show_footer);
+        if show_footer {
+            popup.separator.setFrame(NSRect::new(
+                NSPoint::new(0.0, footer),
+                NSSize::new(CARD_WIDTH, 1.0),
+            ));
+        }
+        popup.cancel_button.setHidden(!show_footer);
+        popup.replace_button.setHidden(!show_footer);
+        if show_footer {
+            popup.replace_button.setFrame(NSRect::new(
+                NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
+                NSSize::new(90.0, 24.0),
+            ));
+            popup.cancel_button.setFrame(NSRect::new(
+                NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
+                NSSize::new(90.0, 24.0),
+            ));
+        }
+        panel_height
+    })
+}
+
+/// Shows the popup with `text`, 4 pt below the anchor (or above the caret
+/// line when there is no room below), clamped to the visible frame of the
+/// screen containing the caret. AX coords start at the top-left; AppKit at
+/// the bottom-left.
 pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &CaretRect) {
     let Some(mtm) = MainThreadMarker::new() else {
         eprintln!(
@@ -237,48 +445,15 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         return;
     }
     let primary_height = screens.objectAtIndex(0).frame().size.height;
+    let panel_height = layout_plain(text, is_error, show_button);
+    if panel_height <= 0.0 {
+        return;
+    }
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(popup) = state.as_mut() else {
             return;
         };
-        popup.label.setStringValue(&NSString::from_str(text));
-        if is_error {
-            popup.label.setTextColor(Some(&NSColor::systemRedColor()));
-        } else {
-            popup.label.setTextColor(Some(&NSColor::whiteColor()));
-        }
-        // Constrain the width first so the wrapping label grows vertically.
-        popup.label.setFrame(NSRect::new(
-            NSPoint::new(PADDING, PADDING),
-            NSSize::new(MAX_TEXT_WIDTH, 10_000.0),
-        ));
-        popup.label.sizeToFit();
-        let fitted = popup.label.frame().size;
-        let text_width = fitted.width.clamp(40.0, MAX_TEXT_WIDTH);
-        let text_height = fitted.height.max(17.0);
-
-        let panel_width = MAX_TEXT_WIDTH + 2.0 * PADDING;
-        let mut panel_height = PADDING + text_height + PADDING;
-        if show_button {
-            panel_height += GAP + BUTTON_HEIGHT;
-        }
-        popup.label.setFrame(NSRect::new(
-            NSPoint::new(PADDING, panel_height - PADDING - text_height),
-            NSSize::new(text_width, text_height),
-        ));
-        popup.button.setHidden(!show_button);
-        if show_button {
-            popup.button.setFrame(NSRect::new(
-                NSPoint::new(panel_width - PADDING - BUTTON_WIDTH, PADDING),
-                NSSize::new(BUTTON_WIDTH, BUTTON_HEIGHT),
-            ));
-        }
-        popup.background.setFrame(NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(panel_width, panel_height),
-        ));
-
         // Screen containing the caret, in AppKit coords.
         let caret_centre = NSPoint::new(
             caret.x + caret.width / 2.0,
@@ -298,10 +473,13 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
             }
         }
         let visible = container.visibleFrame();
+        // If the card is taller than the visible frame, it takes the frame;
+        // the body scrolls past BODY_MAX.
+        let panel_height = panel_height.min(visible.size.height);
         let clamp_x = |x: f64| {
             x.clamp(
                 visible.origin.x,
-                (visible.origin.x + visible.size.width - panel_width).max(visible.origin.x),
+                (visible.origin.x + visible.size.width - CARD_WIDTH).max(visible.origin.x),
             )
         };
         // 4 pt below the icon; the icon sits 4 pt right of the caret.
@@ -323,7 +501,7 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
             )
         };
         popup.panel.setFrame_display(
-            NSRect::new(NSPoint::new(x, y), NSSize::new(panel_width, panel_height)),
+            NSRect::new(NSPoint::new(x, y), NSSize::new(CARD_WIDTH, panel_height)),
             true,
         );
         // The panel is created once and reused; it is never re-created.
@@ -340,7 +518,9 @@ pub fn hide() {
     STATE.with(|state| {
         if let Some(popup) = state.borrow_mut().as_mut() {
             popup.panel.orderOut(None);
-            popup.button.setHidden(true);
+            popup.replace_button.setHidden(true);
+            popup.cancel_button.setHidden(true);
+            popup.separator.setHidden(true);
             popup.visible = false;
         }
     });
