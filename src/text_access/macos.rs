@@ -866,43 +866,66 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
     }))
 }
 
+/// Picks the first valid caret rectangle from the zero-length lookup at
+/// the caret and the right edge of the previous character: each candidate is
+/// validated with `caret_rect_valid`, so an out-of-the-box zero-length rect
+/// (e.g. TextEdit's line above the frame at end of text) falls back to the
+/// previous character instead of hiding the icon. Returns `None` when both
+/// fail. Without a readable frame the first non-empty candidate is trusted.
+pub(crate) fn pick_valid_caret_rect(
+    zero: Option<CGRect>,
+    prev_raw: Option<CGRect>,
+    frame: Option<CGRect>,
+) -> Option<CGRect> {
+    let mut candidates: Vec<CGRect> = Vec::with_capacity(2);
+    if let Some(rect) = zero {
+        if rect.size.width != 0.0 || rect.size.height != 0.0 {
+            candidates.push(rect);
+        }
+    }
+    if let Some(raw) = prev_raw {
+        if raw.size.width != 0.0 || raw.size.height != 0.0 {
+            candidates.push(CGRect {
+                origin: CGPoint {
+                    x: raw.origin.x + raw.size.width,
+                    y: raw.origin.y,
+                },
+                size: CGSize {
+                    width: 0.0,
+                    height: raw.size.height,
+                },
+            });
+        }
+    }
+    for rect in candidates {
+        match frame {
+            Some(frame) => {
+                if caret_rect_valid(&rect, &frame) {
+                    return Some(rect);
+                }
+            }
+            None => return Some(rect),
+        }
+    }
+    None
+}
+
 /// The caret screen rectangle, or `None` when neither bounds lookup yields a
-/// real caret position. A lookup that yields a rect outside the focused
-/// element's frame (or with zero height) is bogus and ignored; when the
-/// frame itself can't be read, today's behaviour is kept. There is no
-/// fallback: without a real position the icon stays hidden.
+/// real caret position. If the zero-length rect at the caret fails
+/// `caret_rect_valid`, the `(caret-1, 1)` rect's right edge is tried and
+/// validated the same way; only if both fail is there no position. A lookup
+/// that yields a rect outside the focused element's frame (or with zero
+/// height) is bogus and ignored; when the frame itself can't be read, today's
+/// behaviour is kept. Without a real position the icon stays hidden.
 fn caret_rect(element: &AXUIElement, caret_utf16: usize) -> Option<CaretRect> {
     let frame = element_frame(element).ok();
-    let mut candidate: Option<CGRect> = None;
-    if let Ok(rect) = bounds_for_range(element, caret_utf16, 0) {
-        if rect.size.width != 0.0 || rect.size.height != 0.0 {
-            candidate = Some(rect);
-        }
-    }
-    if candidate.is_none() && caret_utf16 > 0 {
-        if let Ok(rect) = bounds_for_range(element, caret_utf16 - 1, 1) {
-            if rect.size.width != 0.0 || rect.size.height != 0.0 {
-                candidate = Some(CGRect {
-                    origin: CGPoint {
-                        x: rect.origin.x + rect.size.width,
-                        y: rect.origin.y,
-                    },
-                    size: CGSize {
-                        width: 0.0,
-                        height: rect.size.height,
-                    },
-                });
-            }
-        }
-    }
-    let rect = candidate?;
-    // A bogus rect (e.g. Claude's {0,1117,0,0}) fails validation; without a
-    // readable frame the rect is trusted as before.
-    if let Some(frame) = frame {
-        if !caret_rect_valid(&rect, &frame) {
-            return None;
-        }
-    }
+    let zero = bounds_for_range(element, caret_utf16, 0).ok();
+    let prev_raw = if caret_utf16 > 0 {
+        bounds_for_range(element, caret_utf16 - 1, 1).ok()
+    } else {
+        None
+    };
+    let rect = pick_valid_caret_rect(zero, prev_raw, frame)?;
     Some(CaretRect {
         x: rect.origin.x,
         y: rect.origin.y,
@@ -1146,8 +1169,8 @@ pub(crate) fn read_at(
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_rect_valid, read_error, selected_write_ignored, selected_write_ignored_reread,
-        timeout_error,
+        caret_rect_valid, pick_valid_caret_rect, read_error, selected_write_ignored,
+        selected_write_ignored_reread, timeout_error,
     };
     use objc2_application_services::AXError;
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -1275,6 +1298,61 @@ mod tests {
         assert_eq!(anchor.x + anchor.width + 4.0, 100.0 + 400.0 - 20.0 - 4.0);
         assert_eq!(anchor.y + anchor.height / 2.0 - 10.0, 100.0 + 4.0);
         assert!(!anchor.physical);
+    }
+
+    #[test]
+    fn falls_back_to_previous_character_when_caret_rect_is_out_of_the_box() {
+        // TextEdit's AXFrame and the two bounds lookups from the report.
+        let frame = CGRect {
+            origin: CGPoint { x: 214.0, y: 212.0 },
+            size: CGSize {
+                width: 586.0,
+                height: 382.0,
+            },
+        };
+        // Zero-length rect at end of text: a line above the frame, rejected.
+        let zero = CGRect {
+            origin: CGPoint { x: 336.9, y: 198.0 },
+            size: CGSize {
+                width: 0.0,
+                height: 14.0,
+            },
+        };
+        assert!(!caret_rect_valid(&zero, &frame));
+        // Previous-character rect: valid, so its right edge wins.
+        let prev_raw = CGRect {
+            origin: CGPoint { x: 333.5, y: 212.0 },
+            size: CGSize {
+                width: 3.3,
+                height: 14.0,
+            },
+        };
+        let picked =
+            pick_valid_caret_rect(Some(zero), Some(prev_raw), Some(frame)).expect("fallback rect");
+        assert!((picked.origin.x - 336.8).abs() < 0.01);
+        assert_eq!(picked.origin.y, 212.0);
+        assert_eq!(picked.size.width, 0.0);
+        assert_eq!(picked.size.height, 14.0);
+        // A valid zero-length rect still wins over the previous character.
+        let good_zero = CGRect {
+            origin: CGPoint { x: 300.0, y: 250.0 },
+            size: CGSize {
+                width: 0.0,
+                height: 14.0,
+            },
+        };
+        let picked_first =
+            pick_valid_caret_rect(Some(good_zero), Some(prev_raw), Some(frame)).expect("zero rect");
+        assert_eq!(picked_first.origin.x, 300.0);
+        // Both failing means no position.
+        let bogus = CGRect {
+            origin: CGPoint { x: 0.0, y: 1117.0 },
+            size: CGSize {
+                width: 0.0,
+                height: 0.0,
+            },
+        };
+        assert!(pick_valid_caret_rect(Some(bogus), None, Some(frame)).is_none());
     }
 
     #[test]
