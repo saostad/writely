@@ -5,6 +5,8 @@ mod autostart;
 mod clipboard;
 mod config;
 mod diff;
+#[cfg(target_os = "linux")]
+mod ime_bridge;
 mod overlay;
 mod popup;
 mod providers;
