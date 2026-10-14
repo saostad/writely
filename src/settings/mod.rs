@@ -7,9 +7,28 @@ mod windows;
 
 const SERVICE: &str = "writely";
 const USER: &str = "gemini-api-key";
+const TOGETHER_USER: &str = "together-api-key";
 pub(crate) const API_KEY_PAGE: &str = "https://aistudio.google.com/apikey";
+pub(crate) const TOGETHER_API_KEY_PAGE: &str = "https://api.together.ai/settings/api-keys";
 pub(crate) const ACCESSIBILITY_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+/// The keychain page and storage for the provider that needs a key.
+pub fn api_key_page_for(provider: crate::config::Provider) -> Option<&'static str> {
+    match provider {
+        crate::config::Provider::Gemini => Some(API_KEY_PAGE),
+        crate::config::Provider::Together => Some(TOGETHER_API_KEY_PAGE),
+        crate::config::Provider::Ollama => None,
+    }
+}
+
+fn keychain_user_for(provider: crate::config::Provider) -> Option<&'static str> {
+    match provider {
+        crate::config::Provider::Gemini => Some(USER),
+        crate::config::Provider::Together => Some(TOGETHER_USER),
+        crate::config::Provider::Ollama => None,
+    }
+}
 
 static PERMISSION_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -52,6 +71,64 @@ pub fn validate_api_key(key: &str) -> Result<String, String> {
 
 fn keyring_entry() -> Result<keyring::Entry, keyring::Error> {
     keyring::Entry::new(SERVICE, USER)
+}
+
+fn keyring_entry_for(provider: crate::config::Provider) -> Result<keyring::Entry, keyring::Error> {
+    let user = keychain_user_for(provider).unwrap_or(USER);
+    keyring::Entry::new(SERVICE, user)
+}
+
+/// Loads the API key for the selected provider. Ollama has no key (`Ok(None)`).
+pub fn load_api_key_for(
+    provider: crate::config::Provider,
+) -> Result<Option<String>, String> {
+    if keychain_user_for(provider).is_none() {
+        return Ok(None);
+    }
+    let entry = keyring_entry_for(provider)
+        .map_err(|e| format!("Could not read the key from the system keychain: {e}"))?;
+    match entry.get_password() {
+        Ok(key) => Ok(Some(key)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!(
+            "Could not read the key from the system keychain: {e}"
+        )),
+    }
+}
+
+/// Saves the API key for the selected provider. Ollama has no key (a no-op).
+pub fn save_api_key_for(provider: crate::config::Provider, key: &str) -> Result<(), String> {
+    if keychain_user_for(provider).is_none() {
+        return Ok(());
+    }
+    let trimmed = validate_api_key(key)?;
+    let entry = keyring_entry_for(provider)
+        .map_err(|e| format!("Could not save the key to the system keychain: {e}"))?;
+    entry
+        .set_password(&trimmed)
+        .map_err(|e| format!("Could not save the key to the system keychain: {e}"))
+}
+
+/// Removes the selected provider's key. Ollama has no key (a no-op).
+pub fn remove_api_key_for(provider: crate::config::Provider) -> Result<(), String> {
+    if keychain_user_for(provider).is_none() {
+        return Ok(());
+    }
+    let entry = keyring_entry_for(provider)
+        .map_err(|e| format!("Could not remove the key from the system keychain: {e}"))?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!(
+            "Could not remove the key from the system keychain: {e}"
+        )),
+    }
+}
+
+pub fn has_api_key_for(
+    provider: crate::config::Provider,
+) -> Result<bool, String> {
+    load_api_key_for(provider).map(|key| key.is_some())
 }
 
 pub fn load_api_key() -> Result<Option<String>, String> {

@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "macos")]
 mod clipboard;
+mod config;
 mod gemini;
 mod overlay;
 mod popup;
