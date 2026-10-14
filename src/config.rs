@@ -24,7 +24,7 @@ pub fn settings_path() -> PathBuf {
                     .join("settings.json");
             }
         }
-        PathBuf::from("Writely").join("settings.json");
+        PathBuf::from("Writely").join("settings.json")
     }
     #[cfg(target_os = "macos")]
     {
@@ -46,7 +46,7 @@ pub fn settings_path() -> PathBuf {
         PathBuf::from(home)
             .join(".config")
             .join("writely")
-            .join("settings.json");
+            .join("settings.json")
     }
 }
 
