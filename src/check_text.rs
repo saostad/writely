@@ -124,10 +124,7 @@ mod tests {
             CheckOutcome::Unclear
         );
         assert_eq!(
-            outcome_for_suggestion(
-                "She goes to school.".to_string(),
-                "She goes to school."
-            ),
+            outcome_for_suggestion("She goes to school.".to_string(), "She goes to school."),
             CheckOutcome::Unchanged
         );
         assert_eq!(

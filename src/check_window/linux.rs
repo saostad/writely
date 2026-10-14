@@ -360,9 +360,7 @@ pub fn show() -> Result<(), String> {
         use gtk::gdk::keys::constants::{KP_Enter, Return};
         let key = event.keyval();
         if (key == Return || key == KP_Enter)
-            && event
-                .state()
-                .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+            && event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK)
         {
             on_check();
             gtk::glib::Propagation::Stop
