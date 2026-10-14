@@ -212,7 +212,8 @@ impl ImeBridge {
         }
         // Stored only when it answers the in-flight `Replace`; results for
         // any other request, context or sender are ignored.
-        if lock(&self.shared.replace_wait).insert(&sender, context, request, ok, error) {
+        let stored = lock(&self.shared.replace_wait).insert(&sender, context, request, ok, error);
+        if stored {
             self.shared.replace_cv.notify_one();
         }
         eprintln!(
@@ -302,6 +303,52 @@ fn closed_error() -> String {
     "The input method closed the text field before the replacement finished.".to_string()
 }
 
+/// Waits for the in-flight `Replace` answer. No D-Bus, no statics: the
+/// caller supplies the wait state, the wakeup and a `context_exists` check.
+/// Never holds a guard across another `lock` of the same mutex.
+fn wait_for_replace(
+    replace_wait: &Mutex<ReplaceWait>,
+    replace_cv: &Condvar,
+    timeout: Duration,
+    context_exists: impl Fn() -> bool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Take into a local first: the guard must be dropped before the
+        // `clear()` below locks the same mutex again.
+        let result = lock(replace_wait).take();
+        if let Some((ok, error)) = result {
+            lock(replace_wait).clear();
+            if ok {
+                return Ok(());
+            }
+            return Err(format!(
+                "The input method could not replace the text: {error}"
+            ));
+        }
+        if !context_exists() {
+            lock(replace_wait).clear();
+            return Err(closed_error());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            lock(replace_wait).clear();
+            return Err(
+                "The input method didn't confirm the replacement within 3 seconds.".to_string(),
+            );
+        }
+        let wait = lock(replace_wait);
+        // Re-check under the lock before sleeping: the answer may have
+        // landed between the take above and this lock.
+        if wait.has_result() {
+            continue;
+        }
+        let _ = replace_cv
+            .wait_timeout(wait, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
 /// Emits `Replace` with the next request id and waits up to 3 seconds for
 /// the matching `ReplaceResult`. Never holds the state lock while waiting,
 /// and the service thread never waits on the caller, so this can't deadlock
@@ -319,39 +366,12 @@ pub(crate) fn replace_and_wait(
     // missed between the emit and the wait.
     lock(&shared.replace_wait).begin(sender, context, request);
     emit_replace(sender, context, request, start, end, text);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if let Some((ok, error)) = lock(&shared.replace_wait).take() {
-            lock(&shared.replace_wait).clear();
-            if ok {
-                return Ok(());
-            }
-            return Err(format!(
-                "The input method could not replace the text: {error}"
-            ));
-        }
-        if !lock(&shared.state).context_exists(sender, context) {
-            lock(&shared.replace_wait).clear();
-            return Err(closed_error());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            lock(&shared.replace_wait).clear();
-            return Err(
-                "The input method didn't confirm the replacement within 3 seconds.".to_string(),
-            );
-        }
-        let wait = lock(&shared.replace_wait);
-        // Re-check under the lock before sleeping: the answer may have
-        // landed between the take above and this lock.
-        if wait.has_result() {
-            continue;
-        }
-        let _ = shared
-            .replace_cv
-            .wait_timeout(wait, remaining)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
+    wait_for_replace(
+        &shared.replace_wait,
+        &shared.replace_cv,
+        Duration::from_secs(3),
+        || lock(&shared.state).context_exists(sender, context),
+    )
 }
 
 /// Starts the bridge on its own thread. Never blocks the caller.
@@ -458,4 +478,93 @@ fn serve(proxy: EventLoopProxy<UserEvent>) {
         shared.replace_cv.notify_all();
     }
     eprintln!("Writely: the input method bridge lost its D-Bus connection.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Runs the wait on a spawned thread so a regression fails after
+    /// 5 seconds instead of hanging `cargo test`.
+    fn run_wait(
+        wait: Arc<Mutex<ReplaceWait>>,
+        cv: Arc<Condvar>,
+        timeout: Duration,
+        context_exists: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = wait_for_replace(wait.as_ref(), cv.as_ref(), timeout, context_exists);
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("wait_for_replace hung: no result within 5 seconds")
+    }
+
+    fn pending() -> (Arc<Mutex<ReplaceWait>>, Arc<Condvar>) {
+        let wait = Arc::new(Mutex::new(ReplaceWait::new()));
+        lock(&wait).begin(":1.1", "ctx", 1);
+        (wait, Arc::new(Condvar::new()))
+    }
+
+    #[test]
+    fn wait_returns_ok_when_result_arrives() {
+        let (wait, cv) = pending();
+        let deliver_wait = wait.clone();
+        let deliver_cv = cv.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            lock(&deliver_wait).insert(":1.1", "ctx", 1, true, "");
+            deliver_cv.notify_one();
+        });
+        assert_eq!(run_wait(wait, cv, Duration::from_secs(3), || true), Ok(()));
+    }
+
+    #[test]
+    fn wait_returns_error_when_bridge_reports_failure() {
+        let (wait, cv) = pending();
+        let deliver_wait = wait.clone();
+        let deliver_cv = cv.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            lock(&deliver_wait).insert(":1.1", "ctx", 1, false, "boom");
+            deliver_cv.notify_one();
+        });
+        assert_eq!(
+            run_wait(wait, cv, Duration::from_secs(3), || true),
+            Err("The input method could not replace the text: boom".to_string())
+        );
+    }
+
+    #[test]
+    fn wait_returns_timeout_when_no_result() {
+        let (wait, cv) = pending();
+        assert_eq!(
+            run_wait(wait, cv, Duration::from_millis(100), || true),
+            Err("The input method didn't confirm the replacement within 3 seconds.".to_string())
+        );
+    }
+
+    #[test]
+    fn wait_returns_closed_when_context_disappears() {
+        let (wait, cv) = pending();
+        let exists = Arc::new(AtomicBool::new(true));
+        let exists_writer = exists.clone();
+        let notify_cv = cv.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            exists_writer.store(false, Ordering::SeqCst);
+            notify_cv.notify_all();
+        });
+        assert_eq!(
+            run_wait(wait, cv, Duration::from_secs(3), move || {
+                exists.load(Ordering::SeqCst)
+            }),
+            Err(
+                "The input method closed the text field before the replacement finished."
+                    .to_string()
+            )
+        );
+    }
 }
