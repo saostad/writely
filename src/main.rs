@@ -87,7 +87,9 @@ fn mouse_anchor() -> Option<CaretRect> {
 /// alive by the caller) or `None` when registration failed; failures are
 /// logged and shown in the Settings status line with the real error.
 #[cfg(target_os = "macos")]
-fn register_hotkey(proxy: &EventLoopProxy<UserEvent>) -> Option<global_hotkey::GlobalHotKeyManager> {
+fn register_hotkey(
+    proxy: &EventLoopProxy<UserEvent>,
+) -> Option<global_hotkey::GlobalHotKeyManager> {
     use global_hotkey::hotkey::{Code, HotKey, Modifiers};
     use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
     let manager = match GlobalHotKeyManager::new() {
@@ -99,10 +101,7 @@ fn register_hotkey(proxy: &EventLoopProxy<UserEvent>) -> Option<global_hotkey::G
             return None;
         }
     };
-    let hotkey = HotKey::new(
-        Some(Modifiers::CONTROL | Modifiers::ALT),
-        Code::KeyG,
-    );
+    let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyG);
     if let Err(error) = manager.register(hotkey) {
         let message = format!("Could not register the ⌃⌥G hotkey: {error}");
         eprintln!("Writely: {message}");
@@ -501,14 +500,7 @@ fn handle_icon_clicked(
                 // (which re-applies the limit to the copied text).
                 #[cfg(target_os = "macos")]
                 if let Some(pid) = live_pid.or(Some(snap.pid)) {
-                    handle_icon_clipboard(
-                        proxy,
-                        pid,
-                        anchor,
-                        generation,
-                        last_anchor,
-                        from_hotkey,
-                    );
+                    handle_icon_clipboard(proxy, pid, anchor, generation, last_anchor, from_hotkey);
                     return;
                 }
                 show_popup(

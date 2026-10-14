@@ -452,9 +452,7 @@ fn setup_for_pid(pid: u32) {
                         .map(|(attr, code)| format!("{attr} AXError {code}"))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    eprintln!(
-                        "Writely: could not turn on cursor reporting for {name}: {details}."
-                    );
+                    eprintln!("Writely: could not turn on cursor reporting for {name}: {details}.");
                 }
             }
         }
@@ -696,9 +694,7 @@ mod tests {
 
     #[test]
     fn non_apple_apps_are_managed() {
-        assert!(should_manage_accessibility(Some(
-            "com.google.Chrome"
-        )));
+        assert!(should_manage_accessibility(Some("com.google.Chrome")));
         assert!(should_manage_accessibility(Some("com.microsoft.VSCode")));
         assert!(should_manage_accessibility(Some("org.mozilla.firefox")));
         assert!(should_manage_accessibility(None));

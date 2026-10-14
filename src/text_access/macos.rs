@@ -72,10 +72,7 @@ fn element_frame(element: &AXUIElement) -> Result<CGRect, AXError> {
 /// Picks the input area for caret validation: the scroll-area parent's frame
 /// when the parent role is `AXScrollArea`, else the element's own frame.
 /// Pure so it can be unit-tested.
-pub(crate) fn choose_input_area(
-    element_frame: CGRect,
-    parent: Option<(&str, CGRect)>,
-) -> CGRect {
+pub(crate) fn choose_input_area(element_frame: CGRect, parent: Option<(&str, CGRect)>) -> CGRect {
     match parent {
         Some(("AXScrollArea", parent_frame)) => parent_frame,
         _ => element_frame,

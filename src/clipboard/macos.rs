@@ -2,10 +2,13 @@
 //! (e.g. Warp), or whose field is too large for the whole-field check.
 //! It never runs for a secure (password) field — the caller checks that first.
 //!
-//! Reading posts ⌘C, waits briefly for the pasteboard to change, reads the
-//! plain string, then restores the saved pasteboard. Replacing writes the
-//! suggestion (marked transient + concealed so clipboard managers skip it),
-//! posts ⌘V, waits, then restores. The user's text is never written to logs.
+//! Reading uses layers (Easydict/Pot rule): AX `AXSelectedText`, then the
+//! menu-bar Copy item via AX, then simulated ⌘C with held modifiers released
+//! first. Copy layers wait 50 ms then poll every 5 ms for up to 2 s in a
+//! worker thread and restore the clipboard only when nothing else changed it.
+//! Replacing writes the suggestion (marked transient + concealed so clipboard
+//! managers skip it), posts ⌘V, waits, then restores if unchanged.
+//! The user's text is never written to logs.
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -19,9 +22,7 @@ use objc2_app_kit::{
     NSPasteboard, NSPasteboardItem, NSPasteboardType, NSPasteboardTypeString, NSPasteboardWriting,
 };
 use objc2_application_services::{AXError, AXUIElement};
-use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFNumberType, CFRetained, CFString,
-};
+use objc2_core_foundation::{CFArray, CFBoolean, CFNumber, CFNumberType, CFRetained, CFString};
 use objc2_core_graphics::{
     CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGKeyCode,
 };
@@ -95,11 +96,14 @@ fn ax_selected_text() -> Option<String> {
     // SAFETY: AXFocusedUIElement yields an AXUIElement valid while value is alive.
     let element: &objc2_application_services::AXUIElement = unsafe { ptr.as_ref() };
     crate::text_access::macos_helpers::set_messaging_timeout(element);
-    let selected =
-        crate::text_access::macos_helpers::copy_attr(element, "AXSelectedText").ok()?;
+    let selected = crate::text_access::macos_helpers::copy_attr(element, "AXSelectedText").ok()?;
     let text = selected.downcast_ref::<CFString>()?;
     let text = text.to_string();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// Whether the Copy menu item matches: Cmd+C with no extra modifiers.
@@ -108,19 +112,14 @@ pub(crate) fn is_copy_menu_item(cmd_char: Option<&str>, cmd_modifiers: Option<i6
     is_c && cmd_modifiers == Some(0)
 }
 
-fn read_cmd_char(
-    element: &objc2_application_services::AXUIElement,
-) -> Option<String> {
-    let value =
-        crate::text_access::macos_helpers::copy_attr(element, "AXMenuItemCmdChar").ok()?;
+fn read_cmd_char(element: &objc2_application_services::AXUIElement) -> Option<String> {
+    let value = crate::text_access::macos_helpers::copy_attr(element, "AXMenuItemCmdChar").ok()?;
     value
         .downcast_ref::<CFString>()
         .map(|text| text.to_string())
 }
 
-fn read_cmd_modifiers(
-    element: &objc2_application_services::AXUIElement,
-) -> Option<i64> {
+fn read_cmd_modifiers(element: &objc2_application_services::AXUIElement) -> Option<i64> {
     let value =
         crate::text_access::macos_helpers::copy_attr(element, "AXMenuItemCmdModifiers").ok()?;
     let number = value.downcast::<CFNumber>().ok()?;
@@ -137,9 +136,7 @@ fn read_cmd_modifiers(
 
 fn read_enabled(element: &objc2_application_services::AXUIElement) -> Option<bool> {
     let value = crate::text_access::macos_helpers::copy_attr(element, "AXEnabled").ok()?;
-    value
-        .downcast_ref::<CFBoolean>()
-        .map(|flag| flag.as_bool())
+    value.downcast_ref::<CFBoolean>().map(|flag| flag.as_bool())
 }
 
 /// Depth-first search for the enabled Copy menu item (Cmd+C, no extra
@@ -207,7 +204,10 @@ fn menu_bar_copy() -> Result<bool, String> {
     let menubar_value = match crate::text_access::macos_helpers::copy_attr(&app, "AXMenuBar") {
         Ok(value) => value,
         Err(error) => {
-            return Err(format!("Could not read the menu bar (AXError {}).", error.0));
+            return Err(format!(
+                "Could not read the menu bar (AXError {}).",
+                error.0
+            ));
         }
     };
     let ptr = CFRetained::as_ptr(&menubar_value).cast::<AXUIElement>();
@@ -220,8 +220,9 @@ fn menu_bar_copy() -> Result<bool, String> {
 fn post_key(keycode: CGKeyCode, key_down: bool, flags: CGEventFlags) -> Result<(), String> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .ok_or_else(|| "Could not post the key event (no event source).".to_string())?;
-    let event = CGEvent::new_keyboard_event(Some(&source), keycode, key_down)
-        .ok_or_else(|| "Could not post the key event (CGEventCreateKeyboardEvent failed).".to_string())?;
+    let event = CGEvent::new_keyboard_event(Some(&source), keycode, key_down).ok_or_else(|| {
+        "Could not post the key event (CGEventCreateKeyboardEvent failed).".to_string()
+    })?;
     // SAFETY: event is a valid CGEvent and the flags are a plain bitmask.
     CGEvent::set_flags(Some(&event), flags);
     // SAFETY: event is a valid CGEvent posted to the session tap.
@@ -255,11 +256,7 @@ fn wait_for_pasteboard_change(pasteboard: &NSPasteboard, before: NSInteger) -> b
 /// Restores the saved pasteboard only when nothing else changed it since our
 /// copy (WritingTools `restoreIfUnchanged`); otherwise the user's new
 /// clipboard content is left alone.
-fn restore_if_unchanged(
-    pasteboard: &NSPasteboard,
-    saved: &[SavedItem],
-    our_change: NSInteger,
-) {
+fn restore_if_unchanged(pasteboard: &NSPasteboard, saved: &[SavedItem], our_change: NSInteger) {
     if pasteboard.changeCount() == our_change {
         restore_clipboard(pasteboard, saved);
     } else {
@@ -372,8 +369,6 @@ fn copy_via_simulated_key(pasteboard: &NSPasteboard) -> Result<Option<String>, S
     }
 }
 
-
-
 /// How long to wait after posting ⌘V before restoring the pasteboard.
 const PASTE_WAIT_MS: u64 = 300;
 
@@ -460,45 +455,6 @@ fn post_command_key(keycode: CGKeyCode) -> Result<(), String> {
         CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
     }
     Ok(())
-}
-
-/// Copies the frontmost app's current selection via ⌘C and returns it.
-/// The pasteboard is saved beforehand and restored afterwards either way.
-///
-/// Superseded by `layered_copy_text` (Item 4); kept until Item 6 removes it.
-#[allow(dead_code)]
-pub fn copy_selected_text(pid: u32) -> Result<CopyResult, String> {
-    let pasteboard = NSPasteboard::generalPasteboard();
-    let saved = save_clipboard(&pasteboard);
-    let before = pasteboard.changeCount();
-    let post_result = post_command_key(KEY_C);
-    if let Err(error) = post_result {
-        restore_clipboard(&pasteboard, &saved);
-        eprintln!("Writely: could not copy the selected text: {error}");
-        return Err(format!("Could not copy the selected text: {error}"));
-    }
-    let mut changed = false;
-    for _ in 0..COPY_POLLS {
-        std::thread::sleep(Duration::from_millis(COPY_POLL_MS));
-        if pasteboard.changeCount() != before {
-            changed = true;
-            break;
-        }
-    }
-    // SAFETY: NSPasteboardTypeString is a framework-provided constant.
-    let string_type: &NSPasteboardType = unsafe { NSPasteboardTypeString };
-    let text = pasteboard
-        .stringForType(string_type)
-        .map(|value| value.to_string());
-    restore_clipboard(&pasteboard, &saved);
-    log_clipboard_once(
-        pid,
-        "checked the text via copy-and-paste (pasteboard restored).",
-    );
-    match (changed, text) {
-        (true, Some(copied)) if !copied.is_empty() => Ok(CopyResult::Text(copied)),
-        _ => Ok(CopyResult::NothingNew),
-    }
 }
 
 /// Pastes `suggestion` into the frontmost app via ⌘V, then restores the
