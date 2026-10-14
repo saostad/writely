@@ -40,6 +40,32 @@ fn log_no_caret_once(pid: u32) {
     }
 }
 
+/// Whether setting `AXSelectedText` was silently ignored: the verification
+/// read still shows the snapshot text instead of the expected text.
+pub(crate) fn selected_write_ignored(actual: &str, snapshot_text: &str, expected: &str) -> bool {
+    actual == snapshot_text && actual != expected
+}
+
+/// Moves the caret to `offset_utf16` without failing the replace: a failure
+/// is logged but isn't an error for the user.
+fn move_caret_to(element: &AXUIElement, offset_utf16: usize) {
+    let Some(range_value) = make_ax_range(offset_utf16, 0) else {
+        eprintln!(
+            "Writely: could not move the caret after replacing text (AXError {}).",
+            AXError::Failure.0
+        );
+        return;
+    };
+    let range_type: &CFType = &range_value;
+    let error = set_attr(element, "AXSelectedTextRange", range_type);
+    if error != AXError::Success {
+        eprintln!(
+            "Writely: could not move the caret after replacing text (AXError {}).",
+            error.0
+        );
+    }
+}
+
 /// Pids already told that the app has no partial-read support, so the
 /// message below logs once per pid instead of on every click.
 static PARTIAL_FALLBACK_LOGGED: LazyLock<Mutex<HashSet<u32>>> =
@@ -650,6 +676,8 @@ pub(crate) fn replace_range(
     // from the snapshot length when the suggestion is longer/shorter).
     let expected_window = replaced_text(&snap.text, &range, new_text);
     let expected_len_utf16 = utf16_len(&expected_window);
+    let new_len_utf16 = utf16_len(new_text);
+    let caret_target_utf16 = start.saturating_add(new_len_utf16);
     if selected_error != AXError::Success {
         if !covers_whole_field(snap) {
             return Err(format!(
@@ -673,6 +701,50 @@ pub(crate) fn replace_range(
                 value_error.0
             ));
         }
+        move_caret_to(element, caret_target_utf16);
+    } else {
+        // The set reported Success but some apps (e.g. Chrome) ignore it:
+        // verify, and fall back to the whole-field write when the text is
+        // unchanged and the snapshot covers the whole field.
+        match read_at(&snap.handle, snap, expected_len_utf16) {
+            Ok(actual) if actual == expected_window => return Ok(()),
+            Ok(actual) if !selected_write_ignored(&actual, &snap.text, &expected_window) => {
+                return Err(format!(
+                    "{name} didn't accept the replacement text (AXError {}).",
+                    AXError::Failure.0
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.starts_with("The focused app didn't respond") => {
+                return Err(error);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{name} didn't accept the replacement text ({error})."
+                ));
+            }
+        }
+        if !covers_whole_field(snap) {
+            return Err(format!(
+                "{name} didn't accept the replacement text. Select a shorter part of the text, or copy the suggestion by hand."
+            ));
+        }
+        eprintln!(
+            "Writely: setting AXSelectedText was ignored (the text is unchanged); replaced the whole field text instead."
+        );
+        let whole_cf = CFString::from_str(&expected_window);
+        let whole_type: &CFType = &whole_cf;
+        let value_error = set_attr(element, "AXValue", whole_type);
+        if value_error == AXError::CannotComplete {
+            return Err(timeout_error(value_error));
+        }
+        if value_error != AXError::Success {
+            return Err(format!(
+                "{name} didn't accept the replacement text (AXError {}).",
+                value_error.0
+            ));
+        }
+        move_caret_to(element, caret_target_utf16);
     }
 
     match read_at(&snap.handle, snap, expected_len_utf16) {
@@ -708,7 +780,7 @@ pub(crate) fn read_at(
 
 #[cfg(test)]
 mod tests {
-    use super::{read_error, timeout_error};
+    use super::{read_error, selected_write_ignored, timeout_error};
     use objc2_application_services::AXError;
 
     #[test]
@@ -724,5 +796,17 @@ mod tests {
             read_error(AXError::Failure),
             "Could not read the focused text field: AXError -25200"
         );
+    }
+
+    #[test]
+    fn selected_write_outcome_distinguishes_ignored_from_mismatch() {
+        // Unchanged text that isn't the expected text: the app ignored it.
+        assert!(selected_write_ignored("old", "old", "new"));
+        // Accepted: actual already equals the expected text.
+        assert!(!selected_write_ignored("new", "old", "new"));
+        // Changed to something else: a mismatch, not a silent ignore.
+        assert!(!selected_write_ignored("other", "old", "new"));
+        // Identical snapshot and expectation: nothing to distinguish.
+        assert!(!selected_write_ignored("same", "same", "same"));
     }
 }
