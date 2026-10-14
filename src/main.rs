@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod autostart;
+mod check_text;
 #[cfg(target_os = "macos")]
 mod clipboard;
 mod config;
