@@ -38,13 +38,6 @@ fn log_once(message: String) {
     }
 }
 
-pub fn is_wayland_without_x11() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var("GDK_BACKEND")
-            .map(|value| value != "x11")
-            .unwrap_or(true)
-}
-
 pub struct WatcherInner {
     _private: (),
 }

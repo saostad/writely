@@ -5,7 +5,10 @@
 //! `docs/linux-ime-bridge.md`. Runs on its own thread via the zbus blocking
 //! API, so the tao event loop never blocks.
 
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex, MutexGuard, OnceLock,
+};
 use std::time::{Duration, Instant};
 
 use tao::event_loop::EventLoopProxy;
@@ -17,7 +20,7 @@ use zbus::DBusError;
 
 use crate::UserEvent;
 
-use super::{BridgeState, FocusedText, ReplaceWait};
+use super::{BridgeState, ClickAction, FocusedText, ReplaceWait};
 
 const WELL_KNOWN_NAME: &str = "dev.writely.Writely";
 const OBJECT_PATH: &str = "/dev/writely/ImeBridge";
@@ -40,6 +43,7 @@ struct Shared {
     proxy: EventLoopProxy<UserEvent>,
     replace_wait: Mutex<ReplaceWait>,
     replace_cv: Condvar,
+    bridge_connected: AtomicBool,
 }
 
 /// What the focused context looks like, for change detection.
@@ -89,8 +93,19 @@ impl ImeBridge {
         let sender = sender_of(&header);
         let mut state = lock(&self.shared.state);
         let (version, message) = state.hello(&sender, bridge, bridge_version);
+        let first_from_sender = message.is_some();
         if let Some(message) = message {
             eprintln!("Writely: {message}");
+        }
+        drop(state);
+        // Once, on the first Hello from any bridge, tell the event loop to
+        // clear the waiting-for-add-on state.
+        if first_from_sender && !self.shared.bridge_connected.swap(true, Ordering::SeqCst) {
+            if let Err(error) = self.shared.proxy.send_event(UserEvent::BridgeConnected {
+                bridge: bridge.to_string(),
+            }) {
+                eprintln!("Writely: could not deliver the bridge event: {error}");
+            }
         }
         version
     }
@@ -143,14 +158,28 @@ impl ImeBridge {
         action: &str,
     ) -> Result<(), BridgeError> {
         let sender = sender_of(&header);
-        {
+        let validated = {
             let state = lock(&self.shared.state);
-            if let Err(message) = state.clicked(&sender, context, action) {
-                eprintln!("Writely: {message}");
-                return Err(BridgeError::InvalidArgument(message));
+            match state.clicked(&sender, context, action) {
+                Ok(validated) => validated,
+                Err(message) => {
+                    eprintln!("Writely: {message}");
+                    return Err(BridgeError::InvalidArgument(message));
+                }
             }
+        };
+        // Linux has no Cancel button; Cancel only hides, which bridge-mode
+        // popup::hide() does by emitting Hide. Dismiss takes the same path
+        // macOS Cancel uses: CaretChanged hides the popup, bumps the
+        // generation and clears the in-flight state.
+        let event = match validated {
+            ClickAction::Check => UserEvent::IconClicked,
+            ClickAction::Apply => UserEvent::ReplaceClicked,
+            ClickAction::Dismiss => UserEvent::CaretChanged,
+        };
+        if let Err(error) = self.shared.proxy.send_event(event) {
+            eprintln!("Writely: could not deliver the bridge click event: {error}");
         }
-        // Round 2 item 3 dispatches the action to the event loop.
         eprintln!("Writely: input method bridge Clicked {action} for context \"{context}\".");
         Ok(())
     }
@@ -210,14 +239,10 @@ where
     }
 }
 
-// Used from round 2 wiring.
-#[allow(dead_code)]
 pub fn emit_show_icon(destination: &str, context: &str) {
     emit("ShowIcon", destination, &(context,));
 }
 
-// Used from round 2 wiring.
-#[allow(dead_code)]
 pub fn emit_show_message(
     destination: &str,
     context: &str,
@@ -232,8 +257,6 @@ pub fn emit_show_message(
     );
 }
 
-// Used from round 2 wiring.
-#[allow(dead_code)]
 pub fn emit_hide(destination: &str, context: &str) {
     emit("Hide", destination, &(context,));
 }
@@ -354,6 +377,7 @@ fn serve(proxy: EventLoopProxy<UserEvent>) {
         proxy,
         replace_wait: Mutex::new(ReplaceWait::new()),
         replace_cv: Condvar::new(),
+        bridge_connected: AtomicBool::new(false),
     });
     if let Err(error) = connection.object_server().at(
         OBJECT_PATH,

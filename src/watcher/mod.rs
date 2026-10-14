@@ -61,16 +61,3 @@ impl Watcher {
         {}
     }
 }
-
-#[cfg(target_os = "linux")]
-pub fn is_wayland_without_x11() -> bool {
-    linux::is_wayland_without_x11()
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn is_wayland_without_x11() -> bool {
-    false
-}
-
-pub const WAYLAND_MESSAGE: &str =
-    "Writely can't follow the text cursor on Wayland. Log in with an X11 session to use it.";

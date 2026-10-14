@@ -31,6 +31,10 @@ pub enum UserEvent {
     HotkeyPressed,
     ReplaceClicked,
     PermissionGranted,
+    #[cfg(target_os = "linux")]
+    BridgeConnected {
+        bridge: String,
+    },
     #[cfg(target_os = "macos")]
     CopiedText {
         generation: u64,
@@ -855,11 +859,16 @@ fn main() {
                     }
                 }
 
-                if watcher::is_wayland_without_x11() {
-                    eprintln!("Writely: {}", watcher::WAYLAND_MESSAGE);
-                    settings::set_permission_message(Some(watcher::WAYLAND_MESSAGE.to_string()));
+                #[cfg(target_os = "linux")]
+                let bridge_mode = text_access::uses_ime_bridge();
+                #[cfg(not(target_os = "linux"))]
+                let bridge_mode = false;
+                if bridge_mode {
+                    const WAITING: &str = "Writely is waiting for its input method add-on (IBus or fcitx5). Until it is installed and running, Writely can't see what you type.";
+                    eprintln!("Writely: {WAITING}");
+                    settings::set_permission_message(Some(WAITING.to_string()));
                     if let Some(tray) = &tray_icon {
-                        if let Err(error) = tray.set_tooltip(Some(watcher::WAYLAND_MESSAGE)) {
+                        if let Err(error) = tray.set_tooltip(Some(WAITING)) {
                             eprintln!("Writely: could not update the tray tooltip: {error}");
                         }
                     }
@@ -893,8 +902,15 @@ fn main() {
                 if event.id == settings_id {
                     popup::hide();
                     // A stale permission message (e.g. granted after startup)
-                    // is cleared here so Settings opens fresh.
-                    if text_access::check_permission(false).is_ok()
+                    // is cleared here so Settings opens fresh. Skipped in
+                    // bridge mode: the watcher stays off and only the first
+                    // Hello clears the waiting-for-add-on message.
+                    #[cfg(target_os = "linux")]
+                    let in_bridge_mode = text_access::uses_ime_bridge();
+                    #[cfg(not(target_os = "linux"))]
+                    let in_bridge_mode = false;
+                    if !in_bridge_mode
+                        && text_access::check_permission(false).is_ok()
                         && caret_watcher.is_none()
                     {
                         handle_permission_granted(
@@ -967,6 +983,17 @@ fn main() {
             }
             Event::UserEvent(UserEvent::PermissionGranted) => {
                 handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon);
+            }
+            #[cfg(target_os = "linux")]
+            Event::UserEvent(UserEvent::BridgeConnected { .. }) => {
+                // Hello already logged the connection; just clear the
+                // waiting-for-add-on state and restore the normal tooltip.
+                settings::set_permission_message(None);
+                if let Some(tray) = &tray_icon {
+                    if let Err(error) = tray.set_tooltip(Some("Writely")) {
+                        eprintln!("Writely: could not update the tray tooltip: {error}");
+                    }
+                }
             }
             #[cfg(target_os = "macos")]
             Event::UserEvent(UserEvent::CopiedText {

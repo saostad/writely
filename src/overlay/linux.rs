@@ -20,6 +20,8 @@ struct IconState {
 
 thread_local! {
     static STATE: RefCell<Option<IconState>> = const { RefCell::new(None) };
+    // Bridge mode: the (sender, context) the icon is shown on, if any.
+    static SHOWN_ON: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
 }
 
 pub fn init(proxy: EventLoopProxy<UserEvent>) {
@@ -71,6 +73,16 @@ fn ensure_window() -> Option<Window> {
 }
 
 pub fn show_at(rect: &CaretRect) {
+    if crate::text_access::uses_ime_bridge() {
+        // No GTK window in bridge mode: the input method places its panel.
+        let Some((sender, context, _)) = crate::ime_bridge::focused_snapshot() else {
+            hide();
+            return;
+        };
+        crate::ime_bridge::emit_show_icon(&sender, &context);
+        SHOWN_ON.with(|shown| *shown.borrow_mut() = Some((sender, context)));
+        return;
+    }
     // An all-zero box means the app gave no screen position (native Wayland
     // apps); hide rather than park the icon in the screen's top-left corner.
     if rect.x == 0.0 && rect.y == 0.0 && rect.width == 0.0 && rect.height == 0.0 {
@@ -97,6 +109,14 @@ pub fn show_at(rect: &CaretRect) {
 }
 
 pub fn hide() {
+    if crate::text_access::uses_ime_bridge() {
+        SHOWN_ON.with(|shown| {
+            if let Some((sender, context)) = shown.borrow_mut().take() {
+                crate::ime_bridge::emit_hide(&sender, &context);
+            }
+        });
+        return;
+    }
     STATE.with(|state| {
         if let Some(icon) = state.borrow().as_ref() {
             icon.window.hide();
