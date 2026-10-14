@@ -27,8 +27,8 @@ service side; bridges call its methods and listen to its signals.
 A context is one text field the bridge is tracking, identified by the pair
 (D-Bus unique sender name of the bridge, `context` string). Two bridges may
 reuse the same `context` string; they never collide because the sender name
-is part of the key. A context exists from its first `FocusIn` until its
-bridge disappears from the bus.
+is part of the key. A context exists from its first `FocusIn` until
+`Destroy` or until its bridge disappears from the bus.
 
 All offsets (`cursor`, `anchor`, `start`, `end`) are counts of Unicode scalar
 values (Rust `char`s) into the `text` of the latest `SurroundingText` for
@@ -56,20 +56,10 @@ This context now has keyboard focus, replacing any previous focus from any
 bridge. `program` is the focused app's name and may be empty. `password` is
 true for password fields, which Writely never reads.
 
-```sh
-busctl --user call dev.writely.Writely /dev/writely/ImeBridge \
-  dev.writely.ImeBridge1 FocusIn ssb ctx1 gedit false
-```
-
 ### `FocusOut(context: s)`
 
 Clears focus, but only if this (sender, context) is the focused one;
 otherwise it is a no-op.
-
-```sh
-busctl --user call dev.writely.Writely /dev/writely/ImeBridge \
-  dev.writely.ImeBridge1 FocusOut s ctx1
-```
 
 ### `SurroundingText(context: s, text: s, cursor: u, anchor: u)`
 
@@ -77,30 +67,21 @@ Stores the text around the cursor for a context that had `FocusIn`.
 `cursor` is the caret offset; `anchor` is the other end of the selection,
 or equal to `cursor` when there is none.
 
-```sh
-busctl --user call dev.writely.Writely /dev/writely/ImeBridge \
-  dev.writely.ImeBridge1 SurroundingText ssuu ctx1 'hello world' 5 5
-```
-
 ### `Clicked(context: s, action: s)`
 
 The user clicked something in the input panel. `action` is one of `check`,
 `apply`, `dismiss`.
 
-```sh
-busctl --user call dev.writely.Writely /dev/writely/ImeBridge \
-  dev.writely.ImeBridge1 Clicked ss ctx1 check
-```
+### `Destroy(context: s)`
+
+The bridge's input context is gone; Writely drops it and clears focus if it
+was focused. An unknown context is not an error (no-op), because bridges
+may destroy contexts that never reached `FocusIn`.
 
 ### `ReplaceResult(context: s, request: u, ok: b, error: s)`
 
 Answer to a `Replace` signal: whether replacing `request` worked, with a
 human-readable `error` when it didn't.
-
-```sh
-busctl --user call dev.writely.Writely /dev/writely/ImeBridge \
-  dev.writely.ImeBridge1 ReplaceResult subs ctx1 1 true ''
-```
 
 ## Signals (Writely emits these)
 
@@ -121,6 +102,29 @@ Watch them with e.g.:
 ```sh
 busctl --user monitor dev.writely.Writely
 ```
+
+## Trying it without a bridge
+
+Each `busctl call` is a new D-Bus connection, and contexts are keyed by the
+caller's unique name, so a `FocusIn` from one `busctl` call is unknown to the
+next. Use `scripts/fake-ime-bridge.py` instead: it keeps one connection,
+sends `Hello`, `FocusIn` and `SurroundingText`, prints the signals Writely
+emits, and answers `Replace`. It needs python3 with PyGObject (`gi`), which
+ships on Ubuntu and Arch.
+
+```sh
+./scripts/fake-ime-bridge.py
+./scripts/fake-ime-bridge.py 'Yesterday I goes to the store.' --click-check --apply
+./scripts/fake-ime-bridge.py --timeout 10
+```
+
+The first positional argument is the surrounding text (default
+`"Yesterday I goes to the store."`). `--click-check` sends `Clicked check`
+once after the first `ShowIcon`; `--apply` sends `Clicked apply` once after
+a `ShowMessage` with `can_apply=True`. On `Replace` the script applies the
+range to its own text, sends `ReplaceResult(ok=true)` and a fresh
+`SurroundingText`. After `--timeout N` seconds (default 30) it sends
+`Destroy` and exits 0.
 
 ## Errors
 

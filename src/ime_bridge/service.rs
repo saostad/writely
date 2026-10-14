@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use tao::event_loop::EventLoopProxy;
 use zbus::blocking::{fdo::DBusProxy, Connection};
+use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::message::Header;
 use zbus::names::{BusName, UniqueName};
 use zbus::DBusError;
@@ -175,6 +176,14 @@ impl ImeBridge {
         Ok(())
     }
 
+    fn destroy(&self, #[zbus(header)] header: Header<'_>, context: &str) {
+        let sender = sender_of(&header);
+        let mut state = lock(&self.shared.state);
+        let before = fingerprint(&state);
+        state.destroy(&sender, context);
+        notify_if_changed(&self.shared.proxy, &state, &before);
+    }
+
     fn replace_result(
         &self,
         #[zbus(header)] header: Header<'_>,
@@ -316,15 +325,29 @@ fn serve(proxy: EventLoopProxy<UserEvent>) {
             return;
         }
     };
-    if let Err(error) = connection.request_name(WELL_KNOWN_NAME) {
-        let detail = match error {
-            zbus::Error::NameTaken => {
-                format!("the name {WELL_KNOWN_NAME} is already taken (is another Writely running?)")
-            }
-            other => other.to_string(),
-        };
-        eprintln!("Writely: could not start the input method bridge on D-Bus: {detail}");
-        return;
+    // DoNotQueue: a second Writely must fail fast instead of queuing for
+    // the name and believing it is serving.
+    match connection.request_name_with_flags(WELL_KNOWN_NAME, RequestNameFlags::DoNotQueue.into()) {
+        Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => {}
+        Ok(_) => {
+            eprintln!(
+                "Writely: could not start the input method bridge on D-Bus: \
+                 the name {WELL_KNOWN_NAME} is already taken (is another Writely running?)"
+            );
+            return;
+        }
+        Err(error) => {
+            let detail = match error {
+                zbus::Error::NameTaken => {
+                    format!(
+                        "the name {WELL_KNOWN_NAME} is already taken (is another Writely running?)"
+                    )
+                }
+                other => other.to_string(),
+            };
+            eprintln!("Writely: could not start the input method bridge on D-Bus: {detail}");
+            return;
+        }
     }
     // The local `connection` stays alive for the `names` iterator below.
     if CONNECTION.set(connection.clone()).is_err() {

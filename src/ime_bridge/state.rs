@@ -188,6 +188,16 @@ impl BridgeState {
         Ok(())
     }
 
+    /// Drops one context. Unknown contexts are a no-op, because bridges
+    /// may destroy contexts that never reached `FocusIn`.
+    pub fn destroy(&mut self, sender: &str, context: &str) {
+        let key = (sender.to_string(), context.to_string());
+        self.contexts.remove(&key);
+        if self.focused.as_ref() == Some(&key) {
+            self.focused = None;
+        }
+    }
+
     /// Drops every context owned by a bridge that left the bus, and clears
     /// focus if it owned the focused one.
     pub fn sender_vanished(&mut self, sender: &str) {
@@ -439,6 +449,31 @@ mod tests {
         assert_eq!(state.next_request(), 1);
         assert_eq!(state.next_request(), 2);
         assert_eq!(state.next_request(), 3);
+    }
+
+    #[test]
+    fn destroy_clears_focus_only_for_that_context() {
+        let mut state = focused_with_text();
+        // Unknown context is a no-op: focus and text survive.
+        state.destroy(A, "nope");
+        state.destroy(B, "ctx");
+        assert_eq!(state.focused_key(), Some((A, "ctx")));
+        assert!(state.focused_text().is_some());
+        // Another sender's same-named context survives.
+        state.focus_in(B, "ctx", "firefox", false);
+        state.surrounding_text(B, "ctx", "bbb", 3, 3).unwrap();
+        state.focus_in(A, "ctx", "gedit", false);
+        state.destroy(B, "ctx");
+        assert_eq!(state.focused_key(), Some((A, "ctx")));
+        assert_eq!(state.focused_text().unwrap().text, "hello");
+        assert_eq!(
+            state.surrounding_text(B, "ctx", "x", 1, 1),
+            Err("SurroundingText: unknown context \"ctx\"; call FocusIn first.".to_string())
+        );
+        // Destroying the focused context clears focus.
+        state.destroy(A, "ctx");
+        assert_eq!(state.focused_key(), None);
+        assert_eq!(state.focused_text(), None);
     }
 
     #[test]
