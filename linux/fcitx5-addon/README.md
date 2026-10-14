@@ -49,3 +49,7 @@ sudo make -C linux/fcitx5-addon install
 - Shows Writely's "W" icon and suggestion messages in fcitx5's input panel at
   the cursor, without touching another engine's panel content, and applies
   accepted fixes via surrounding-text deletion.
+- For apps that don't share their text (e.g. Chromium), reports
+  `TextUnavailable` and falls back to selecting the line with `Shift+Home`
+  and reading it through the PRIMARY selection (the clipboard is untouched);
+  accepted fixes are committed over the still-active selection.

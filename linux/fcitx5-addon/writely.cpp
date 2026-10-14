@@ -2,9 +2,13 @@
 #include "writely.h"
 
 #include <cstdint>
+#include <ctime>
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/dbus/matchrule.h>
+#include <fcitx-utils/event.h>
+#include <fcitx-utils/key.h>
 #include <fcitx-utils/log.h>
+#include <fcitx-module/clipboard/clipboard_public.h>
 #include <fcitx-module/dbus/dbus_public.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addonmanager.h>
@@ -25,6 +29,12 @@ constexpr const char *kBridgeName = "fcitx5";
 constexpr const char *kAddonVersion = "0.1.0";
 // Timeout for async D-Bus calls, in microseconds.
 constexpr uint64_t kCallTimeoutUsec = 5000000;
+// Delay after FocusIn before reporting missing surrounding text, giving
+// the app time to send it. In microseconds.
+constexpr uint64_t kUnavailableDelayUsec = 300000;
+// Delay after forwarding Shift+Home before reading back the PRIMARY
+// selection. In microseconds.
+constexpr uint64_t kSelectReadDelayUsec = 150000;
 
 bool hasSurroundingText(const fcitx::InputContext *ic) {
     return ic->capabilityFlags().test(fcitx::CapabilityFlag::SurroundingText);
@@ -113,6 +123,9 @@ void Writely::onWritelyAppeared() {
 void Writely::onWritelyDisappeared() {
     writelyAvailable_ = false;
     announced_.clear();
+    unavailableTimers_.clear();
+    selectTimers_.clear();
+    selectedText_.clear();
     // Drop pending panel state; clicking a stale candidate would send Clicked
     // to nobody.
     instance_->inputContextManager().foreach([this](fcitx::InputContext *ic) {
@@ -135,6 +148,7 @@ void Writely::onFocusOut(fcitx::InputContext *ic) {
     if (hasFocused_ && ic->uuid() == focusedUuid_) {
         hasFocused_ = false;
     }
+    unavailableTimers_.erase(contextId(ic));
     if (!bus_) {
         return;
     }
@@ -155,6 +169,9 @@ void Writely::onDestroyed(fcitx::InputContext *ic) {
     }
     announced_.erase(ctx);
     shown_.erase(ctx);
+    unavailableTimers_.erase(ctx);
+    selectTimers_.erase(ctx);
+    selectedText_.erase(ctx);
     if (bus_) {
         fcitx::dbus::Message msg =
             bus_->createMethodCall(kBusName, kObjectPath, kInterface, "Destroy");
@@ -181,7 +198,62 @@ void Writely::announceFocus(fcitx::InputContext *ic) {
         }
         return;
     }
-    maybeSendSurroundingText(ic);
+    if (ic->surroundingText().isValid()) {
+        maybeSendSurroundingText(ic);
+    } else {
+        // The app may still send its text; report it missing only if it
+        // hasn't arrived after a short delay.
+        scheduleUnavailableTimer(ic);
+    }
+}
+
+bool Writely::clipboardAvailable() {
+    return instance_->addonManager().addon("clipboard") != nullptr;
+}
+
+void Writely::scheduleUnavailableTimer(fcitx::InputContext *ic) {
+    const std::string ctx = contextId(ic);
+    const fcitx::ICUUID uuid = ic->uuid();
+    auto timer = instance_->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC,
+        fcitx::now(CLOCK_MONOTONIC) + kUnavailableDelayUsec, 0,
+        [this, ctx, uuid](fcitx::EventSourceTime *, uint64_t) {
+            const fcitx::InputContext *current =
+                instance_->inputContextManager().findByUUID(uuid);
+            if (!current || !announced_.count(ctx) || !hasFocused_ ||
+                current->uuid() != focusedUuid_) {
+                return true;
+            }
+            if (hasSurroundingText(current) &&
+                current->surroundingText().isValid()) {
+                return true;
+            }
+            sendTextUnavailable(ctx, clipboardAvailable());
+            return true;
+        });
+    timer->setOneShot();
+    unavailableTimers_[ctx] = std::move(timer);
+}
+
+void Writely::sendTextUnavailable(const std::string &ctx, bool canSelect) {
+    if (!bus_) {
+        return;
+    }
+    fcitx::dbus::Message msg = bus_->createMethodCall(
+        kBusName, kObjectPath, kInterface, "TextUnavailable");
+    msg << ctx << canSelect;
+    send(std::move(msg), "TextUnavailable");
+}
+
+void Writely::sendSelected(const std::string &ctx, uint32_t request, bool ok,
+                           const std::string &text, const std::string &error) {
+    if (!bus_) {
+        return;
+    }
+    fcitx::dbus::Message msg = bus_->createMethodCall(
+        kBusName, kObjectPath, kInterface, "Selected");
+    msg << ctx << request << ok << text << error;
+    send(std::move(msg), "Selected");
 }
 
 void Writely::maybeSendSurroundingText(fcitx::InputContext *ic) {
@@ -201,6 +273,7 @@ void Writely::maybeSendSurroundingText(fcitx::InputContext *ic) {
     if (!surr.isValid()) {
         return;
     }
+    unavailableTimers_.erase(ctx);
     fcitx::dbus::Message msg = bus_->createMethodCall(
         kBusName, kObjectPath, kInterface, "SurroundingText");
     msg << ctx << surr.text() << surr.cursor() << surr.anchor();
@@ -280,7 +353,8 @@ fcitx::InputContext *Writely::findContext(const std::string &ctx) {
 bool Writely::onSignal(fcitx::dbus::Message &msg) {
     const std::string member = msg.member();
     if (member != "ShowIcon" && member != "ShowMessage" && member != "Hide" &&
-        member != "Replace") {
+        member != "Replace" && member != "SelectRequest" &&
+        member != "ReplaceSelection") {
         return true;
     }
     std::string ctx;
@@ -317,6 +391,25 @@ bool Writely::onSignal(fcitx::dbus::Message &msg) {
             return true;
         }
         onReplace(ctx, request, start, end, text);
+    } else if (member == "SelectRequest") {
+        uint32_t request = 0;
+        msg >> request;
+        if (!msg) {
+            FCITX_WARN() << "Writely: ignoring a malformed SelectRequest "
+                            "signal from Writely.";
+            return true;
+        }
+        onSelectRequest(ctx, request);
+    } else if (member == "ReplaceSelection") {
+        uint32_t request = 0;
+        std::string text;
+        msg >> request >> text;
+        if (!msg) {
+            FCITX_WARN() << "Writely: ignoring a malformed ReplaceSelection "
+                            "signal from Writely.";
+            return true;
+        }
+        onReplaceSelection(ctx, request, text);
     }
     return true;
 }
@@ -436,6 +529,118 @@ void Writely::onReplace(const std::string &ctx, uint32_t request,
         ic->deleteSurroundingText(static_cast<int>(start) -
                                       static_cast<int>(cursor),
                                   end - start);
+        ic->commitString(text);
+    } catch (const std::exception &e) {
+        sendReplaceResult(ctx, request, false, e.what());
+        return;
+    } catch (...) {
+        sendReplaceResult(ctx, request, false,
+                          "unknown error while replacing the text");
+        return;
+    }
+    sendReplaceResult(ctx, request, true, "");
+    if (hideWritelyPanel(ic, ctx)) {
+        ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+    }
+}
+
+void Writely::onSelectRequest(const std::string &ctx, uint32_t request) {
+    fcitx::InputContext *ic = findContext(ctx);
+    if (!ic || !hasFocused_ || ic->uuid() != focusedUuid_) {
+        sendSelected(ctx, request, false, "",
+                     "the text field is no longer focused");
+        return;
+    }
+    if (!clipboardAvailable()) {
+        sendSelected(ctx, request, false, "",
+                     "the fcitx5 clipboard add-on is not available");
+        return;
+    }
+    try {
+        const fcitx::Key shiftHome("Shift+Home");
+        ic->forwardKey(shiftHome, false);
+        ic->forwardKey(shiftHome, true);
+    } catch (const std::exception &e) {
+        sendSelected(ctx, request, false, "", e.what());
+        return;
+    } catch (...) {
+        sendSelected(ctx, request, false, "",
+                     "unknown error while selecting the text");
+        return;
+    }
+    // Selecting sets the PRIMARY selection on Linux, so reading it back
+    // never touches the user's clipboard.
+    const fcitx::ICUUID uuid = ic->uuid();
+    auto timer = instance_->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC,
+        fcitx::now(CLOCK_MONOTONIC) + kSelectReadDelayUsec, 0,
+        [this, ctx, uuid, request](fcitx::EventSourceTime *, uint64_t) {
+            fcitx::InputContext *current =
+                instance_->inputContextManager().findByUUID(uuid);
+            if (!current || !hasFocused_ || current->uuid() != focusedUuid_) {
+                sendSelected(ctx, request, false, "",
+                             "the text field is no longer focused");
+                return true;
+            }
+            fcitx::AddonInstance *clipboard =
+                instance_->addonManager().addon("clipboard");
+            if (!clipboard) {
+                sendSelected(ctx, request, false, "",
+                             "the fcitx5 clipboard add-on is not available");
+                return true;
+            }
+            try {
+                const std::string text =
+                    clipboard->call<fcitx::IClipboard::primary>(current);
+                selectedText_[ctx] = text;
+                sendSelected(ctx, request, true, text, "");
+            } catch (const std::exception &e) {
+                sendSelected(ctx, request, false, "", e.what());
+            } catch (...) {
+                sendSelected(ctx, request, false, "",
+                             "unknown error while reading the selection");
+            }
+            return true;
+        });
+    timer->setOneShot();
+    selectTimers_[ctx] = std::move(timer);
+}
+
+void Writely::onReplaceSelection(const std::string &ctx, uint32_t request,
+                                 const std::string &text) {
+    fcitx::InputContext *ic = findContext(ctx);
+    if (!ic) {
+        sendReplaceResult(ctx, request, false, "the text field is gone");
+        return;
+    }
+    fcitx::AddonInstance *clipboard =
+        instance_->addonManager().addon("clipboard");
+    if (!clipboard) {
+        sendReplaceResult(ctx, request, false,
+                          "the fcitx5 clipboard add-on is not available");
+        return;
+    }
+    std::string current;
+    try {
+        current = clipboard->call<fcitx::IClipboard::primary>(ic);
+    } catch (const std::exception &e) {
+        sendReplaceResult(ctx, request, false, e.what());
+        return;
+    } catch (...) {
+        sendReplaceResult(ctx, request, false,
+                          "unknown error while reading the selection");
+        return;
+    }
+    const auto remembered = selectedText_.find(ctx);
+    if (remembered == selectedText_.end() || current != remembered->second) {
+        sendReplaceResult(ctx, request, false,
+                          "the selection changed since Writely checked it; "
+                          "click W again");
+        return;
+    }
+    selectedText_.erase(ctx);
+    try {
+        // Committing over the still-active selection replaces it.
         ic->commitString(text);
     } catch (const std::exception &e) {
         sendReplaceResult(ctx, request, false, e.what());

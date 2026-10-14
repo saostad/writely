@@ -14,6 +14,7 @@
 #include <fcitx-utils/dbus/bus.h>
 #include <fcitx-utils/dbus/message.h>
 #include <fcitx-utils/dbus/servicewatcher.h>
+#include <fcitx-utils/eventloopinterface.h>
 #include <fcitx-utils/handlertable.h>
 #include <fcitx/addoninstance.h>
 #include <fcitx/candidatelist.h>
@@ -59,8 +60,18 @@ private:
     void onHide(const std::string &ctx);
     void onReplace(const std::string &ctx, uint32_t request, uint32_t start,
                    uint32_t end, const std::string &text);
+    void onSelectRequest(const std::string &ctx, uint32_t request);
+    void onReplaceSelection(const std::string &ctx, uint32_t request,
+                            const std::string &text);
     void sendReplaceResult(const std::string &ctx, uint32_t request, bool ok,
                            const std::string &error);
+    void sendSelected(const std::string &ctx, uint32_t request, bool ok,
+                      const std::string &text, const std::string &error);
+    void sendTextUnavailable(const std::string &ctx, bool canSelect);
+
+    // Select fallback for apps without surrounding text.
+    void scheduleUnavailableTimer(fcitx::InputContext *ic);
+    bool clipboardAvailable();
     // The user clicked one of Writely's candidates.
     void sendClicked(fcitx::InputContext *ic, const std::string &action);
 
@@ -90,6 +101,15 @@ private:
         std::string auxText;
     };
     std::map<std::string, ShownPanel> shown_;
+    // Pending one-shot timers per context id: the TextUnavailable delay
+    // after FocusIn, and the select read-back delay after Shift+Home.
+    // Fired timers stay in the map, disabled, until replaced or erased.
+    std::map<std::string, std::unique_ptr<fcitx::EventSourceTime>>
+        unavailableTimers_;
+    std::map<std::string, std::unique_ptr<fcitx::EventSourceTime>>
+        selectTimers_;
+    // Text reported by Selected per context, for the ReplaceSelection check.
+    std::map<std::string, std::string> selectedText_;
     // Programs already warned about missing surrounding-text support.
     std::set<std::string> warnedPrograms_;
     fcitx::ICUUID focusedUuid_{};
