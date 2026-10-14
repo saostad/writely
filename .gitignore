@@ -1,4 +1,2 @@
 /target
 /dist
-linux/fcitx5-addon/*.o
-linux/fcitx5-addon/*.so

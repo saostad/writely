@@ -39,9 +39,3 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
-      - name: Build fcitx5 add-on
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfcitx5core-dev libfcitx5config-dev libfcitx5utils-dev fcitx5-modules-dev
-          make -C linux/fcitx5-addon
