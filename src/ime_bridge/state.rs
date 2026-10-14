@@ -56,11 +56,76 @@ struct ContextData {
 pub struct BridgeState {
     contexts: HashMap<ContextKey, ContextData>,
     focused: Option<ContextKey>,
-    // Used from round 2 wiring.
-    #[allow(dead_code)]
     next_replace_id: u32,
     /// Senders that already got their `Hello` log line.
     hello_logged: HashSet<String>,
+}
+
+/// One in-flight `Replace` and its answer. Results for any other
+/// (sender, context, request) triple are ignored.
+pub struct ReplaceWait {
+    pending: Option<(String, String, u32)>,
+    result: Option<(bool, String)>,
+}
+
+impl ReplaceWait {
+    pub fn new() -> Self {
+        Self {
+            pending: None,
+            result: None,
+        }
+    }
+
+    /// Marks a `Replace` as in flight, dropping any previous answer.
+    pub fn begin(&mut self, sender: &str, context: &str, request: u32) {
+        self.pending = Some((sender.to_string(), context.to_string(), request));
+        self.result = None;
+    }
+
+    /// Stores the result when it answers the pending request.
+    /// Returns true when stored; anything else is ignored.
+    pub fn insert(
+        &mut self,
+        sender: &str,
+        context: &str,
+        request: u32,
+        ok: bool,
+        error: &str,
+    ) -> bool {
+        let matches = self.pending.as_ref().is_some_and(
+            |(pending_sender, pending_context, pending_request)| {
+                pending_sender == sender
+                    && pending_context == context
+                    && *pending_request == request
+            },
+        );
+        if matches {
+            self.result = Some((ok, error.to_string()));
+        }
+        matches
+    }
+
+    /// Takes the stored answer, if any.
+    pub fn take(&mut self) -> Option<(bool, String)> {
+        self.result.take()
+    }
+
+    /// True when an answer is waiting to be taken.
+    pub fn has_result(&self) -> bool {
+        self.result.is_some()
+    }
+
+    /// Drops the pending request and any answer.
+    pub fn clear(&mut self) {
+        self.pending = None;
+        self.result = None;
+    }
+}
+
+impl Default for ReplaceWait {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BridgeState {
@@ -209,8 +274,6 @@ impl BridgeState {
     }
 
     /// Next `Replace` request id: 1, 2, 3, …
-    // Used from round 2 wiring.
-    #[allow(dead_code)]
     pub fn next_request(&mut self) -> u32 {
         let request = self.next_replace_id;
         self.next_replace_id = self.next_replace_id.wrapping_add(1).max(1);
@@ -244,6 +307,19 @@ impl BridgeState {
         self.focused
             .as_ref()
             .map(|key| (key.0.as_str(), key.1.as_str()))
+    }
+
+    /// The latest surrounding text for one context, if it exists and text
+    /// arrived. Used for stale-text detection and bridge-mode reads.
+    pub fn current_text(&self, sender: &str, context: &str) -> Option<String> {
+        let key = (sender.to_string(), context.to_string());
+        self.contexts.get(&key).and_then(|data| data.text.clone())
+    }
+
+    /// True when the (sender, context) pair still exists.
+    pub fn context_exists(&self, sender: &str, context: &str) -> bool {
+        let key = (sender.to_string(), context.to_string());
+        self.contexts.contains_key(&key)
     }
 }
 
@@ -474,6 +550,56 @@ mod tests {
         state.destroy(A, "ctx");
         assert_eq!(state.focused_key(), None);
         assert_eq!(state.focused_text(), None);
+    }
+
+    #[test]
+    fn current_text_tracks_latest_surrounding_text() {
+        let mut state = BridgeState::new();
+        assert_eq!(state.current_text(A, "ctx"), None);
+        assert!(!state.context_exists(A, "ctx"));
+        state.focus_in(A, "ctx", "gedit", false);
+        // No surrounding text yet.
+        assert_eq!(state.current_text(A, "ctx"), None);
+        assert!(state.context_exists(A, "ctx"));
+        state.surrounding_text(A, "ctx", "hello", 5, 5).unwrap();
+        assert_eq!(state.current_text(A, "ctx"), Some("hello".to_string()));
+        // Stale detection: a snapshot of "hello" no longer matches.
+        state.surrounding_text(A, "ctx", "hello!", 6, 6).unwrap();
+        assert_ne!(state.current_text(A, "ctx").as_deref(), Some("hello"));
+        // Per-sender: another sender's same-named context has its own text.
+        state.focus_in(B, "ctx", "firefox", false);
+        assert_eq!(state.current_text(B, "ctx"), None);
+        // Destroyed contexts have no text.
+        state.destroy(A, "ctx");
+        assert_eq!(state.current_text(A, "ctx"), None);
+        assert!(!state.context_exists(A, "ctx"));
+        assert!(state.context_exists(B, "ctx"));
+    }
+
+    #[test]
+    fn replace_wait_ignores_other_requests_and_senders() {
+        let mut wait = ReplaceWait::new();
+        // Nothing pending: everything is ignored.
+        assert!(!wait.insert(A, "ctx", 1, true, ""));
+        assert_eq!(wait.take(), None);
+        wait.begin(A, "ctx", 2);
+        // Other request id, other sender, other context: ignored.
+        assert!(!wait.insert(A, "ctx", 1, true, ""));
+        assert!(!wait.insert(A, "ctx", 3, true, ""));
+        assert!(!wait.insert(B, "ctx", 2, true, ""));
+        assert!(!wait.insert(A, "other", 2, true, ""));
+        assert!(!wait.has_result());
+        assert_eq!(wait.take(), None);
+        // The exact triple is stored.
+        assert!(wait.insert(A, "ctx", 2, false, "boom"));
+        assert!(wait.has_result());
+        assert_eq!(wait.take(), Some((false, "boom".to_string())));
+        assert_eq!(wait.take(), None);
+        // begin() drops any previous answer.
+        wait.begin(A, "ctx", 3);
+        assert_eq!(wait.take(), None);
+        wait.clear();
+        assert!(!wait.insert(A, "ctx", 3, true, ""));
     }
 
     #[test]

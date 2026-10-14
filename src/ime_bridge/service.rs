@@ -5,7 +5,8 @@
 //! `docs/linux-ime-bridge.md`. Runs on its own thread via the zbus blocking
 //! API, so the tao event loop never blocks.
 
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use tao::event_loop::EventLoopProxy;
 use zbus::blocking::{fdo::DBusProxy, Connection};
@@ -16,7 +17,7 @@ use zbus::DBusError;
 
 use crate::UserEvent;
 
-use super::{BridgeState, ClickAction, FocusedText};
+use super::{BridgeState, FocusedText, ReplaceWait};
 
 const WELL_KNOWN_NAME: &str = "dev.writely.Writely";
 const OBJECT_PATH: &str = "/dev/writely/ImeBridge";
@@ -25,35 +26,20 @@ const INTERFACE_NAME: &str = "dev.writely.ImeBridge1";
 /// The serving connection, for the `emit_*` unicast signals below.
 static CONNECTION: OnceLock<Connection> = OnceLock::new();
 
+/// The serving state, for bridge-mode reads from other threads.
+static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
+
 #[derive(Debug, DBusError)]
 #[zbus(prefix = "dev.writely.ImeBridge1.Error")]
 enum BridgeError {
     InvalidArgument(String),
 }
 
-/// A stored `Clicked` call, for round 2 wiring.
-#[allow(dead_code)]
-struct ClickedEvent {
-    sender: String,
-    context: String,
-    action: ClickAction,
-}
-
-/// A stored `ReplaceResult` call, for round 2 wiring.
-#[allow(dead_code)]
-struct ReplaceResultEvent {
-    sender: String,
-    context: String,
-    request: u32,
-    ok: bool,
-    error: String,
-}
-
 struct Shared {
     state: Mutex<BridgeState>,
     proxy: EventLoopProxy<UserEvent>,
-    clicked: Mutex<Vec<ClickedEvent>>,
-    replace_results: Mutex<Vec<ReplaceResultEvent>>,
+    replace_wait: Mutex<ReplaceWait>,
+    replace_cv: Condvar,
 }
 
 /// What the focused context looks like, for change detection.
@@ -157,21 +143,14 @@ impl ImeBridge {
         action: &str,
     ) -> Result<(), BridgeError> {
         let sender = sender_of(&header);
-        let validated = {
+        {
             let state = lock(&self.shared.state);
-            match state.clicked(&sender, context, action) {
-                Ok(validated) => validated,
-                Err(message) => {
-                    eprintln!("Writely: {message}");
-                    return Err(BridgeError::InvalidArgument(message));
-                }
+            if let Err(message) = state.clicked(&sender, context, action) {
+                eprintln!("Writely: {message}");
+                return Err(BridgeError::InvalidArgument(message));
             }
-        };
-        lock(&self.shared.clicked).push(ClickedEvent {
-            sender,
-            context: context.to_string(),
-            action: validated,
-        });
+        }
+        // Round 2 item 3 dispatches the action to the event loop.
         eprintln!("Writely: input method bridge Clicked {action} for context \"{context}\".");
         Ok(())
     }
@@ -182,6 +161,8 @@ impl ImeBridge {
         let before = fingerprint(&state);
         state.destroy(&sender, context);
         notify_if_changed(&self.shared.proxy, &state, &before);
+        // Wake any `Replace` waiter: the context may be gone.
+        self.shared.replace_cv.notify_all();
     }
 
     fn replace_result(
@@ -200,13 +181,11 @@ impl ImeBridge {
                 return Err(BridgeError::InvalidArgument(message));
             }
         }
-        lock(&self.shared.replace_results).push(ReplaceResultEvent {
-            sender,
-            context: context.to_string(),
-            request,
-            ok,
-            error: error.to_string(),
-        });
+        // Stored only when it answers the in-flight `Replace`; results for
+        // any other request, context or sender are ignored.
+        if lock(&self.shared.replace_wait).insert(&sender, context, request, ok, error) {
+            self.shared.replace_cv.notify_one();
+        }
         eprintln!(
             "Writely: input method bridge ReplaceResult for context \"{context}\" request {request}: ok={ok} error=\"{error}\"."
         );
@@ -259,8 +238,6 @@ pub fn emit_hide(destination: &str, context: &str) {
     emit("Hide", destination, &(context,));
 }
 
-// Used from round 2 wiring.
-#[allow(dead_code)]
 pub fn emit_replace(
     destination: &str,
     context: &str,
@@ -274,6 +251,84 @@ pub fn emit_replace(
         destination,
         &(context, request, start, end, text),
     );
+}
+
+fn shared() -> Option<Arc<Shared>> {
+    SHARED.get().cloned()
+}
+
+/// The focused bridge context and its text, for bridge-mode reads.
+/// `None` when nothing is focused, the field is a password, or no
+/// surrounding text arrived yet — or when the bridge isn't serving.
+pub(crate) fn focused_snapshot() -> Option<(String, String, FocusedText)> {
+    let shared = shared()?;
+    let state = lock(&shared.state);
+    let (sender, context) = state.focused_key()?;
+    let focused = state.focused_text()?;
+    Some((sender.to_string(), context.to_string(), focused))
+}
+
+/// The latest surrounding text for one context, if it exists.
+pub(crate) fn current_text(sender: &str, context: &str) -> Option<String> {
+    let shared = shared()?;
+    let state = lock(&shared.state);
+    state.current_text(sender, context)
+}
+
+fn closed_error() -> String {
+    "The input method closed the text field before the replacement finished.".to_string()
+}
+
+/// Emits `Replace` with the next request id and waits up to 3 seconds for
+/// the matching `ReplaceResult`. Never holds the state lock while waiting,
+/// and the service thread never waits on the caller, so this can't deadlock
+/// the event loop.
+pub(crate) fn replace_and_wait(
+    sender: &str,
+    context: &str,
+    start: u32,
+    end: u32,
+    text: &str,
+) -> Result<(), String> {
+    let shared = shared().ok_or_else(closed_error)?;
+    let request = lock(&shared.state).next_request();
+    // Mark the request pending before emitting, so a fast answer can't be
+    // missed between the emit and the wait.
+    lock(&shared.replace_wait).begin(sender, context, request);
+    emit_replace(sender, context, request, start, end, text);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some((ok, error)) = lock(&shared.replace_wait).take() {
+            lock(&shared.replace_wait).clear();
+            if ok {
+                return Ok(());
+            }
+            return Err(format!(
+                "The input method could not replace the text: {error}"
+            ));
+        }
+        if !lock(&shared.state).context_exists(sender, context) {
+            lock(&shared.replace_wait).clear();
+            return Err(closed_error());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            lock(&shared.replace_wait).clear();
+            return Err(
+                "The input method didn't confirm the replacement within 3 seconds.".to_string(),
+            );
+        }
+        let wait = lock(&shared.replace_wait);
+        // Re-check under the lock before sleeping: the answer may have
+        // landed between the take above and this lock.
+        if wait.has_result() {
+            continue;
+        }
+        let _ = shared
+            .replace_cv
+            .wait_timeout(wait, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
 }
 
 /// Starts the bridge on its own thread. Never blocks the caller.
@@ -297,8 +352,8 @@ fn serve(proxy: EventLoopProxy<UserEvent>) {
     let shared = Arc::new(Shared {
         state: Mutex::new(BridgeState::new()),
         proxy,
-        clicked: Mutex::new(Vec::new()),
-        replace_results: Mutex::new(Vec::new()),
+        replace_wait: Mutex::new(ReplaceWait::new()),
+        replace_cv: Condvar::new(),
     });
     if let Err(error) = connection.object_server().at(
         OBJECT_PATH,
@@ -353,6 +408,9 @@ fn serve(proxy: EventLoopProxy<UserEvent>) {
     if CONNECTION.set(connection.clone()).is_err() {
         // Keep the first connection installed for this process.
     }
+    if SHARED.set(shared.clone()).is_err() {
+        // Keep the first state installed for this process.
+    }
     for signal in names {
         let args = match signal.args() {
             Ok(args) => args,
@@ -372,6 +430,8 @@ fn serve(proxy: EventLoopProxy<UserEvent>) {
         let before = fingerprint(&state);
         state.sender_vanished(unique.as_str());
         notify_if_changed(&shared.proxy, &state, &before);
+        // Wake any `Replace` waiter: its context may be gone.
+        shared.replace_cv.notify_all();
     }
     eprintln!("Writely: the input method bridge lost its D-Bus connection.");
 }

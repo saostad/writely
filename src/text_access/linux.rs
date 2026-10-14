@@ -1,5 +1,5 @@
 use std::ops::Range;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::proxy_ext::ProxyExt;
@@ -39,8 +39,17 @@ fn take_focused() -> Option<ObjectRefOwned> {
     }
 }
 
-pub(crate) struct PlatformHandle {
-    object: ObjectRefOwned,
+/// The Linux backend, chosen once per process: the input method bridge
+/// on Wayland, AT-SPI otherwise.
+static IME_BRIDGE: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn uses_ime_bridge() -> bool {
+    *IME_BRIDGE.get_or_init(|| std::env::var_os("WAYLAND_DISPLAY").is_some())
+}
+
+pub(crate) enum PlatformHandle {
+    Atspi { object: ObjectRefOwned },
+    Bridge { sender: String, context: String },
 }
 
 fn read_error(error: impl std::fmt::Display) -> String {
@@ -193,14 +202,16 @@ async fn focused_field_async() -> Result<Option<FieldSnapshot>, String> {
         // whole field, so the whole-field write fallback stays allowed.
         window_start_utf16: 0,
         field_len_utf16,
-        handle: PlatformHandle { object },
+        handle: PlatformHandle::Atspi { object },
     }))
 }
 
 async fn read_text_async(handle: &PlatformHandle) -> Result<String, String> {
+    let PlatformHandle::Atspi { object } = handle else {
+        unreachable!("bridge handles never reach the AT-SPI path");
+    };
     let conn = AccessibilityConnection::new().await.map_err(read_error)?;
-    let element = handle
-        .object
+    let element = object
         .as_accessible_proxy(conn.connection())
         .await
         .map_err(read_error)?;
@@ -218,10 +229,11 @@ async fn replace_range_async(
     range: Range<usize>,
     new_text: &str,
 ) -> Result<(), String> {
+    let PlatformHandle::Atspi { object } = &snap.handle else {
+        unreachable!("bridge handles never reach the AT-SPI path");
+    };
     let conn = AccessibilityConnection::new().await.map_err(read_error)?;
-    let element = snap
-        .handle
-        .object
+    let element = object
         .as_accessible_proxy(conn.connection())
         .await
         .map_err(read_error)?;
@@ -270,11 +282,70 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
     }
 }
 
+fn focused_field_bridge() -> Result<Option<FieldSnapshot>, String> {
+    let Some((sender, context, focused)) = crate::ime_bridge::focused_snapshot() else {
+        return Ok(None);
+    };
+    Ok(Some(FieldSnapshot {
+        pid: 0,
+        text: focused.text.clone(),
+        caret: focused.caret,
+        caret_known: true,
+        // The bridge panel is placed by the input method, not by Writely.
+        caret_rect: CaretRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+            physical: false,
+        },
+        selection: focused.selection,
+        window_start_utf16: 0,
+        field_len_utf16: super::utf16_len(&focused.text),
+        handle: PlatformHandle::Bridge { sender, context },
+    }))
+}
+
+fn replace_range_bridge(
+    snap: &FieldSnapshot,
+    range: Range<usize>,
+    sender: &str,
+    context: &str,
+    new_text: &str,
+) -> Result<(), String> {
+    let Some(current) = crate::ime_bridge::current_text(sender, context) else {
+        return Err(
+            "The input method closed the text field before the replacement finished.".to_string(),
+        );
+    };
+    if current != snap.text {
+        return Err(
+            "The text changed since Writely checked it. Click W again to check the new text."
+                .to_string(),
+        );
+    }
+    // No re-read verification: the bridge's ok is the confirmation.
+    crate::ime_bridge::replace_and_wait(
+        sender,
+        context,
+        range.start as u32,
+        range.end as u32,
+        new_text,
+    )
+}
+
 pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
+    if uses_ime_bridge() {
+        return focused_field_bridge();
+    }
     pollster::block_on(focused_field_async())
 }
 
 pub(crate) fn read_text(handle: &PlatformHandle) -> Result<String, String> {
+    if let PlatformHandle::Bridge { sender, context } = handle {
+        return crate::ime_bridge::current_text(sender, context)
+            .ok_or_else(|| "The text field is no longer available.".to_string());
+    }
     pollster::block_on(read_text_async(handle))
 }
 
@@ -283,5 +354,8 @@ pub(crate) fn replace_range(
     range: Range<usize>,
     new_text: &str,
 ) -> Result<(), String> {
+    if let PlatformHandle::Bridge { sender, context } = &snap.handle {
+        return replace_range_bridge(snap, range, sender, context, new_text);
+    }
     pollster::block_on(replace_range_async(snap, range, new_text))
 }

@@ -3,7 +3,7 @@ pub mod sentence;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{clear_focused_if, set_focused};
+pub(crate) use linux::{clear_focused_if, set_focused, uses_ime_bridge};
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 #[cfg(target_os = "macos")]
@@ -285,6 +285,11 @@ pub fn replace_range(
     range: Range<usize>,
     new_text: &str,
 ) -> Result<(), String> {
+    // Bridge mode does its own stale-text check with bridge-specific errors.
+    #[cfg(target_os = "linux")]
+    if uses_ime_bridge() {
+        return linux::replace_range(snap, range, new_text);
+    }
     let char_count = snap.text.chars().count();
     if range.start > range.end || range.end > char_count {
         return Err(
