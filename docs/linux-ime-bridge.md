@@ -71,10 +71,10 @@ an earlier `TextUnavailable` for that context.
 ### `TextUnavailable(context: s, can_select: b)`
 
 The focused context has no surrounding text (the app doesn't share it with
-input methods). `can_select` says whether the bridge can select the line on
-request (the select fallback below). Writely still shows the "W" when
-`can_select` is true. A later valid `SurroundingText` for that context
-cancels it.
+input methods). `can_select` says whether the bridge can report the text the
+user selected in the field (the select fallback below). Writely still shows
+the "W" when `can_select` is true. A later valid `SurroundingText` for that
+context cancels it.
 
 ### `Clicked(context: s, action: s)`
 
@@ -94,9 +94,9 @@ Answer to a `Replace` or `ReplaceSelection` signal: whether replacing
 
 ### `Selected(context: s, request: u, ok: b, text: s, error: s)`
 
-Answer to a `SelectRequest` signal: the text selected from the cursor back
-to the start of the line, or `ok=false` with a human-readable `error` when
-selecting failed.
+Answer to a `SelectRequest` signal: the text the user selected in this
+field while it had focus; empty text means nothing is selected.
+`ok=false` with a human-readable `error` when the selection can't be read.
 
 ## Signals (Writely emits these)
 
@@ -113,10 +113,13 @@ the unique name of the bridge that owns the context, never broadcast.
   chars `start..end` of that context's latest surrounding text with `text`.
   Answer with `ReplaceResult`. After `ReplaceResult(ok=true)` send a fresh
   `SurroundingText` with the new text.
-- `SelectRequest(context: s, request: u)` — select from the cursor back to
-  the start of the line and report the selection with `Selected`. Only sent
-  for contexts that reported `TextUnavailable` with `can_select=true`, and
-  only after the user clicks the "W" (never on caret changes).
+- `SelectRequest(context: s, request: u)` — report the text the user
+  selected in this field while it had focus with `Selected`; never change
+  the selection. Empty text means nothing is selected. Only sent for
+  contexts that reported `TextUnavailable` with `can_select=true`, and
+  only after the user clicks the "W" (never on caret changes). Bridges must
+  not forward keys to create a selection: modifiers are dropped on Wayland,
+  so a forwarded `Shift+Home` arrives as plain `Home`.
 - `ReplaceSelection(context: s, request: u, text: s)` — replace the active
   selection (the one reported by `Selected`) with `text`. Answer with
   `ReplaceResult`.
@@ -151,8 +154,9 @@ once after the first `ShowIcon`; `--apply` sends `Clicked apply` once after
 a `ShowMessage` with `can_apply=True`. On `Replace` the script applies the
 range to its own text, sends `ReplaceResult(ok=true)` and a fresh
 `SurroundingText`. `--no-text` sends `TextUnavailable` instead of
-`SurroundingText`, answers `SelectRequest` with the positional text, and
-answers `ReplaceSelection` with `ReplaceResult(ok=true)`. After `--timeout
+`SurroundingText`, answers `SelectRequest` with the positional text (or with
+empty text when `--nothing-selected` is passed), and answers
+`ReplaceSelection` with `ReplaceResult(ok=true)`. After `--timeout
 N` seconds (default 30) it sends `Destroy` and exits 0.
 
 ## Errors

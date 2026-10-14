@@ -489,7 +489,7 @@ pub(crate) fn select_and_wait(sender: &str, context: &str) -> Result<String, Str
     )?;
     if text.is_empty() {
         return Err(
-            "There is no text before the cursor on this line. Click at the end of the sentence you want to check."
+            "This app doesn't share its text with Writely. Select the text you want to check, then click W again."
                 .to_string(),
         );
     }

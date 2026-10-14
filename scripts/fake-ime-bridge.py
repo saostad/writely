@@ -43,6 +43,8 @@ def main():
     parser.add_argument("--no-text", action="store_true",
                         help="send TextUnavailable instead of SurroundingText, "
                              "and answer SelectRequest/ReplaceSelection")
+    parser.add_argument("--nothing-selected", action="store_true",
+                        help="with --no-text, answer SelectRequest with empty text")
     parser.add_argument("--timeout", type=int, default=30,
                         help="seconds before Destroy and exit 0 (default 30)")
     args = parser.parse_args()
@@ -91,8 +93,9 @@ def main():
         elif signal == "SelectRequest":
             (context, request) = values
             print(f"signal SelectRequest {context} request={request}", flush=True)
+            selected = "" if args.nothing_selected else state["text"]
             call(connection, "Selected",
-                 GLib.Variant("(subss)", (context, request, True, state["text"], "")))
+                 GLib.Variant("(subss)", (context, request, True, selected, "")))
         elif signal == "ReplaceSelection":
             (context, request, text) = values
             print(f"signal ReplaceSelection {context} request={request}: {text}",
