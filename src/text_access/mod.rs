@@ -35,8 +35,12 @@ pub(crate) struct PlatformHandle;
 pub struct FieldSnapshot {
     pub pid: u32,
     pub text: String,
-    /// Char index of the caret (insertion position) into `text`.
+    /// Char index of the caret (insertion position) into `text`. Meaningful
+    /// only when `caret_known` is true; otherwise 0.
     pub caret: usize,
+    /// False when the caret offset couldn't be read (e.g. Firefox): `text`
+    /// is then the whole field and the click checks it as a whole.
+    pub caret_known: bool,
     pub caret_rect: CaretRect,
     /// Char-index range of the current selection into `text`, `Some` only
     /// for a non-empty selection.
@@ -131,6 +135,39 @@ pub fn check_selection(text: &str, selection: Range<usize>) -> CheckedSelection 
         return CheckedSelection::TooLong;
     }
     CheckedSelection::Use(start..end)
+}
+
+/// What a click should check when the caret offset is unknown but the whole
+/// field text is readable (e.g. Firefox).
+#[derive(Debug, Clone, PartialEq)]
+pub enum NoCaretDecision {
+    /// Check (and later replace) this trimmed char range of the whole field.
+    CheckWholeField(Range<usize>),
+    /// The field is empty or only whitespace: show "Type a sentence first."
+    Empty,
+    /// The trimmed field exceeds `MAX_SELECTION_CHARS`: the clipboard
+    /// fallback (or the too-long message where it isn't available) applies.
+    TooLong,
+}
+
+/// Trims `text` (the whole field) and applies the length limit.
+pub fn check_without_caret(text: &str) -> NoCaretDecision {
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = 0;
+    let mut end = chars.len();
+    while start < end && chars[start].is_whitespace() {
+        start += 1;
+    }
+    while end > start && chars[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    if start >= end {
+        return NoCaretDecision::Empty;
+    }
+    if end - start > MAX_SELECTION_CHARS {
+        return NoCaretDecision::TooLong;
+    }
+    NoCaretDecision::CheckWholeField(start..end)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -446,6 +483,38 @@ mod tests {
                 assert_eq!(range.end - range.start, MAX_SELECTION_CHARS)
             }
             other => panic!("expected Use at the limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whole_field_check_without_caret() {
+        use super::{check_without_caret, NoCaretDecision};
+        // A short field is checked as a whole, trimmed.
+        match check_without_caret("  Today are a good day.  ") {
+            NoCaretDecision::CheckWholeField(range) => {
+                let text = "  Today are a good day.  ";
+                let got: String = text
+                    .chars()
+                    .skip(range.start)
+                    .take(range.end - range.start)
+                    .collect();
+                assert_eq!(got, "Today are a good day.");
+            }
+            other => panic!("expected CheckWholeField, got {other:?}"),
+        }
+        // Empty or whitespace-only fields have nothing to check.
+        assert_eq!(check_without_caret(""), NoCaretDecision::Empty);
+        assert_eq!(check_without_caret("   \n  "), NoCaretDecision::Empty);
+        // An over-long field goes to the clipboard fallback.
+        let long = "a".repeat(MAX_SELECTION_CHARS + 1);
+        assert_eq!(check_without_caret(&long), NoCaretDecision::TooLong);
+        // Exactly at the limit is still checked.
+        let at_limit = "b".repeat(MAX_SELECTION_CHARS);
+        match check_without_caret(&at_limit) {
+            NoCaretDecision::CheckWholeField(range) => {
+                assert_eq!(range.end - range.start, MAX_SELECTION_CHARS)
+            }
+            other => panic!("expected CheckWholeField at the limit, got {other:?}"),
         }
     }
 }

@@ -215,6 +215,7 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
         pid,
         text,
         caret,
+        caret_known: true,
         caret_rect,
         selection,
         window_start_utf16: 0,

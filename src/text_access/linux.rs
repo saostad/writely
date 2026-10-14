@@ -162,6 +162,7 @@ async fn focused_field_async() -> Result<Option<FieldSnapshot>, String> {
         pid,
         text,
         caret,
+        caret_known: true,
         caret_rect: CaretRect {
             x: x as f64,
             y: y as f64,

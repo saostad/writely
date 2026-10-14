@@ -148,6 +148,43 @@ fn handle_icon_clicked(
     }
     let (range, sentence) = if let Some(use_range) = selection_use {
         use_range
+    } else if !snap.caret_known {
+        // No caret offset (e.g. Firefox): check the whole field when it fits,
+        // otherwise the clipboard fallback (or the too-long message where
+        // that isn't available).
+        match text_access::check_without_caret(&snap.text) {
+            text_access::NoCaretDecision::CheckWholeField(range) => {
+                let sentence: String = snap
+                    .text
+                    .chars()
+                    .skip(range.start)
+                    .take(range.end - range.start)
+                    .collect();
+                (range, sentence)
+            }
+            text_access::NoCaretDecision::Empty => {
+                show_popup(
+                    "Type a sentence first.",
+                    false,
+                    false,
+                    anchor,
+                    None,
+                    last_anchor,
+                );
+                return;
+            }
+            text_access::NoCaretDecision::TooLong => {
+                show_popup(
+                    text_access::SELECTION_TOO_LONG_MESSAGE,
+                    false,
+                    false,
+                    anchor,
+                    None,
+                    last_anchor,
+                );
+                return;
+            }
+        }
     } else {
         match text_access::sentence::sentence_range(&snap.text, snap.caret) {
             Some(range) => {

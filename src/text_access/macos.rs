@@ -506,8 +506,10 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
 
     let range_value = match copy_ax_value(&element, "AXSelectedTextRange") {
         Ok(value) => value,
+        // No caret offset (e.g. Firefox): fall back to a whole-field
+        // snapshot when the text itself is readable.
         Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
-            return Ok(None);
+            return snapshot_without_caret(element, pid as u32);
         }
         Err(error) => return Err(read_error(error)),
     };
@@ -562,7 +564,7 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
             } else {
                 None
             };
-            let Some(caret_rect) = caret_rect(&element, sel_start_clamped) else {
+            let Some(caret_rect) = caret_or_box_anchor(&element, pid_u32, sel_start_clamped) else {
                 log_no_caret_once(pid_u32);
                 return Ok(None);
             };
@@ -570,6 +572,7 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
                 pid: pid_u32,
                 text: window,
                 caret,
+                caret_known: true,
                 caret_rect,
                 selection,
                 window_start_utf16: start,
@@ -589,6 +592,59 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
     }
 }
 
+/// Pids already told the whole field is checked because the caret offset is
+/// unavailable, so the message below logs once per pid instead of on click.
+static WHOLE_FIELD_LOGGED: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn log_whole_field_once(pid: u32, app: &str) {
+    let mut logged = WHOLE_FIELD_LOGGED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if logged.insert(pid) {
+        eprintln!("Writely: {app}: caret offset unavailable; checking the whole field.");
+    }
+}
+
+/// Snapshot for apps where the caret offset can't be read (Firefox reports
+/// `NoValue` for `AXSelectedTextRange`) but the text itself is readable: the
+/// whole field becomes the snapshot and the click checks it as a whole.
+/// Returns `Ok(None)` when no text is readable (the clipboard fallback or
+/// the can't-read message then applies).
+fn snapshot_without_caret(
+    element: CFRetained<AXUIElement>,
+    pid: u32,
+) -> Result<Option<FieldSnapshot>, String> {
+    let text = match copy_string(&element, "AXValue") {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok(None),
+        Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
+            return Ok(None);
+        }
+        Err(error) => return Err(read_error(error)),
+    };
+    if utf16_len(&text) > WHOLE_READ_LIMIT_UTF16 {
+        return Err("This text field is too large for Writely.".to_string());
+    }
+    let Some(caret_rect) = box_anchor_for(&element, pid) else {
+        log_no_caret_once(pid);
+        return Ok(None);
+    };
+    let name = app_name(pid);
+    log_whole_field_once(pid, &name);
+    let field_len_utf16 = utf16_len(&text);
+    Ok(Some(FieldSnapshot {
+        pid,
+        text,
+        caret: 0,
+        caret_known: false,
+        caret_rect,
+        selection: None,
+        window_start_utf16: 0,
+        field_len_utf16,
+        handle: PlatformHandle { element },
+    }))
+}
 /// Legacy whole-field read for apps without `AXStringForRange` (or without
 /// `AXNumberOfCharacters`). Only used on click paths, never per keystroke.
 fn whole_field_snapshot(
@@ -618,7 +674,7 @@ fn whole_field_snapshot(
     } else {
         None
     };
-    let Some(caret_rect) = caret_rect(&element, caret_utf16) else {
+    let Some(caret_rect) = caret_or_box_anchor(&element, pid, caret_utf16) else {
         log_no_caret_once(pid);
         return Ok(None);
     };
@@ -627,6 +683,7 @@ fn whole_field_snapshot(
         pid,
         text,
         caret,
+        caret_known: true,
         caret_rect,
         selection,
         window_start_utf16: 0,
@@ -811,6 +868,40 @@ pub(crate) fn read_text(handle: &PlatformHandle) -> Result<String, String> {
     }
 }
 
+/// Writes the whole field via `AXValue` and verifies the result against
+/// `expected_window`.
+fn write_whole_field(
+    snap: &FieldSnapshot,
+    name: &str,
+    expected_window: &str,
+    expected_len_utf16: usize,
+) -> Result<(), String> {
+    let element: &AXUIElement = &snap.handle.element;
+    let whole_cf = CFString::from_str(expected_window);
+    let whole_type: &CFType = &whole_cf;
+    let value_error = set_attr(element, "AXValue", whole_type);
+    if value_error == AXError::CannotComplete {
+        return Err(timeout_error(value_error));
+    }
+    if value_error != AXError::Success {
+        return Err(format!(
+            "{name} didn't accept the replacement text (AXError {}).",
+            value_error.0
+        ));
+    }
+    match read_at(&snap.handle, snap, expected_len_utf16) {
+        Ok(actual) if actual == expected_window => Ok(()),
+        Ok(_) => Err(format!(
+            "{name} didn't accept the replacement text (AXError {}).",
+            AXError::Failure.0
+        )),
+        Err(error) if error.starts_with("The focused app didn't respond") => Err(error),
+        Err(error) => Err(format!(
+            "{name} didn't accept the replacement text ({error})."
+        )),
+    }
+}
+
 pub(crate) fn replace_range(
     snap: &FieldSnapshot,
     range: Range<usize>,
@@ -819,6 +910,21 @@ pub(crate) fn replace_range(
     let element: &AXUIElement = &snap.handle.element;
     set_messaging_timeout(element);
     let name = app_name(snap.pid);
+    // Without a known caret (e.g. Firefox) the selected-range machinery
+    // can't be trusted — setting the range fails silently there — so the
+    // whole field is written directly. The snapshot always covers the whole
+    // field on this path, which is what allows the `AXValue` write.
+    if !snap.caret_known {
+        if !covers_whole_field(snap) {
+            return Err(format!(
+                "{name} didn't accept the replacement text. Select a shorter part of the text, or copy the suggestion by hand."
+            ));
+        }
+        let expected_window = replaced_text(&snap.text, &range, new_text);
+        let expected_len_utf16 = utf16_len(&expected_window);
+        eprintln!("Writely: {name}: caret offset unavailable; replaced the whole field text.");
+        return write_whole_field(snap, &name, &expected_window, expected_len_utf16);
+    }
     // Window-relative range math; the offset is added only for AX.
     let start = snap.window_start_utf16 + char_to_utf16_offset(&snap.text, range.start);
     let end = snap.window_start_utf16 + char_to_utf16_offset(&snap.text, range.end);
