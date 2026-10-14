@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,6 +75,11 @@ struct Inner {
     /// Pids where a retry window already started; cleared when the pid is
     /// deactivated so a re-activation may retry once more.
     retried_pids: HashSet<u32>,
+    /// When cursor reporting was newly enabled per pid (CFAbsoluteTime). The
+    /// "can't find the text cursor" message stays suppressed for the full 4 s
+    /// window even when the retry ends early, because the caret position can
+    /// lag behind the newly appeared focused element.
+    grace_enabled_at: HashMap<u32, f64>,
     retry_timer: Option<CFRetained<CFRunLoopTimer>>,
     retry_pid: u32,
     retry_remaining: u8,
@@ -90,6 +95,12 @@ pub(crate) enum FocusedPresence {
     Present,
     Absent,
     NoValue,
+}
+
+/// Whether `now` is still within the suppression window for a pid whose
+/// cursor reporting was enabled at `enabled_at`: the full retry window.
+pub(crate) fn within_grace(now: f64, enabled_at: f64) -> bool {
+    now - enabled_at < RETRY_ATTEMPTS as f64 * RETRY_INTERVAL_SECS
 }
 
 /// Whether Writely should set `AXEnhancedUserInterface` on the app: the app
@@ -354,6 +365,7 @@ fn setup_for_pid(pid: u32) {
             logged_report_pids: HashSet::new(),
             logged_timeout_pids: HashSet::new(),
             retried_pids: HashSet::new(),
+            grace_enabled_at: HashMap::new(),
             retry_timer: None,
             retry_pid: 0,
             retry_remaining: 0,
@@ -418,10 +430,12 @@ fn setup_for_pid(pid: u32) {
             let name = app_display_name(pid, &app_element);
             let initial = read_bool_attr(&app_element, "AXEnhancedUserInterface");
             let set_error = set_bool_attr(&app_element, "AXEnhancedUserInterface", true);
-            let sent = set_error == AXError::Success || set_error == AXError::CannotComplete;
+            // The set call's return is unreliable (Chrome answers
+            // `NotImplemented` yet still applies it), so the readback alone
+            // decides whether cursor reporting is on.
             let readback = read_bool_attr(&app_element, "AXEnhancedUserInterface");
             let confirmed = readback == Some(true);
-            if sent && confirmed {
+            if confirmed {
                 if initial == Some(false) {
                     inner.enhanced_pids.insert(pid);
                 }
@@ -449,6 +463,14 @@ fn setup_for_pid(pid: u32) {
                 "Writely: could not turn on cursor reporting for {name}: AXManualAccessibility AXError {}.",
                 manual_error.0
             );
+        }
+        if newly_enabled {
+            // The retry below can end early once a focused element appears,
+            // but the caret position may lag behind it; keep suppressing the
+            // "can't find the text cursor" message for the full window.
+            inner
+                .grace_enabled_at
+                .insert(pid, CFAbsoluteTimeGetCurrent());
         }
         let mut raw: *mut AXObserver = null_mut();
         let out = NonNull::from(&mut raw);
@@ -507,14 +529,29 @@ fn setup_for_pid(pid: u32) {
 }
 
 /// Whether the cursor-reporting retry window is currently active for `pid`.
-/// `text_access` uses this to skip the premature "can't find the text
-/// cursor" message while a retry is still running; the window's own 4 s
-/// timeout line covers a lasting failure.
 pub(crate) fn retry_active_for(pid: u32) -> bool {
     INNER.with(|cell| {
         cell.borrow()
             .as_ref()
             .is_some_and(|inner| inner.retry_pid == pid && inner.retry_timer.is_some())
+    })
+}
+
+/// Whether the "can't find the text cursor" message is suppressed for `pid`:
+/// while its retry window runs, plus the rest of the 4 s window after the
+/// retry ends early (the focused element appearing cancels the retry, but the
+/// caret position may lag behind it). `text_access` uses this to skip the
+/// premature message; afterwards the window's own 4 s timeout line or the
+/// regular message covers a lasting failure.
+pub(crate) fn no_caret_suppressed(pid: u32) -> bool {
+    if retry_active_for(pid) {
+        return true;
+    }
+    INNER.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|inner| inner.grace_enabled_at.get(&pid).copied())
+            .is_some_and(|enabled_at| within_grace(CFAbsoluteTimeGetCurrent(), enabled_at))
     })
 }
 
@@ -552,6 +589,7 @@ impl WatcherInner {
                     logged_report_pids: HashSet::new(),
                     logged_timeout_pids: HashSet::new(),
                     retried_pids: HashSet::new(),
+                    grace_enabled_at: HashMap::new(),
                     retry_timer: None,
                     retry_pid: 0,
                     retry_remaining: 0,
@@ -701,5 +739,13 @@ mod tests {
             super::RETRY_ATTEMPTS as f64 * super::RETRY_INTERVAL_SECS,
             4.0
         );
+    }
+
+    #[test]
+    fn grace_covers_the_retry_window() {
+        assert!(super::within_grace(100.0, 100.0));
+        assert!(super::within_grace(103.9, 100.0));
+        assert!(!super::within_grace(104.0, 100.0));
+        assert!(!super::within_grace(110.0, 100.0));
     }
 }

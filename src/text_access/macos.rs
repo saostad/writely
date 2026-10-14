@@ -32,10 +32,11 @@ static NO_CARET_LOGGED: LazyLock<Mutex<HashSet<u32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn log_no_caret_once(pid: u32) {
-    // While the cursor-reporting retry window is active for this pid, the
-    // "no text cursor appeared within 4 s" line at the end of the window
-    // covers it; don't log a premature message per caret event.
-    if crate::watcher::macos::retry_active_for(pid) {
+    // While cursor reporting was newly enabled for this pid, the caret
+    // position may lag behind the focused element (the retry ends as soon as
+    // the element appears); the "no text cursor appeared within 4 s" line at
+    // the end of the window covers a lasting failure, so don't log here.
+    if crate::watcher::macos::no_caret_suppressed(pid) {
         return;
     }
     let mut logged = NO_CARET_LOGGED
@@ -50,6 +51,20 @@ fn log_no_caret_once(pid: u32) {
 /// read still shows the snapshot text instead of the expected text.
 pub(crate) fn selected_write_ignored(actual: &str, snapshot_text: &str, expected: &str) -> bool {
     actual == snapshot_text && actual != expected
+}
+
+/// Whether the two verification reads show the `AXSelectedText` write was
+/// silently ignored: the expected-length read isn't the expected text, but a
+/// re-read at the snapshot length still shows the snapshot text. The second
+/// read matters when old and new lengths differ: a truncated read of an
+/// unchanged field then equals neither text.
+pub(crate) fn selected_write_ignored_reread(
+    expected_read: &str,
+    snapshot_read: &str,
+    snapshot_text: &str,
+    expected: &str,
+) -> bool {
+    expected_read != expected && selected_write_ignored(snapshot_read, snapshot_text, expected)
 }
 
 /// Moves the caret to `offset_utf16` without failing the replace: a failure
@@ -711,16 +726,30 @@ pub(crate) fn replace_range(
     } else {
         // The set reported Success but some apps (e.g. Chrome) ignore it:
         // verify, and fall back to the whole-field write when the text is
-        // unchanged and the snapshot covers the whole field.
+        // unchanged and the snapshot covers the whole field. When old and new
+        // lengths differ, the expected-length read of an unchanged field is
+        // truncated to neither text, so re-read at the snapshot length
+        // before deciding.
         match read_at(&snap.handle, snap, expected_len_utf16) {
             Ok(actual) if actual == expected_window => return Ok(()),
-            Ok(actual) if !selected_write_ignored(&actual, &snap.text, &expected_window) => {
-                return Err(format!(
-                    "{name} didn't accept the replacement text (AXError {}).",
-                    AXError::Failure.0
-                ));
+            Ok(expected_read) => {
+                let snapshot_len_utf16 = utf16_len(&snap.text);
+                let ignored = match read_at(&snap.handle, snap, snapshot_len_utf16) {
+                    Ok(snapshot_read) => selected_write_ignored_reread(
+                        &expected_read,
+                        &snapshot_read,
+                        &snap.text,
+                        &expected_window,
+                    ),
+                    Err(_) => selected_write_ignored(&expected_read, &snap.text, &expected_window),
+                };
+                if !ignored {
+                    return Err(format!(
+                        "{name} didn't accept the replacement text (AXError {}).",
+                        AXError::Failure.0
+                    ));
+                }
             }
-            Ok(_) => {}
             Err(error) if error.starts_with("The focused app didn't respond") => {
                 return Err(error);
             }
@@ -786,7 +815,7 @@ pub(crate) fn read_at(
 
 #[cfg(test)]
 mod tests {
-    use super::{read_error, selected_write_ignored, timeout_error};
+    use super::{read_error, selected_write_ignored, selected_write_ignored_reread, timeout_error};
     use objc2_application_services::AXError;
 
     #[test]
@@ -814,5 +843,30 @@ mod tests {
         assert!(!selected_write_ignored("other", "old", "new"));
         // Identical snapshot and expectation: nothing to distinguish.
         assert!(!selected_write_ignored("same", "same", "same"));
+    }
+
+    #[test]
+    fn ignored_write_detected_when_lengths_differ() {
+        let snapshot = "Today are a good day.";
+        let expected = "Today is a good day.";
+        // Expected-length (20 units) read of the unchanged 21-unit field:
+        // truncated to neither text, so the snapshot-length re-read decides.
+        assert!(selected_write_ignored_reread(
+            "Today are a good day",
+            snapshot,
+            snapshot,
+            expected
+        ));
+        // A field changed to something else is a mismatch, not ignored.
+        assert!(!selected_write_ignored_reread(
+            "Today was a good day",
+            "Today was a good day.",
+            snapshot,
+            expected
+        ));
+        // An accepted write is never "ignored".
+        assert!(!selected_write_ignored_reread(
+            expected, snapshot, snapshot, expected
+        ));
     }
 }
