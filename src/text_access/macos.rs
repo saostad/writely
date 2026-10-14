@@ -68,9 +68,122 @@ fn element_frame(element: &AXUIElement) -> Result<CGRect, AXError> {
     let value = copy_ax_value(element, "AXFrame")?;
     ax_rect(&value).ok_or(AXError::Failure)
 }
+/// Whether setting `AXSelectedText` was silently ignored: the verification
 /// read still shows the snapshot text instead of the expected text.
 pub(crate) fn selected_write_ignored(actual: &str, snapshot_text: &str, expected: &str) -> bool {
     actual == snapshot_text && actual != expected
+}
+
+/// Roles that hold editable text, for the text-box icon anchor.
+pub(crate) fn is_text_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXTextArea" | "AXTextField" | "AXComboBox" | "AXSearchField"
+    )
+}
+
+/// Whether an element frame can anchor the icon: non-zero, and no larger
+/// than the biggest screen (an absurd frame means "no anchor").
+pub(crate) fn frame_usable(frame: &CGRect, max_screen: (f64, f64)) -> bool {
+    frame.size.width > 0.0
+        && frame.size.height > 0.0
+        && frame.size.width <= max_screen.0
+        && frame.size.height <= max_screen.1
+}
+
+/// Size of the icon panel, kept in sync with `overlay/macos.rs`.
+const ICON_SIZE: f64 = 20.0;
+/// Inset of the icon inside the text-box frame.
+const BOX_INSET: f64 = 4.0;
+
+/// A zero-size rect that makes `overlay::show_at` (which puts the icon 4 pt
+/// right of the rect and centres it on the rect's middle) land the 20x20
+/// icon just inside the frame's top-right corner, inset 4 pt.
+pub(crate) fn box_anchor_rect(frame: &CGRect) -> CaretRect {
+    CaretRect {
+        x: frame.origin.x + frame.size.width - ICON_SIZE - BOX_INSET - 4.0,
+        y: frame.origin.y + BOX_INSET + ICON_SIZE / 2.0,
+        width: 0.0,
+        height: 0.0,
+        physical: false,
+    }
+}
+
+/// Pids already told the icon is at the text box, so the message below logs
+/// once per pid instead of on every keystroke.
+static BOX_ANCHOR_LOGGED: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn log_box_anchor_once(pid: u32, app: &str) {
+    let mut logged = BOX_ANCHOR_LOGGED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if logged.insert(pid) {
+        eprintln!("Writely: {app}: caret position unavailable; showing the icon at the text box.");
+    }
+}
+
+/// Largest screen size in points, for the absurd-frame check. `None` when it
+/// can't be read (the size check is then skipped).
+fn max_screen_size() -> Option<(f64, f64)> {
+    let mtm = objc2_foundation::MainThreadMarker::new()?;
+    let screens = objc2_app_kit::NSScreen::screens(mtm);
+    if screens.count() == 0 {
+        return None;
+    }
+    let mut max: (f64, f64) = (0.0, 0.0);
+    for index in 0..screens.count() {
+        let size = screens.objectAtIndex(index).frame().size;
+        max = (max.0.max(size.width), max.1.max(size.height));
+    }
+    if max.0 <= 0.0 || max.1 <= 0.0 {
+        None
+    } else {
+        Some(max)
+    }
+}
+
+/// The text-box anchor for `element` when there is no valid caret rect:
+/// the top-right corner of its `AXFrame`, or `None` when the element isn't
+/// a text element, is secure, or has no usable frame.
+fn box_anchor_for(element: &AXUIElement, pid: u32) -> Option<CaretRect> {
+    match copy_string(element, "AXSubrole") {
+        Ok(Some(subrole)) if subrole == "AXSecureTextField" => return None,
+        _ => {}
+    }
+    let is_text = match copy_string(element, "AXRole") {
+        Ok(Some(role)) => is_text_role(&role),
+        // Without a readable role, an AXValue that is a settable string
+        // still counts as a text element.
+        _ => match copy_string(element, "AXValue") {
+            Ok(Some(_)) => element_is_editable(element),
+            _ => false,
+        },
+    };
+    if !is_text {
+        return None;
+    }
+    let frame = element_frame(element).ok()?;
+    let usable = match max_screen_size() {
+        Some(max) => frame_usable(&frame, max),
+        None => frame.size.width > 0.0 && frame.size.height > 0.0,
+    };
+    if !usable {
+        return None;
+    }
+    let name = app_name(pid);
+    log_box_anchor_once(pid, &name);
+    Some(box_anchor_rect(&frame))
+}
+
+/// The caret rectangle, falling back to the text-box anchor when there is no
+/// valid caret position. Returns `None` only when neither exists (the caller
+/// then logs the no-caret message and hides the icon).
+fn caret_or_box_anchor(element: &AXUIElement, pid: u32, caret_utf16: usize) -> Option<CaretRect> {
+    if let Some(rect) = caret_rect(element, caret_utf16) {
+        return Some(rect);
+    }
+    box_anchor_for(element, pid)
 }
 
 /// Whether the two verification reads show the `AXSelectedText` write was
@@ -535,8 +648,12 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
         }
         let range_value = match copy_ax_value(&element, "AXSelectedTextRange") {
             Ok(value) => value,
+            // No caret offset (e.g. Firefox): the icon can still anchor to
+            // the text box when the element has a usable frame.
             Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
-                return Ok(None);
+                return Ok(
+                    box_anchor_for(&element, pid).map(|caret_rect| CaretInfo { pid, caret_rect })
+                );
             }
             Err(error) => return Err(read_error(error)),
         };
@@ -549,7 +666,7 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
         } else {
             selected.location as usize
         };
-        let Some(rect) = caret_rect(&element, caret_utf16) else {
+        let Some(rect) = caret_or_box_anchor(&element, pid, caret_utf16) else {
             log_no_caret_once(pid);
             return Ok(None);
         };
@@ -596,8 +713,15 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
 
     let range_value = match copy_ax_value(&element, "AXSelectedTextRange") {
         Ok(value) => value,
+        // No caret offset (e.g. Firefox): the icon can still anchor to the
+        // text box when the element has a usable frame.
         Err(error) if error == AXError::NoValue || error == AXError::AttributeUnsupported => {
-            return Ok(None);
+            return Ok(
+                box_anchor_for(&element, pid as u32).map(|caret_rect| CaretInfo {
+                    pid: pid as u32,
+                    caret_rect,
+                }),
+            );
         }
         Err(error) => return Err(read_error(error)),
     };
@@ -610,7 +734,7 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
     } else {
         selected.location as usize
     };
-    let Some(rect) = caret_rect(&element, caret_utf16) else {
+    let Some(rect) = caret_or_box_anchor(&element, pid as u32, caret_utf16) else {
         log_no_caret_once(pid as u32);
         return Ok(None);
     };
@@ -938,6 +1062,48 @@ mod tests {
             },
         };
         assert!(!caret_rect_valid(&far, &frame));
+    }
+
+    #[test]
+    fn text_box_anchor_helpers() {
+        use super::{box_anchor_rect, frame_usable, is_text_role};
+        assert!(is_text_role("AXTextArea"));
+        assert!(is_text_role("AXTextField"));
+        assert!(is_text_role("AXComboBox"));
+        assert!(is_text_role("AXSearchField"));
+        assert!(!is_text_role("AXStaticText"));
+        assert!(!is_text_role("AXButton"));
+        // Absurd frames (zero size or larger than the screen) are no anchor.
+        let frame = CGRect {
+            origin: CGPoint { x: 100.0, y: 100.0 },
+            size: CGSize {
+                width: 400.0,
+                height: 200.0,
+            },
+        };
+        assert!(frame_usable(&frame, (1920.0, 1080.0)));
+        let zero = CGRect {
+            origin: CGPoint { x: 100.0, y: 100.0 },
+            size: CGSize {
+                width: 0.0,
+                height: 0.0,
+            },
+        };
+        assert!(!frame_usable(&zero, (1920.0, 1080.0)));
+        let huge = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: 4000.0,
+                height: 200.0,
+            },
+        };
+        assert!(!frame_usable(&huge, (1920.0, 1080.0)));
+        // The anchor lands the 20x20 icon inside the frame's top-right
+        // corner, inset 4 pt (overlay adds +4 x and centres vertically).
+        let anchor = box_anchor_rect(&frame);
+        assert_eq!(anchor.x + anchor.width + 4.0, 100.0 + 400.0 - 20.0 - 4.0);
+        assert_eq!(anchor.y + anchor.height / 2.0 - 10.0, 100.0 + 4.0);
+        assert!(!anchor.physical);
     }
 
     #[test]
