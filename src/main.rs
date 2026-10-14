@@ -345,6 +345,9 @@ fn handle_icon_clicked(
     let my_generation = *generation;
     *pending = None;
     *checking = None;
+    // `live_pid` is only consumed by macOS-only paths below; keep the
+    // binding on all targets and allow it to be unused elsewhere.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     let (live_anchor, live_pid) = match text_access::caret_info() {
         Ok(Some(info)) => (Some(info.caret_rect), Some(info.pid)),
         Ok(None) => (None, None),
@@ -754,6 +757,8 @@ fn handle_permission_granted(
 }
 
 fn main() {
+    // Only the macOS setup mutates the event loop before running it.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
     #[cfg(target_os = "macos")]

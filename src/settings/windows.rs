@@ -116,13 +116,13 @@ fn set_status(text: &str, is_error: bool) {
 
 fn combo_selection(combo: HWND) -> i32 {
     // SAFETY: combo is a live COMBOBOX while the window is open.
-    unsafe { SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0 as i32
+    unsafe { SendMessageW(combo, CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))) }.0 as i32
 }
 
 fn set_combo_selection(combo: HWND, index: usize) {
     // SAFETY: combo is a live COMBOBOX while the window is open.
     unsafe {
-        SendMessageW(combo, CB_SETCURSEL, WPARAM(index), LPARAM(0));
+        SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(index)), Some(LPARAM(0)));
     }
 }
 
@@ -152,8 +152,8 @@ fn refresh_key_cue(edit: HWND, provider: Provider) {
         SendMessageW(
             edit,
             EM_SETCUEBANNER,
-            WPARAM(0),
-            LPARAM(cue.as_ptr() as isize),
+            Some(WPARAM(0)),
+            Some(LPARAM(cue.as_ptr() as isize)),
         );
     }
 }
@@ -197,8 +197,8 @@ fn refresh_provider_rows() {
         SendMessageW(
             rows.model_edit,
             EM_SETCUEBANNER,
-            WPARAM(0),
-            LPARAM(model_cue.as_ptr() as isize),
+            Some(WPARAM(0)),
+            Some(LPARAM(model_cue.as_ptr() as isize)),
         );
     }
     let is_ollama = rows.provider == Provider::Ollama;
@@ -521,7 +521,7 @@ pub fn show_settings() -> Result<(), String> {
         .map_err(|error| format!("Could not open the settings window: {error}"))
     };
 
-    let combo_style = WINDOW_STYLE((CBS_DROPDOWNLIST.0 as u32) | (WS_VSCROLL.0 as u32));
+    let combo_style = WINDOW_STYLE((CBS_DROPDOWNLIST as u32) | WS_VSCROLL.0);
 
     let _provider_label = make_child("STATIC", "Provider", WINDOW_STYLE(0), 20, 16, 400, 18, 0)?;
     let provider_combo = make_child("COMBOBOX", "", combo_style, 20, 38, 400, 26, ID_PROVIDER)?;
@@ -532,8 +532,8 @@ pub fn show_settings() -> Result<(), String> {
             SendMessageW(
                 provider_combo,
                 CB_ADDSTRING,
-                WPARAM(0),
-                LPARAM(entry.as_ptr() as isize),
+                Some(WPARAM(0)),
+                Some(LPARAM(entry.as_ptr() as isize)),
             );
         }
     }
@@ -568,8 +568,8 @@ pub fn show_settings() -> Result<(), String> {
             SendMessageW(
                 effort_combo,
                 CB_ADDSTRING,
-                WPARAM(0),
-                LPARAM(entry.as_ptr() as isize),
+                Some(WPARAM(0)),
+                Some(LPARAM(entry.as_ptr() as isize)),
             );
         }
     }

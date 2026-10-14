@@ -15,7 +15,7 @@ const PROVIDER_NAMES: [&str; 3] = [
 ];
 const EFFORT_NAMES: [&str; 5] = ["Default", "Minimal (fastest)", "Low", "Medium", "High"];
 
-fn provider_at(index: i32) -> Provider {
+fn provider_at(index: u32) -> Provider {
     match index {
         1 => Provider::Together,
         2 => Provider::Ollama,
@@ -31,7 +31,7 @@ fn provider_index(provider: Provider) -> u32 {
     }
 }
 
-fn effort_at(index: i32) -> Effort {
+fn effort_at(index: u32) -> Effort {
     match index {
         1 => Effort::Minimal,
         2 => Effort::Low,
