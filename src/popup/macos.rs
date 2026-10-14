@@ -7,14 +7,16 @@ use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventMask, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSMutableParagraphStyle, NSParagraphStyleAttributeName,
-    NSStatusWindowLevel, NSPanel, NSScreen, NSScrollView, NSStrikethroughStyleAttributeName,
-    NSTextField, NSTextView, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSForegroundColorAttributeName, NSMutableParagraphStyle, NSPanel,
+    NSParagraphStyleAttributeName, NSProgressIndicator, NSProgressIndicatorStyle, NSScreen,
+    NSScrollView, NSStatusWindowLevel, NSStrikethroughStyleAttributeName, NSTextField, NSTextView,
+    NSView, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSMutableAttributedString, NSAttributedString, NSAttributedStringKey,
-    NSDictionary, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSAttributedString, NSAttributedStringKey, NSDictionary,
+    NSMutableAttributedString, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString,
 };
 use tao::event_loop::EventLoopProxy;
 
@@ -138,6 +140,7 @@ struct PopupState {
     separator: Retained<SeparatorView>,
     cancel_button: Retained<NSButton>,
     replace_button: Retained<NSButton>,
+    spinner: Retained<NSProgressIndicator>,
     #[allow(dead_code)]
     replace_target: Retained<ReplaceTarget>,
     #[allow(dead_code)]
@@ -277,6 +280,17 @@ fn ensure_popup(mtm: MainThreadMarker) {
         replace_button.setKeyEquivalent(&NSString::from_str(""));
         card.addSubview(&replace_button);
 
+        // Loading spinner for "Checking…": 14 pt, hidden until needed.
+        // SAFETY: initWithFrame: is the designated initializer and mtm is the main thread.
+        let spinner = NSProgressIndicator::initWithFrame(
+            NSProgressIndicator::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(14.0, 14.0)),
+        );
+        spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+        spinner.setDisplayedWhenStopped(false);
+        spinner.setHidden(true);
+        card.addSubview(&spinner);
+
         panel.setContentView(Some(&card));
         *state.borrow_mut() = Some(PopupState {
             panel,
@@ -286,6 +300,7 @@ fn ensure_popup(mtm: MainThreadMarker) {
             separator,
             cancel_button,
             replace_button,
+            spinner,
             replace_target,
             dismiss_target,
             visible: false,
@@ -354,7 +369,10 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
         } else {
             popup.text.setTextColor(Some(&NSColor::labelColor()));
         }
-        let text_width = CARD_WIDTH - 2.0 * SIDE_PAD;
+        // Loading state: a small spinning indicator before "Checking…".
+        let checking = text == "Checking…" && !is_error && !show_footer;
+        let text_indent = if checking { 18.0 } else { 0.0 };
+        let text_width = CARD_WIDTH - 2.0 * SIDE_PAD - text_indent;
         // SAFETY: the text container exists for a freshly created NSTextView.
         unsafe {
             if let Some(container) = popup.text.textContainer() {
@@ -401,13 +419,26 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
             ));
         }
         popup.scroll.setFrame(NSRect::new(
-            NSPoint::new(4.0, footer),
-            NSSize::new(CARD_WIDTH - 8.0, body_height),
+            NSPoint::new(4.0 + text_indent, footer),
+            NSSize::new(CARD_WIDTH - 8.0 - text_indent, body_height),
         ));
         popup.text.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
             NSSize::new(text_width, body_height.max(needed)),
         ));
+        if checking {
+            popup.spinner.setHidden(false);
+            popup.spinner.setFrame(NSRect::new(
+                NSPoint::new(SIDE_PAD, footer + body_height - 16.0),
+                NSSize::new(14.0, 14.0),
+            ));
+            // SAFETY: the spinner is alive in STATE for the life of the popup.
+            unsafe { popup.spinner.startAnimation(None) };
+        } else {
+            // SAFETY: the spinner is alive in STATE for the life of the popup.
+            unsafe { popup.spinner.stopAnimation(None) };
+            popup.spinner.setHidden(true);
+        }
         popup.separator.setHidden(!show_footer);
         if show_footer {
             popup.separator.setFrame(NSRect::new(
@@ -434,20 +465,28 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
 /// Builds one inline attributed text for the suggestion: unchanged tokens in
 /// `labelColor`; removed tokens in red with a strikethrough; inserted tokens
 /// in green, semibold. 13 pt with 3 pt line spacing, wrapping to `width`.
-fn build_diff_attributed(original: &str, suggestion: &str, width: f64) -> Retained<NSMutableAttributedString> {
+fn build_diff_attributed(
+    original: &str,
+    suggestion: &str,
+    width: f64,
+) -> Retained<NSMutableAttributedString> {
     let regular = NSFont::systemFontOfSize(13.0);
     let semibold = NSFont::boldSystemFontOfSize(13.0);
     let paragraph = NSMutableParagraphStyle::new();
     paragraph.setLineSpacing(3.0);
     // SAFETY: the paragraph style object is valid for the duration of the call.
-    let full: Retained<NSMutableAttributedString> =
-        NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &NSString::from_str(""));
+    let full: Retained<NSMutableAttributedString> = NSMutableAttributedString::initWithString(
+        NSMutableAttributedString::alloc(),
+        &NSString::from_str(""),
+    );
     let _ = width;
     for op in crate::diff::diff_words(original, suggestion) {
         let (text, font, color, strike) = match op {
             crate::diff::DiffOp::Equal(s) => (s, regular.clone(), NSColor::labelColor(), false),
             crate::diff::DiffOp::Delete(s) => (s, regular.clone(), NSColor::systemRedColor(), true),
-            crate::diff::DiffOp::Insert(s) => (s, semibold.clone(), NSColor::systemGreenColor(), false),
+            crate::diff::DiffOp::Insert(s) => {
+                (s, semibold.clone(), NSColor::systemGreenColor(), false)
+            }
         };
         let font_key: &NSAttributedStringKey =
             // SAFETY: NSFontAttributeName is a framework-provided constant.
@@ -498,6 +537,12 @@ fn layout_attributed(body: &NSAttributedString) -> f64 {
                 storage.setAttributedString(body);
             }
         }
+        // The result arrived: the spinner stops and is removed.
+        // SAFETY: the spinner is alive in STATE for the life of the popup.
+        unsafe {
+            popup.spinner.stopAnimation(None);
+        }
+        popup.spinner.setHidden(true);
         popup.text.setEditable(false);
         popup.text.setSelectable(false);
         let text_width = CARD_WIDTH - 2.0 * SIDE_PAD;
@@ -679,6 +724,11 @@ pub fn hide() {
     remove_key_monitor();
     STATE.with(|state| {
         if let Some(popup) = state.borrow_mut().as_mut() {
+            // SAFETY: the spinner is alive in STATE for the life of the popup.
+            unsafe {
+                popup.spinner.stopAnimation(None);
+            }
+            popup.spinner.setHidden(true);
             popup.panel.orderOut(None);
             popup.replace_button.setHidden(true);
             popup.cancel_button.setHidden(true);
