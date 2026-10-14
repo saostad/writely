@@ -44,12 +44,22 @@ pub struct FocusedText {
     pub selection: Option<Range<usize>>,
 }
 
+/// What the focused field offers: full surrounding text, or the
+/// selection-only fallback for apps that don't share their text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FocusedKind {
+    Text(FocusedText),
+    SelectOnly,
+}
+
 struct ContextData {
     program: String,
     password: bool,
     text: Option<String>,
     cursor: u32,
     anchor: u32,
+    text_unavailable: bool,
+    can_select: bool,
 }
 
 /// All input-method bridge contexts. See `docs/linux-ime-bridge.md`.
@@ -61,11 +71,13 @@ pub struct BridgeState {
     hello_logged: HashSet<String>,
 }
 
-/// One in-flight `Replace` and its answer. Results for any other
-/// (sender, context, request) triple are ignored.
+/// One in-flight bridge answer (`Replace`, `SelectRequest` or
+/// `ReplaceSelection`) and its result. Results for any other
+/// (sender, context, request) triple are ignored. The event loop is
+/// single-threaded, so only one request is ever in flight.
 pub struct ReplaceWait {
     pending: Option<(String, String, u32)>,
-    result: Option<(bool, String)>,
+    result: Option<(bool, String, String)>,
 }
 
 impl ReplaceWait {
@@ -76,7 +88,7 @@ impl ReplaceWait {
         }
     }
 
-    /// Marks a `Replace` as in flight, dropping any previous answer.
+    /// Marks a request as in flight, dropping any previous answer.
     pub fn begin(&mut self, sender: &str, context: &str, request: u32) {
         self.pending = Some((sender.to_string(), context.to_string(), request));
         self.result = None;
@@ -92,6 +104,20 @@ impl ReplaceWait {
         ok: bool,
         error: &str,
     ) -> bool {
+        self.insert_full(sender, context, request, ok, error, "")
+    }
+
+    /// Stores a result with a text payload (`Selected`'s text).
+    /// Returns true when stored; anything else is ignored.
+    pub fn insert_full(
+        &mut self,
+        sender: &str,
+        context: &str,
+        request: u32,
+        ok: bool,
+        error: &str,
+        text: &str,
+    ) -> bool {
         let matches = self.pending.as_ref().is_some_and(
             |(pending_sender, pending_context, pending_request)| {
                 pending_sender == sender
@@ -100,13 +126,13 @@ impl ReplaceWait {
             },
         );
         if matches {
-            self.result = Some((ok, error.to_string()));
+            self.result = Some((ok, error.to_string(), text.to_string()));
         }
         matches
     }
 
-    /// Takes the stored answer, if any.
-    pub fn take(&mut self) -> Option<(bool, String)> {
+    /// Takes the stored answer with its text payload, if any.
+    pub fn take_full(&mut self) -> Option<(bool, String, String)> {
         self.result.take()
     }
 
@@ -175,6 +201,8 @@ impl BridgeState {
                         text: None,
                         cursor: 0,
                         anchor: 0,
+                        text_unavailable: false,
+                        can_select: false,
                     },
                 );
             }
@@ -214,6 +242,46 @@ impl BridgeState {
         data.text = Some(text.to_string());
         data.cursor = cursor;
         data.anchor = anchor;
+        // A valid SurroundingText cancels an earlier TextUnavailable.
+        data.text_unavailable = false;
+        Ok(())
+    }
+
+    /// The focused context has no surrounding text. `can_select` says
+    /// whether the bridge can select the line for the select fallback.
+    pub fn text_unavailable(
+        &mut self,
+        sender: &str,
+        context: &str,
+        can_select: bool,
+    ) -> Result<(), String> {
+        let key = (sender.to_string(), context.to_string());
+        let Some(data) = self.contexts.get_mut(&key) else {
+            return Err(format!(
+                "TextUnavailable: unknown context \"{context}\"; call FocusIn first."
+            ));
+        };
+        data.text_unavailable = true;
+        data.can_select = can_select;
+        Ok(())
+    }
+
+    /// Validates a `Selected` answer. The service stores the result.
+    pub fn selected(
+        &self,
+        sender: &str,
+        context: &str,
+        _request: u32,
+        _ok: bool,
+        _text: &str,
+        _error: &str,
+    ) -> Result<(), String> {
+        let key = (sender.to_string(), context.to_string());
+        if !self.contexts.contains_key(&key) {
+            return Err(format!(
+                "Selected: unknown context \"{context}\"; call FocusIn first."
+            ));
+        }
         Ok(())
     }
 
@@ -278,6 +346,25 @@ impl BridgeState {
         let request = self.next_replace_id;
         self.next_replace_id = self.next_replace_id.wrapping_add(1).max(1);
         request
+    }
+
+    /// What the focused field offers, or `None` when nothing is
+    /// focused, the field is a password, or there is neither text nor a
+    /// usable select fallback.
+    pub fn focused_kind(&self) -> Option<FocusedKind> {
+        let key = self.focused.as_ref()?;
+        let data = self.contexts.get(key)?;
+        if data.password {
+            return None;
+        }
+        if data.text_unavailable {
+            return if data.can_select {
+                Some(FocusedKind::SelectOnly)
+            } else {
+                None
+            };
+        }
+        self.focused_text().map(FocusedKind::Text)
     }
 
     /// The focused field's text, or `None` when nothing is focused, the
@@ -483,10 +570,18 @@ mod tests {
             state.replace_result(A, "ctx", 1, true, ""),
             Err("ReplaceResult: unknown context \"ctx\"; call FocusIn first.".to_string())
         );
+        assert_eq!(
+            state.selected(A, "ctx", 1, true, "x", ""),
+            Err("Selected: unknown context \"ctx\"; call FocusIn first.".to_string())
+        );
         let mut state = state;
         assert_eq!(
             state.surrounding_text(A, "ctx", "x", 1, 1),
             Err("SurroundingText: unknown context \"ctx\"; call FocusIn first.".to_string())
+        );
+        assert_eq!(
+            state.text_unavailable(A, "ctx", true),
+            Err("TextUnavailable: unknown context \"ctx\"; call FocusIn first.".to_string())
         );
         // A context known under another sender is still unknown here.
         state.focus_in(B, "ctx", "firefox", false);
@@ -581,7 +676,7 @@ mod tests {
         let mut wait = ReplaceWait::new();
         // Nothing pending: everything is ignored.
         assert!(!wait.insert(A, "ctx", 1, true, ""));
-        assert_eq!(wait.take(), None);
+        assert_eq!(wait.take_full(), None);
         wait.begin(A, "ctx", 2);
         // Other request id, other sender, other context: ignored.
         assert!(!wait.insert(A, "ctx", 1, true, ""));
@@ -589,17 +684,83 @@ mod tests {
         assert!(!wait.insert(B, "ctx", 2, true, ""));
         assert!(!wait.insert(A, "other", 2, true, ""));
         assert!(!wait.has_result());
-        assert_eq!(wait.take(), None);
+        assert_eq!(wait.take_full(), None);
         // The exact triple is stored.
         assert!(wait.insert(A, "ctx", 2, false, "boom"));
         assert!(wait.has_result());
-        assert_eq!(wait.take(), Some((false, "boom".to_string())));
-        assert_eq!(wait.take(), None);
+        assert_eq!(
+            wait.take_full(),
+            Some((false, "boom".to_string(), String::new()))
+        );
+        assert_eq!(wait.take_full(), None);
         // begin() drops any previous answer.
         wait.begin(A, "ctx", 3);
-        assert_eq!(wait.take(), None);
+        assert_eq!(wait.take_full(), None);
         wait.clear();
         assert!(!wait.insert(A, "ctx", 3, true, ""));
+    }
+
+    #[test]
+    fn text_unavailable_then_surrounding_text_gives_text() {
+        let mut state = BridgeState::new();
+        state.focus_in(A, "ctx", "chromium", false);
+        assert_eq!(state.focused_kind(), None);
+        state.text_unavailable(A, "ctx", true).unwrap();
+        assert_eq!(state.focused_kind(), Some(FocusedKind::SelectOnly));
+        assert_eq!(state.focused_text(), None);
+        state.surrounding_text(A, "ctx", "hello", 5, 5).unwrap();
+        assert_eq!(
+            state.focused_kind(),
+            Some(FocusedKind::Text(FocusedText {
+                text: "hello".to_string(),
+                caret: 5,
+                selection: None,
+            }))
+        );
+        // TextUnavailable again shadows the stale text until fresh text arrives.
+        state.text_unavailable(A, "ctx", true).unwrap();
+        assert_eq!(state.focused_kind(), Some(FocusedKind::SelectOnly));
+    }
+
+    #[test]
+    fn text_unavailable_without_select_fallback_gives_none() {
+        let mut state = BridgeState::new();
+        state.focus_in(A, "ctx", "chromium", true);
+        state.text_unavailable(A, "ctx", true).unwrap();
+        // Password fields never offer the select fallback.
+        assert_eq!(state.focused_kind(), None);
+        state.focus_in(A, "ctx", "chromium", false);
+        state.text_unavailable(A, "ctx", false).unwrap();
+        // No select capability: nothing to show.
+        assert_eq!(state.focused_kind(), None);
+        assert_eq!(state.focused_text(), None);
+    }
+
+    #[test]
+    fn selected_answers_match_by_request_and_sender() {
+        let mut wait = ReplaceWait::new();
+        wait.begin(A, "ctx", 2);
+        // Other request id, other sender, other context: ignored.
+        assert!(!wait.insert_full(A, "ctx", 1, true, "", "stale"));
+        assert!(!wait.insert_full(B, "ctx", 2, true, "", "stale"));
+        assert!(!wait.insert_full(A, "other", 2, true, "", "stale"));
+        assert!(!wait.has_result());
+        assert_eq!(wait.take_full(), None);
+        // The exact triple stores the text payload.
+        assert!(wait.insert_full(A, "ctx", 2, true, "", "line text"));
+        assert!(wait.has_result());
+        assert_eq!(
+            wait.take_full(),
+            Some((true, String::new(), "line text".to_string()))
+        );
+        assert_eq!(wait.take_full(), None);
+        // Failures carry the error instead.
+        wait.begin(A, "ctx", 3);
+        assert!(wait.insert_full(A, "ctx", 3, false, "boom", ""));
+        assert_eq!(
+            wait.take_full(),
+            Some((false, "boom".to_string(), String::new()))
+        );
     }
 
     #[test]

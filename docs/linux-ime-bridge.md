@@ -65,7 +65,16 @@ otherwise it is a no-op.
 
 Stores the text around the cursor for a context that had `FocusIn`.
 `cursor` is the caret offset; `anchor` is the other end of the selection,
-or equal to `cursor` when there is none.
+or equal to `cursor` when there is none. A valid `SurroundingText` cancels
+an earlier `TextUnavailable` for that context.
+
+### `TextUnavailable(context: s, can_select: b)`
+
+The focused context has no surrounding text (the app doesn't share it with
+input methods). `can_select` says whether the bridge can select the line on
+request (the select fallback below). Writely still shows the "W" when
+`can_select` is true. A later valid `SurroundingText` for that context
+cancels it.
 
 ### `Clicked(context: s, action: s)`
 
@@ -80,8 +89,14 @@ may destroy contexts that never reached `FocusIn`.
 
 ### `ReplaceResult(context: s, request: u, ok: b, error: s)`
 
-Answer to a `Replace` signal: whether replacing `request` worked, with a
-human-readable `error` when it didn't.
+Answer to a `Replace` or `ReplaceSelection` signal: whether replacing
+`request` worked, with a human-readable `error` when it didn't.
+
+### `Selected(context: s, request: u, ok: b, text: s, error: s)`
+
+Answer to a `SelectRequest` signal: the text selected from the cursor back
+to the start of the line, or `ok=false` with a human-readable `error` when
+selecting failed.
 
 ## Signals (Writely emits these)
 
@@ -96,9 +111,18 @@ the unique name of the bridge that owns the context, never broadcast.
   (the icon and any message).
 - `Replace(context: s, request: u, start: u, end: u, text: s)` — replace
   chars `start..end` of that context's latest surrounding text with `text`.
-  `request` increases by 1 per `Replace`, starting at 1; answer with
-  `ReplaceResult`. After `ReplaceResult(ok=true)` send a fresh
+  Answer with `ReplaceResult`. After `ReplaceResult(ok=true)` send a fresh
   `SurroundingText` with the new text.
+- `SelectRequest(context: s, request: u)` — select from the cursor back to
+  the start of the line and report the selection with `Selected`. Only sent
+  for contexts that reported `TextUnavailable` with `can_select=true`, and
+  only after the user clicks the "W" (never on caret changes).
+- `ReplaceSelection(context: s, request: u, text: s)` — replace the active
+  selection (the one reported by `Selected`) with `text`. Answer with
+  `ReplaceResult`.
+
+`request` increases by 1 per `Replace`, `SelectRequest` and
+`ReplaceSelection` from a single counter, starting at 1.
 
 Watch them with e.g.:
 
@@ -126,8 +150,10 @@ The first positional argument is the surrounding text (default
 once after the first `ShowIcon`; `--apply` sends `Clicked apply` once after
 a `ShowMessage` with `can_apply=True`. On `Replace` the script applies the
 range to its own text, sends `ReplaceResult(ok=true)` and a fresh
-`SurroundingText`. After `--timeout N` seconds (default 30) it sends
-`Destroy` and exits 0.
+`SurroundingText`. `--no-text` sends `TextUnavailable` instead of
+`SurroundingText`, answers `SelectRequest` with the positional text, and
+answers `ReplaceSelection` with `ReplaceResult(ok=true)`. After `--timeout
+N` seconds (default 30) it sends `Destroy` and exits 0.
 
 ## Errors
 
@@ -139,8 +165,8 @@ method and the bad values (also printed to stderr as `Writely: ...`):
   `SurroundingText: cursor {cursor} / anchor {anchor} is past the end of the {len}-character text.`
 - unknown action:
   `Clicked: unknown action "{action}" (expected check, apply or dismiss).`
-- `SurroundingText`/`Clicked`/`ReplaceResult` for a context that never had
-  `FocusIn` from that sender:
+- `SurroundingText`/`TextUnavailable`/`Clicked`/`ReplaceResult`/`Selected`
+  for a context that never had `FocusIn` from that sender:
   `{Method}: unknown context "{context}"; call FocusIn first.`
 
 ## Bridge disconnects

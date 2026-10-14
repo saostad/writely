@@ -20,7 +20,7 @@ use zbus::DBusError;
 
 use crate::UserEvent;
 
-use super::{BridgeState, ClickAction, FocusedText, ReplaceWait};
+use super::{BridgeState, ClickAction, FocusedKind, FocusedText, ReplaceWait};
 
 const WELL_KNOWN_NAME: &str = "dev.writely.Writely";
 const OBJECT_PATH: &str = "/dev/writely/ImeBridge";
@@ -47,13 +47,13 @@ struct Shared {
 }
 
 /// What the focused context looks like, for change detection.
-type Fingerprint = (Option<(String, String)>, Option<FocusedText>);
+type Fingerprint = (Option<(String, String)>, Option<FocusedKind>);
 
 fn fingerprint(state: &BridgeState) -> Fingerprint {
     let key = state
         .focused_key()
         .map(|(sender, context)| (sender.to_string(), context.to_string()));
-    (key, state.focused_text())
+    (key, state.focused_kind())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -151,6 +151,53 @@ impl ImeBridge {
         Ok(())
     }
 
+    fn text_unavailable(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        context: &str,
+        can_select: bool,
+    ) -> Result<(), BridgeError> {
+        let sender = sender_of(&header);
+        let mut state = lock(&self.shared.state);
+        let before = fingerprint(&state);
+        if let Err(message) = state.text_unavailable(&sender, context, can_select) {
+            eprintln!("Writely: {message}");
+            return Err(BridgeError::InvalidArgument(message));
+        }
+        notify_if_changed(&self.shared.proxy, &state, &before);
+        Ok(())
+    }
+
+    fn selected(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        context: &str,
+        request: u32,
+        ok: bool,
+        text: &str,
+        error: &str,
+    ) -> Result<(), BridgeError> {
+        let sender = sender_of(&header);
+        {
+            let state = lock(&self.shared.state);
+            if let Err(message) = state.selected(&sender, context, request, ok, text, error) {
+                eprintln!("Writely: {message}");
+                return Err(BridgeError::InvalidArgument(message));
+            }
+        }
+        // Stored only when it answers the in-flight `SelectRequest`; results
+        // for any other request, context or sender are ignored.
+        let stored =
+            lock(&self.shared.replace_wait).insert_full(&sender, context, request, ok, error, text);
+        if stored {
+            self.shared.replace_cv.notify_one();
+        }
+        eprintln!(
+            "Writely: input method bridge Selected for context \"{context}\" request {request}: ok={ok} error=\"{error}\"."
+        );
+        Ok(())
+    }
+
     fn clicked(
         &self,
         #[zbus(header)] header: Header<'_>,
@@ -190,7 +237,7 @@ impl ImeBridge {
         let before = fingerprint(&state);
         state.destroy(&sender, context);
         notify_if_changed(&self.shared.proxy, &state, &before);
-        // Wake any `Replace` waiter: the context may be gone.
+        // Wake any answer waiter: the context may be gone.
         self.shared.replace_cv.notify_all();
     }
 
@@ -274,6 +321,23 @@ pub fn emit_replace(
     )
 }
 
+// Used from item 2 wiring.
+#[allow(dead_code)]
+pub fn emit_select_request(destination: &str, context: &str, request: u32) -> Result<(), String> {
+    emit("SelectRequest", destination, &(context, request))
+}
+
+// Used from item 2 wiring.
+#[allow(dead_code)]
+pub fn emit_replace_selection(
+    destination: &str,
+    context: &str,
+    request: u32,
+    text: &str,
+) -> Result<(), String> {
+    emit("ReplaceSelection", destination, &(context, request, text))
+}
+
 fn shared() -> Option<Arc<Shared>> {
     SHARED.get().cloned()
 }
@@ -300,6 +364,57 @@ fn closed_error() -> String {
     "The input method closed the text field before the replacement finished.".to_string()
 }
 
+fn select_closed_error() -> String {
+    "The input method closed the text field before the selection finished.".to_string()
+}
+
+/// Waits for the in-flight bridge answer (`ReplaceResult` or `Selected`).
+/// No D-Bus, no statics: the caller supplies the wait state, the wakeup, a
+/// `context_exists` check and the error messages. Returns the text payload
+/// (`Selected`'s text; empty for `ReplaceResult`).
+/// Never holds a guard across another `lock` of the same mutex.
+fn wait_for_answer(
+    answer_wait: &Mutex<ReplaceWait>,
+    answer_cv: &Condvar,
+    timeout: Duration,
+    context_exists: impl Fn() -> bool,
+    fail_message: impl Fn(String) -> String,
+    timeout_message: &str,
+    closed_message: &str,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Take into a local first: the guard must be dropped before the
+        // `clear()` below locks the same mutex again.
+        let result = lock(answer_wait).take_full();
+        if let Some((ok, error, text)) = result {
+            lock(answer_wait).clear();
+            if ok {
+                return Ok(text);
+            }
+            return Err(fail_message(error));
+        }
+        if !context_exists() {
+            lock(answer_wait).clear();
+            return Err(closed_message.to_string());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            lock(answer_wait).clear();
+            return Err(timeout_message.to_string());
+        }
+        let wait = lock(answer_wait);
+        // Re-check under the lock before sleeping: the answer may have
+        // landed between the take above and this lock.
+        if wait.has_result() {
+            continue;
+        }
+        let _ = answer_cv
+            .wait_timeout(wait, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
 /// Waits for the in-flight `Replace` answer. No D-Bus, no statics: the
 /// caller supplies the wait state, the wakeup and a `context_exists` check.
 /// Never holds a guard across another `lock` of the same mutex.
@@ -309,41 +424,16 @@ fn wait_for_replace(
     timeout: Duration,
     context_exists: impl Fn() -> bool,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        // Take into a local first: the guard must be dropped before the
-        // `clear()` below locks the same mutex again.
-        let result = lock(replace_wait).take();
-        if let Some((ok, error)) = result {
-            lock(replace_wait).clear();
-            if ok {
-                return Ok(());
-            }
-            return Err(format!(
-                "The input method could not replace the text: {error}"
-            ));
-        }
-        if !context_exists() {
-            lock(replace_wait).clear();
-            return Err(closed_error());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            lock(replace_wait).clear();
-            return Err(
-                "The input method didn't confirm the replacement within 3 seconds.".to_string(),
-            );
-        }
-        let wait = lock(replace_wait);
-        // Re-check under the lock before sleeping: the answer may have
-        // landed between the take above and this lock.
-        if wait.has_result() {
-            continue;
-        }
-        let _ = replace_cv
-            .wait_timeout(wait, remaining)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
+    wait_for_answer(
+        replace_wait,
+        replace_cv,
+        timeout,
+        context_exists,
+        |error| format!("The input method could not replace the text: {error}"),
+        "The input method didn't confirm the replacement within 3 seconds.",
+        &closed_error(),
+    )
+    .map(|_| ())
 }
 
 /// Emits `Replace` with the next request id and waits up to 3 seconds for
@@ -363,6 +453,67 @@ pub(crate) fn replace_and_wait(
     // missed between the emit and the wait.
     lock(&shared.replace_wait).begin(sender, context, request);
     if let Err(error) = emit_replace(sender, context, request, start, end, text) {
+        lock(&shared.replace_wait).clear();
+        return Err(format!(
+            "Could not send the replacement to the input method: {error}"
+        ));
+    }
+    wait_for_replace(
+        &shared.replace_wait,
+        &shared.replace_cv,
+        Duration::from_secs(3),
+        || lock(&shared.state).context_exists(sender, context),
+    )
+}
+
+/// Emits `SelectRequest` with the next request id and waits up to 2 seconds
+/// for the matching `Selected`, returning the selected text. Shares the one
+/// in-flight wait with `replace_and_wait`; both run on the event-loop
+/// thread, so they never overlap. Never holds the state lock while waiting.
+#[allow(dead_code)] // Used from item 2 wiring.
+pub(crate) fn select_and_wait(sender: &str, context: &str) -> Result<String, String> {
+    let shared = shared().ok_or_else(select_closed_error)?;
+    let request = lock(&shared.state).next_request();
+    // Mark the request pending before emitting, so a fast answer can't be
+    // missed between the emit and the wait.
+    lock(&shared.replace_wait).begin(sender, context, request);
+    if let Err(error) = emit_select_request(sender, context, request) {
+        lock(&shared.replace_wait).clear();
+        return Err(format!(
+            "Could not send the selection request to the input method: {error}"
+        ));
+    }
+    let text = wait_for_answer(
+        &shared.replace_wait,
+        &shared.replace_cv,
+        Duration::from_secs(2),
+        || lock(&shared.state).context_exists(sender, context),
+        |error| format!("The input method could not select the text: {error}"),
+        "The input method didn't answer the selection request within 2 seconds.",
+        &select_closed_error(),
+    )?;
+    if text.is_empty() {
+        return Err(
+            "There is no text before the cursor on this line. Click at the end of the sentence you want to check."
+                .to_string(),
+        );
+    }
+    Ok(text)
+}
+
+/// Emits `ReplaceSelection` with the next request id and waits up to
+/// 3 seconds for the matching `ReplaceResult`. Same messages as
+/// `replace_and_wait`.
+#[allow(dead_code)] // Used from item 2 wiring.
+pub(crate) fn replace_selection_and_wait(
+    sender: &str,
+    context: &str,
+    text: &str,
+) -> Result<(), String> {
+    let shared = shared().ok_or_else(closed_error)?;
+    let request = lock(&shared.state).next_request();
+    lock(&shared.replace_wait).begin(sender, context, request);
+    if let Err(error) = emit_replace_selection(sender, context, request, text) {
         lock(&shared.replace_wait).clear();
         return Err(format!(
             "Could not send the replacement to the input method: {error}"
@@ -476,7 +627,7 @@ fn serve(proxy: EventLoopProxy<UserEvent>) {
         let before = fingerprint(&state);
         state.sender_vanished(unique.as_str());
         notify_if_changed(&shared.proxy, &state, &before);
-        // Wake any `Replace` waiter: its context may be gone.
+        // Wake any answer waiter: its context may be gone.
         shared.replace_cv.notify_all();
     }
     eprintln!("Writely: the input method bridge lost its D-Bus connection.");

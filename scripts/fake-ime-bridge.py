@@ -40,6 +40,9 @@ def main():
                         help="send Clicked check once after the first ShowIcon")
     parser.add_argument("--apply", action="store_true",
                         help="send Clicked apply once after a ShowMessage with can_apply=True")
+    parser.add_argument("--no-text", action="store_true",
+                        help="send TextUnavailable instead of SurroundingText, "
+                             "and answer SelectRequest/ReplaceSelection")
     parser.add_argument("--timeout", type=int, default=30,
                         help="seconds before Destroy and exit 0 (default 30)")
     args = parser.parse_args()
@@ -85,6 +88,18 @@ def main():
             cursor = len(state["text"])
             call(connection, "SurroundingText",
                  GLib.Variant("(ssuu)", (context, state["text"], cursor, cursor)))
+        elif signal == "SelectRequest":
+            (context, request) = values
+            print(f"signal SelectRequest {context} request={request}", flush=True)
+            call(connection, "Selected",
+                 GLib.Variant("(subss)", (context, request, True, state["text"], "")))
+        elif signal == "ReplaceSelection":
+            (context, request, text) = values
+            print(f"signal ReplaceSelection {context} request={request}: {text}",
+                  flush=True)
+            print(f"selection replaced with: {text}", flush=True)
+            call(connection, "ReplaceResult",
+                 GLib.Variant("(subs)", (context, request, True, "")))
         else:
             print(f"signal {signal} {values}", flush=True)
 
@@ -96,9 +111,13 @@ def main():
     call(connection, "Hello", GLib.Variant("(ss)", ("fake", "1")))
     call(connection, "FocusIn",
          GLib.Variant("(ssb)", (CONTEXT, "fake-ime-bridge", False)))
-    cursor = len(state["text"])
-    call(connection, "SurroundingText",
-         GLib.Variant("(ssuu)", (CONTEXT, state["text"], cursor, cursor)))
+    if args.no_text:
+        call(connection, "TextUnavailable",
+             GLib.Variant("(sb)", (CONTEXT, True)))
+    else:
+        cursor = len(state["text"])
+        call(connection, "SurroundingText",
+             GLib.Variant("(ssuu)", (CONTEXT, state["text"], cursor, cursor)))
 
     loop = GLib.MainLoop()
 
