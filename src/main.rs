@@ -3,6 +3,7 @@
 #[cfg(target_os = "macos")]
 mod clipboard;
 mod config;
+mod diff;
 mod overlay;
 mod popup;
 mod providers;
@@ -614,14 +615,16 @@ fn handle_suggestion(
                     );
                 }
                 providers::SuggestionOutcome::Suggestion => {
-                    show_popup(
-                        &suggestion,
-                        false,
-                        true,
-                        *last_anchor,
-                        active.snap.as_ref().map(|snap| snap.caret_rect),
-                        last_anchor,
-                    );
+                    if let Some(rect) =
+                        (*last_anchor).or(active.snap.as_ref().map(|snap| snap.caret_rect))
+                    {
+                        *last_anchor = Some(rect);
+                        popup::show_suggestion(&active.sentence, &suggestion, &rect);
+                    } else {
+                        eprintln!(
+                            "Writely: could not show the suggestion: the caret position is unknown."
+                        );
+                    }
                     *pending = Some(Pending {
                         snap: active.snap,
                         range: active.range,

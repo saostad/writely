@@ -52,6 +52,21 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
     }
 }
 
+/// Shows the suggestion with the word-level diff (what changed) and the
+/// Cancel/Replace footer. On platforms without the diff view this falls back
+/// to the plain suggestion text.
+pub fn show_suggestion(original: &str, suggestion: &str, caret: &CaretRect) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::show_suggestion(original, suggestion, caret);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        show_message(suggestion, false, true, caret);
+        let _ = original;
+    }
+}
+
 pub fn hide() {
     #[cfg(target_os = "macos")]
     {

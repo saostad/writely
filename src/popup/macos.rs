@@ -4,14 +4,17 @@ use std::sync::OnceLock;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, sel, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AnyThread, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventMask, NSFont, NSPanel, NSScreen,
-    NSScrollView, NSTextField, NSTextView, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSStatusWindowLevel, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventMask, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSMutableParagraphStyle, NSParagraphStyleAttributeName,
+    NSStatusWindowLevel, NSPanel, NSScreen, NSScrollView, NSStrikethroughStyleAttributeName,
+    NSTextField, NSTextView, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSMutableAttributedString, NSAttributedString, NSAttributedStringKey,
+    NSDictionary, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 use tao::event_loop::EventLoopProxy;
 
@@ -428,6 +431,159 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
     })
 }
 
+/// Builds one inline attributed text for the suggestion: unchanged tokens in
+/// `labelColor`; removed tokens in red with a strikethrough; inserted tokens
+/// in green, semibold. 13 pt with 3 pt line spacing, wrapping to `width`.
+fn build_diff_attributed(original: &str, suggestion: &str, width: f64) -> Retained<NSMutableAttributedString> {
+    let regular = NSFont::systemFontOfSize(13.0);
+    let semibold = NSFont::boldSystemFontOfSize(13.0);
+    let paragraph = NSMutableParagraphStyle::new();
+    paragraph.setLineSpacing(3.0);
+    // SAFETY: the paragraph style object is valid for the duration of the call.
+    let full: Retained<NSMutableAttributedString> =
+        NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &NSString::from_str(""));
+    let _ = width;
+    for op in crate::diff::diff_words(original, suggestion) {
+        let (text, font, color, strike) = match op {
+            crate::diff::DiffOp::Equal(s) => (s, regular.clone(), NSColor::labelColor(), false),
+            crate::diff::DiffOp::Delete(s) => (s, regular.clone(), NSColor::systemRedColor(), true),
+            crate::diff::DiffOp::Insert(s) => (s, semibold.clone(), NSColor::systemGreenColor(), false),
+        };
+        let font_key: &NSAttributedStringKey =
+            // SAFETY: NSFontAttributeName is a framework-provided constant.
+            unsafe { NSFontAttributeName };
+        let color_key: &NSAttributedStringKey =
+            // SAFETY: NSForegroundColorAttributeName is a framework-provided constant.
+            unsafe { NSForegroundColorAttributeName };
+        let paragraph_key: &NSAttributedStringKey =
+            // SAFETY: NSParagraphStyleAttributeName is a framework-provided constant.
+            unsafe { NSParagraphStyleAttributeName };
+        let strike_key: &NSAttributedStringKey =
+            // SAFETY: NSStrikethroughStyleAttributeName is a framework-provided constant.
+            unsafe { NSStrikethroughStyleAttributeName };
+        let keys3: [&NSAttributedStringKey; 3] = [font_key, color_key, paragraph_key];
+        let dict: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> = if strike {
+            let one = NSNumber::numberWithInt(1);
+            let keys4: [&NSAttributedStringKey; 4] =
+                [font_key, color_key, paragraph_key, strike_key];
+            let objects: Vec<&AnyObject> = vec![&font, &color, &paragraph, &one];
+            NSDictionary::from_slices(&keys4, &objects)
+        } else {
+            let objects: Vec<&AnyObject> = vec![&font, &color, &paragraph];
+            NSDictionary::from_slices(&keys3, &objects)
+        };
+        // SAFETY: the string and attribute dictionary hold valid objects of the expected kinds.
+        let segment: Retained<NSAttributedString> = unsafe {
+            NSAttributedString::initWithString_attributes(
+                NSAttributedString::alloc(),
+                &NSString::from_str(&text),
+                Some(&dict),
+            )
+        };
+        full.appendAttributedString(&segment);
+    }
+    full
+}
+
+/// Lays out the card for an attributed suggestion body. Returns the panel height.
+fn layout_attributed(body: &NSAttributedString) -> f64 {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(popup) = state.as_mut() else {
+            return 0.0;
+        };
+        // SAFETY: the text storage exists for a freshly created NSTextView.
+        unsafe {
+            if let Some(storage) = popup.text.textStorage() {
+                storage.setAttributedString(body);
+            }
+        }
+        popup.text.setEditable(false);
+        popup.text.setSelectable(false);
+        let text_width = CARD_WIDTH - 2.0 * SIDE_PAD;
+        // SAFETY: the text container exists for a freshly created NSTextView.
+        unsafe {
+            if let Some(container) = popup.text.textContainer() {
+                container.setWidthTracksTextView(false);
+                container.setContainerSize(NSSize::new(text_width, 1_000_000.0));
+            }
+        }
+        popup.text.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(text_width, 1_000_000.0),
+        ));
+        // SAFETY: the layout manager exists for a freshly created NSTextView.
+        let mut needed: f64 = BODY_MIN;
+        unsafe {
+            if let (Some(layout), Some(container)) =
+                (popup.text.layoutManager(), popup.text.textContainer())
+            {
+                layout.ensureLayoutForTextContainer(&container);
+                needed = layout.usedRectForTextContainer(&container).size.height;
+            }
+        }
+        let body_height = needed.clamp(BODY_MIN, BODY_MAX);
+        let panel_height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
+
+        popup.card.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(CARD_WIDTH, panel_height),
+        ));
+        let subviews = popup.card.subviews();
+        if subviews.count() >= 2 {
+            let title_view = subviews.objectAtIndex(0);
+            title_view.setFrame(NSRect::new(
+                NSPoint::new(SIDE_PAD, panel_height - HEADER_HEIGHT + 4.0),
+                NSSize::new(300.0, 20.0),
+            ));
+            let close_view = subviews.objectAtIndex(1);
+            close_view.setFrame(NSRect::new(
+                NSPoint::new(CARD_WIDTH - 36.0, panel_height - HEADER_HEIGHT + 2.0),
+                NSSize::new(24.0, 24.0),
+            ));
+        }
+        popup.scroll.setFrame(NSRect::new(
+            NSPoint::new(4.0, FOOTER_HEIGHT),
+            NSSize::new(CARD_WIDTH - 8.0, body_height),
+        ));
+        popup.text.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(text_width, body_height.max(needed)),
+        ));
+        popup.separator.setHidden(false);
+        popup.separator.setFrame(NSRect::new(
+            NSPoint::new(0.0, FOOTER_HEIGHT),
+            NSSize::new(CARD_WIDTH, 1.0),
+        ));
+        popup.cancel_button.setHidden(false);
+        popup.replace_button.setHidden(false);
+        popup.replace_button.setFrame(NSRect::new(
+            NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
+            NSSize::new(90.0, 24.0),
+        ));
+        popup.cancel_button.setFrame(NSRect::new(
+            NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
+            NSSize::new(90.0, 24.0),
+        ));
+        panel_height
+    })
+}
+
+/// Shows the suggestion with the word-level diff (what changed) and the
+/// Cancel/Replace footer. Replace still inserts the plain suggestion.
+pub fn show_suggestion(original: &str, suggestion: &str, caret: &CaretRect) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        eprintln!(
+            "Writely: could not show the suggestion: Writely must update it on the main thread."
+        );
+        return;
+    };
+    ensure_popup(mtm);
+    let text_width = CARD_WIDTH - 2.0 * SIDE_PAD;
+    let body = build_diff_attributed(original, suggestion, text_width);
+    show_body(layout_attributed(&body), caret, mtm);
+}
+
 /// Shows the popup with `text`, 4 pt below the anchor (or above the caret
 /// line when there is no room below), clamped to the visible frame of the
 /// screen containing the caret. AX coords start at the top-left; AppKit at
@@ -440,15 +596,21 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         return;
     };
     ensure_popup(mtm);
+    let panel_height = layout_plain(text, is_error, show_button);
+    show_body(panel_height, caret, mtm);
+}
+
+/// Positions the already-laid-out card (of `panel_height`) at the anchor and
+/// shows it. Shared by messages and suggestions.
+fn show_body(panel_height: f64, caret: &CaretRect, mtm: MainThreadMarker) {
+    if panel_height <= 0.0 {
+        return;
+    }
     let screens = NSScreen::screens(mtm);
     if screens.count() == 0 {
         return;
     }
     let primary_height = screens.objectAtIndex(0).frame().size.height;
-    let panel_height = layout_plain(text, is_error, show_button);
-    if panel_height <= 0.0 {
-        return;
-    }
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(popup) = state.as_mut() else {
