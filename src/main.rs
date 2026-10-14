@@ -238,29 +238,42 @@ fn handle_suggestion(
             let Some(active) = checking.take() else {
                 return;
             };
-            if suggestion.trim() == active.sentence.trim() {
-                show_popup(
-                    "Looks good — no changes needed.",
-                    false,
-                    false,
-                    *last_anchor,
-                    Some(active.snap.caret_rect),
-                    last_anchor,
-                );
-            } else {
-                show_popup(
-                    &suggestion,
-                    false,
-                    true,
-                    *last_anchor,
-                    Some(active.snap.caret_rect),
-                    last_anchor,
-                );
-                *pending = Some(Pending {
-                    snap: active.snap,
-                    range: active.range,
-                    suggestion,
-                });
+            match gemini::classify_suggestion(&suggestion, &active.sentence) {
+                gemini::SuggestionOutcome::Unclear => {
+                    show_popup(
+                        gemini::UNCLEAR_MESSAGE,
+                        false,
+                        false,
+                        *last_anchor,
+                        Some(active.snap.caret_rect),
+                        last_anchor,
+                    );
+                }
+                gemini::SuggestionOutcome::Unchanged => {
+                    show_popup(
+                        "Looks good — no changes needed.",
+                        false,
+                        false,
+                        *last_anchor,
+                        Some(active.snap.caret_rect),
+                        last_anchor,
+                    );
+                }
+                gemini::SuggestionOutcome::Suggestion => {
+                    show_popup(
+                        &suggestion,
+                        false,
+                        true,
+                        *last_anchor,
+                        Some(active.snap.caret_rect),
+                        last_anchor,
+                    );
+                    *pending = Some(Pending {
+                        snap: active.snap,
+                        range: active.range,
+                        suggestion,
+                    });
+                }
             }
         }
     }

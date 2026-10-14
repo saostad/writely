@@ -3,7 +3,29 @@ use std::time::Duration;
 
 pub const GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 
-const SYSTEM_INSTRUCTION: &str = "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged. Keep line breaks and paragraph breaks as they are.";
+const SYSTEM_INSTRUCTION: &str = "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged. Keep line breaks and paragraph breaks as they are. If the text is not understandable English (random letters or gibberish), reply with exactly UNCLEAR and nothing else.";
+
+pub const UNCLEAR_MARKER: &str = "UNCLEAR";
+
+pub const UNCLEAR_MESSAGE: &str =
+    "Writely couldn't understand this text, so there's no suggestion.";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SuggestionOutcome {
+    Unclear,
+    Unchanged,
+    Suggestion,
+}
+
+pub fn classify_suggestion(suggestion: &str, sentence: &str) -> SuggestionOutcome {
+    if suggestion.trim() == UNCLEAR_MARKER {
+        SuggestionOutcome::Unclear
+    } else if suggestion.trim() == sentence.trim() {
+        SuggestionOutcome::Unchanged
+    } else {
+        SuggestionOutcome::Suggestion
+    }
+}
 
 pub fn build_request_body(sentence: &str) -> serde_json::Value {
     serde_json::json!({
@@ -127,7 +149,10 @@ pub fn suggest(api_key: &str, sentence: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_request_body, parse_response, GEMINI_MODEL};
+    use super::{
+        build_request_body, classify_suggestion, parse_response, SuggestionOutcome, GEMINI_MODEL,
+        UNCLEAR_MARKER, UNCLEAR_MESSAGE,
+    };
 
     #[test]
     fn model_name_is_the_required_one() {
@@ -139,7 +164,7 @@ mod tests {
         let body = build_request_body("She go to school.");
         assert_eq!(
             body["systemInstruction"]["parts"][0]["text"],
-            "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged. Keep line breaks and paragraph breaks as they are."
+            "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged. Keep line breaks and paragraph breaks as they are. If the text is not understandable English (random letters or gibberish), reply with exactly UNCLEAR and nothing else."
         );
         assert_eq!(body["contents"][0]["parts"][0]["text"], "She go to school.");
         assert_eq!(body["generationConfig"]["temperature"], 0);
@@ -213,6 +238,32 @@ mod tests {
         assert_eq!(
             parse_response(200, body).expect_err("should fail"),
             "Gemini returned no suggestion (finishReason: unknown)."
+        );
+    }
+
+    #[test]
+    fn classify_suggestion_distinguishes_three_outcomes() {
+        assert_eq!(UNCLEAR_MARKER, "UNCLEAR");
+        assert_eq!(
+            UNCLEAR_MESSAGE,
+            "Writely couldn't understand this text, so there's no suggestion."
+        );
+        assert_eq!(
+            classify_suggestion("UNCLEAR", "Sig we we ef wet wf wet"),
+            SuggestionOutcome::Unclear
+        );
+        // Unclear wins over unchanged, even with surrounding whitespace.
+        assert_eq!(
+            classify_suggestion("  UNCLEAR  ", "UNCLEAR"),
+            SuggestionOutcome::Unclear
+        );
+        assert_eq!(
+            classify_suggestion("She goes to school.", "She goes to school."),
+            SuggestionOutcome::Unchanged
+        );
+        assert_eq!(
+            classify_suggestion("She goes to school.", "She go to school."),
+            SuggestionOutcome::Suggestion
         );
     }
 }
