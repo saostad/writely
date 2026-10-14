@@ -801,6 +801,8 @@ fn main() {
     let mut _hotkey_manager: Option<global_hotkey::GlobalHotKeyManager> = None;
     let mut settings_id = tray_icon::menu::MenuId::new("settings");
     let mut quit_id = tray_icon::menu::MenuId::new("quit");
+    #[cfg(target_os = "linux")]
+    let mut check_text_id = tray_icon::menu::MenuId::new("check-text");
     let mut caret_watcher: Option<watcher::Watcher> = None;
     let mut last_caret_error: Option<String> = None;
     // Popup flow state: bumped on every click and on hide so late Gemini
@@ -828,10 +830,22 @@ fn main() {
                 }
                 let settings_item = MenuItem::with_id("settings", "Settings…", true, None);
                 let quit_item = MenuItem::with_id("quit", "Quit Writely", true, None);
+                #[cfg(target_os = "linux")]
+                let check_text_item =
+                    MenuItem::with_id("check-text", "Check text…", true, None);
                 settings_id = settings_item.id().clone();
                 quit_id = quit_item.id().clone();
+                #[cfg(target_os = "linux")]
+                {
+                    check_text_id = check_text_item.id().clone();
+                }
 
-                let menu = match Menu::with_items(&[&settings_item, &quit_item]) {
+                #[cfg(target_os = "linux")]
+                let menu_result =
+                    Menu::with_items(&[&check_text_item, &settings_item, &quit_item]);
+                #[cfg(not(target_os = "linux"))]
+                let menu_result = Menu::with_items(&[&settings_item, &quit_item]);
+                let menu = match menu_result {
                     Ok(menu) => menu,
                     Err(error) => {
                         eprintln!("Writely: could not create the tray icon: {error}");
@@ -871,14 +885,9 @@ fn main() {
                 #[cfg(not(target_os = "linux"))]
                 let bridge_mode = false;
                 if bridge_mode {
-                    const WAITING: &str = "Writely is waiting for its input method add-on (IBus or fcitx5). Until it is installed and running, Writely can't see what you type.";
+                    const WAITING: &str = "On Wayland, Writely can't see what you type in other apps. Open “Check text…” from the Writely menu and paste your text there.";
                     eprintln!("Writely: {WAITING}");
                     settings::set_permission_message(Some(WAITING.to_string()));
-                    if let Some(tray) = &tray_icon {
-                        if let Err(error) = tray.set_tooltip(Some(WAITING)) {
-                            eprintln!("Writely: could not update the tray tooltip: {error}");
-                        }
-                    }
                 } else {
                     match text_access::check_permission(true) {
                         Ok(()) => {
@@ -906,6 +915,12 @@ fn main() {
                 }
             }
             Event::UserEvent(UserEvent::MenuEvent(event)) => {
+                #[cfg(target_os = "linux")]
+                if event.id == check_text_id {
+                    if let Err(error) = check_window::show() {
+                        eprintln!("Writely: {error}");
+                    }
+                }
                 if event.id == settings_id {
                     popup::hide();
                     // A stale permission message (e.g. granted after startup)
