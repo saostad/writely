@@ -29,11 +29,11 @@ pub fn settings_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        return PathBuf::from(home)
+        PathBuf::from(home)
             .join("Library")
             .join("Application Support")
             .join("Writely")
-            .join("settings.json");
+            .join("settings.json")
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -300,10 +300,12 @@ mod tests {
 
     #[test]
     fn round_trip_through_json() {
-        let mut settings = AppSettings::default();
-        settings.provider = Provider::Together;
+        let mut settings = AppSettings {
+            provider: Provider::Together,
+            effort: Effort::Low,
+            ..AppSettings::default()
+        };
         settings.set_model(Provider::Together, "deepseek-ai/DeepSeek-V4.1-Flash");
-        settings.effort = Effort::Low;
         settings.ollama_url = "http://localhost:11434".to_string();
         let json = serde_json::to_string_pretty(&settings).expect("should serialize");
         let back: AppSettings = serde_json::from_str(&json).expect("should parse");

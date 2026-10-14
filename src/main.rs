@@ -2,8 +2,11 @@
 
 #[cfg(target_os = "macos")]
 mod clipboard;
+#[allow(dead_code)]
 mod config;
 mod gemini;
+#[allow(dead_code)]
+mod providers;
 mod overlay;
 mod popup;
 mod settings;

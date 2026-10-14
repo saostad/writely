@@ -1,269 +1,37 @@
-use std::sync::OnceLock;
-use std::time::Duration;
+//! Compatibility shim: the providers live in `crate::providers` now.
+//! `main.rs` still uses this module until the click flow switches over.
 
-pub const GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
+use crate::config::{AppSettings, Effort, Provider, DEFAULT_GEMINI_MODEL};
 
-const SYSTEM_INSTRUCTION: &str = "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged. Keep line breaks and paragraph breaks as they are. If the text is not understandable English (random letters or gibberish), reply with exactly UNCLEAR and nothing else.";
+pub const GEMINI_MODEL: &str = DEFAULT_GEMINI_MODEL;
 
-pub const UNCLEAR_MARKER: &str = "UNCLEAR";
+#[allow(dead_code)]
+pub const UNCLEAR_MARKER: &str = crate::providers::UNCLEAR_MARKER;
 
-pub const UNCLEAR_MESSAGE: &str =
-    "Writely couldn't understand this text, so there's no suggestion.";
+pub const UNCLEAR_MESSAGE: &str = crate::providers::UNCLEAR_MESSAGE;
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum SuggestionOutcome {
-    Unclear,
-    Unchanged,
-    Suggestion,
-}
+pub use crate::providers::{classify_suggestion, SuggestionOutcome};
 
-pub fn classify_suggestion(suggestion: &str, sentence: &str) -> SuggestionOutcome {
-    if suggestion.trim() == UNCLEAR_MARKER {
-        SuggestionOutcome::Unclear
-    } else if suggestion.trim() == sentence.trim() {
-        SuggestionOutcome::Unchanged
-    } else {
-        SuggestionOutcome::Suggestion
-    }
-}
-
+#[allow(dead_code)]
 pub fn build_request_body(sentence: &str) -> serde_json::Value {
-    serde_json::json!({
-        "systemInstruction": {
-            "parts": [{ "text": SYSTEM_INSTRUCTION }]
-        },
-        "contents": [
-            { "parts": [{ "text": sentence }] }
-        ],
-        "generationConfig": { "temperature": 0 }
-    })
+    crate::providers::gemini::build_request_body(sentence, Effort::Default)
 }
 
+#[allow(dead_code)]
 pub fn parse_response(status: u16, body: &str) -> Result<String, String> {
-    if !(200..300).contains(&status) {
-        let detail = serde_json::from_str::<serde_json::Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(|message| message.as_str())
-                    .map(|message| message.to_string())
-            })
-            .unwrap_or_else(|| body.chars().take(300).collect());
-        return Err(format!("Gemini request failed (HTTP {status}): {detail}"));
-    }
-
-    let value: serde_json::Value = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(e) => {
-            return Err(format!("Could not parse Gemini response: {e}"));
-        }
-    };
-
-    let candidates = value
-        .get("candidates")
-        .and_then(|candidates| candidates.as_array());
-
-    let first = candidates.and_then(|list| list.first());
-
-    let finish_reason = first
-        .and_then(|candidate| candidate.get("finishReason"))
-        .and_then(|reason| reason.as_str())
-        .map(|reason| reason.to_string())
-        .or_else(|| {
-            value
-                .get("promptFeedback")
-                .and_then(|feedback| feedback.get("blockReason"))
-                .and_then(|reason| reason.as_str())
-                .map(|reason| reason.to_string())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let text = first
-        .and_then(|candidate| candidate.get("content"))
-        .and_then(|content| content.get("parts"))
-        .and_then(|parts| parts.as_array())
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|part| part.get("text"))
-                .filter_map(|text| text.as_str())
-                .collect::<String>()
-        })
-        .unwrap_or_default();
-
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err(format!(
-            "Gemini returned no suggestion (finishReason: {finish_reason})."
-        ));
-    }
-
-    let unquoted = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        trimmed[1..trimmed.len() - 1].trim()
-    } else {
-        trimmed
-    };
-
-    if unquoted.is_empty() {
-        return Err(format!(
-            "Gemini returned no suggestion (finishReason: {finish_reason})."
-        ));
-    }
-
-    Ok(unquoted.to_string())
-}
-
-static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-
-fn agent() -> &'static ureq::Agent {
-    AGENT.get_or_init(|| {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(20)))
-            .http_status_as_error(false)
-            .build();
-        ureq::Agent::new_with_config(config)
-    })
+    crate::providers::gemini::parse_response(status, body, GEMINI_MODEL)
 }
 
 pub fn suggest(api_key: &str, sentence: &str) -> Result<String, String> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    );
-
-    let mut response = agent()
-        .post(&url)
-        .header("x-goog-api-key", api_key)
-        .send_json(build_request_body(sentence))
-        .map_err(|e| format!("Could not reach Gemini: {e}"))?;
-
-    let status = response.status().as_u16();
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("Could not reach Gemini: {e}"))?;
-
-    parse_response(status, &body)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        build_request_body, classify_suggestion, parse_response, SuggestionOutcome, GEMINI_MODEL,
-        UNCLEAR_MARKER, UNCLEAR_MESSAGE,
+    let settings = AppSettings {
+        provider: Provider::Gemini,
+        models: {
+            let mut models = std::collections::HashMap::new();
+            models.insert("gemini".to_string(), GEMINI_MODEL.to_string());
+            models
+        },
+        effort: Effort::Default,
+        ollama_url: crate::config::DEFAULT_OLLAMA_URL.to_string(),
     };
-
-    #[test]
-    fn model_name_is_the_required_one() {
-        assert_eq!(GEMINI_MODEL, "gemini-3.5-flash-lite");
-    }
-
-    #[test]
-    fn request_body_shape() {
-        let body = build_request_body("She go to school.");
-        assert_eq!(
-            body["systemInstruction"]["parts"][0]["text"],
-            "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged. Keep line breaks and paragraph breaks as they are. If the text is not understandable English (random letters or gibberish), reply with exactly UNCLEAR and nothing else."
-        );
-        assert_eq!(body["contents"][0]["parts"][0]["text"], "She go to school.");
-        assert_eq!(body["generationConfig"]["temperature"], 0);
-    }
-
-    #[test]
-    fn parses_200_with_text() {
-        let body = r#"{"candidates":[{"content":{"parts":[{"text":"She goes to school."}],"role":"model"},"finishReason":"STOP"}]}"#;
-        assert_eq!(
-            parse_response(200, body).expect("should parse suggestion"),
-            "She goes to school."
-        );
-    }
-
-    #[test]
-    fn trims_and_strips_one_pair_of_wrapping_quotes() {
-        let body = r#"{"candidates":[{"content":{"parts":[{"text":"\"She goes to school.\""}],"role":"model"},"finishReason":"STOP"}]}"#;
-        assert_eq!(
-            parse_response(200, body).expect("should parse suggestion"),
-            "She goes to school."
-        );
-    }
-
-    #[test]
-    fn trims_returned_text() {
-        let body = r#"{"candidates":[{"content":{"parts":[{"text":"  She goes to school.  "}],"role":"model"},"finishReason":"STOP"}]}"#;
-        assert_eq!(
-            parse_response(200, body).expect("should parse suggestion"),
-            "She goes to school."
-        );
-    }
-
-    #[test]
-    fn parses_400_with_error_message() {
-        let body = r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}"#;
-        assert_eq!(
-            parse_response(400, body).expect_err("should fail"),
-            "Gemini request failed (HTTP 400): API key not valid. Please pass a valid API key."
-        );
-    }
-
-    #[test]
-    fn parses_500_with_non_json_body() {
-        assert_eq!(
-            parse_response(500, "Internal Server Error: something broke").expect_err("should fail"),
-            "Gemini request failed (HTTP 500): Internal Server Error: something broke"
-        );
-    }
-
-    #[test]
-    fn truncates_long_non_json_error_body_to_300_chars() {
-        let body = "x".repeat(400);
-        let err = parse_response(500, &body).expect_err("should fail");
-        let prefix = "Gemini request failed (HTTP 500): ";
-        assert!(err.starts_with(prefix));
-        assert_eq!(err.len(), prefix.len() + 300);
-    }
-
-    #[test]
-    fn parses_200_with_no_candidates_safety() {
-        let body = r#"{"candidates":[{"finishReason":"SAFETY","content":{"parts":[]}}]}"#;
-        assert_eq!(
-            parse_response(200, body).expect_err("should fail"),
-            "Gemini returned no suggestion (finishReason: SAFETY)."
-        );
-    }
-
-    #[test]
-    fn parses_200_with_empty_candidates_as_unknown() {
-        let body = r#"{"candidates":[]}"#;
-        assert_eq!(
-            parse_response(200, body).expect_err("should fail"),
-            "Gemini returned no suggestion (finishReason: unknown)."
-        );
-    }
-
-    #[test]
-    fn classify_suggestion_distinguishes_three_outcomes() {
-        assert_eq!(UNCLEAR_MARKER, "UNCLEAR");
-        assert_eq!(
-            UNCLEAR_MESSAGE,
-            "Writely couldn't understand this text, so there's no suggestion."
-        );
-        assert_eq!(
-            classify_suggestion("UNCLEAR", "Sig we we ef wet wf wet"),
-            SuggestionOutcome::Unclear
-        );
-        // Unclear wins over unchanged, even with surrounding whitespace.
-        assert_eq!(
-            classify_suggestion("  UNCLEAR  ", "UNCLEAR"),
-            SuggestionOutcome::Unclear
-        );
-        assert_eq!(
-            classify_suggestion("She goes to school.", "She goes to school."),
-            SuggestionOutcome::Unchanged
-        );
-        assert_eq!(
-            classify_suggestion("She goes to school.", "She go to school."),
-            SuggestionOutcome::Suggestion
-        );
-    }
+    crate::providers::gemini::suggest(&settings, Some(api_key), sentence)
 }
