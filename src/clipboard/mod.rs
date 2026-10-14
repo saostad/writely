@@ -2,4 +2,4 @@
 mod macos;
 
 #[cfg(target_os = "macos")]
-pub use macos::{copy_selected_text, paste_suggestion, CopyResult};
+pub use macos::{layered_copy_text, paste_suggestion, CopyResult};

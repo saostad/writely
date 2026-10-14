@@ -27,6 +27,13 @@ pub enum UserEvent {
     HotkeyPressed,
     ReplaceClicked,
     PermissionGranted,
+    #[cfg(target_os = "macos")]
+    CopiedText {
+        generation: u64,
+        result: Result<clipboard::CopyResult, String>,
+        pid: u32,
+        from_hotkey: bool,
+    },
     Suggestion {
         generation: u64,
         result: Result<String, String>,
@@ -169,41 +176,82 @@ fn spawn_check_thread(
     }
 }
 
-/// Copy-and-paste flow (macOS): copies the frontmost app's selection via ⌘C
-/// and starts a check on it. Never runs for a secure field (the caller
-/// checks that first).
+/// Copy-and-paste flow (macOS): the layered chain (AX selection, menu-bar
+/// Copy, simulated ⌘C) runs in a `writely-copy` worker thread — it can take
+/// up to 2 s — which sends `UserEvent::CopiedText`. Never runs for a secure
+/// field (the caller checks that first).
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
 fn handle_icon_clipboard(
     proxy: &EventLoopProxy<UserEvent>,
     pid: u32,
     anchor: Option<CaretRect>,
     generation: &mut u64,
+    last_anchor: &mut Option<CaretRect>,
+    from_hotkey: bool,
+) {
+    show_popup("Checking…", false, false, anchor, None, last_anchor);
+    let my_generation = *generation;
+    let worker_proxy = proxy.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("writely-copy".to_string())
+        .spawn(move || {
+            let result = clipboard::layered_copy_text(pid);
+            if let Err(send_error) = worker_proxy.send_event(UserEvent::CopiedText {
+                generation: my_generation,
+                result,
+                pid,
+                from_hotkey,
+            }) {
+                eprintln!("Writely: could not deliver the copied text: {send_error}");
+            }
+        })
+    {
+        show_popup(
+            &format!("Could not copy the selected text: {error}"),
+            true,
+            false,
+            anchor,
+            None,
+            last_anchor,
+        );
+    }
+}
+
+/// Handles the worker's layered-copy result: starts a check on the copied
+/// text, or tells the user to select text first.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn handle_copied_text(
+    proxy: &EventLoopProxy<UserEvent>,
+    current_generation: u64,
+    event_generation: u64,
+    result: Result<clipboard::CopyResult, String>,
+    pid: u32,
+    from_hotkey: bool,
     checking: &mut Option<Checking>,
     pending: &mut Option<Pending>,
     last_anchor: &mut Option<CaretRect>,
-    app_settings: config::AppSettings,
-    key: Option<String>,
-    from_hotkey: bool,
 ) {
-    let copied = match clipboard::copy_selected_text(pid) {
-        Ok(copied) => copied,
-        Err(error) => {
-            show_popup(&error, true, false, anchor, None, last_anchor);
-            return;
-        }
-    };
+    // Drop late results: a newer click, or typing that hid the popup, wins.
+    if event_generation != current_generation || !popup::is_visible() {
+        return;
+    }
     let empty_message = if from_hotkey {
         "Select the text you want to check, then press ⌃⌥G."
     } else {
         "Select the text you want to check, then click W."
     };
-    let text = match copied {
-        clipboard::CopyResult::Text(text) => text,
-        clipboard::CopyResult::NothingNew => {
+    let anchor = *last_anchor;
+    let text = match result {
+        Err(error) => {
+            show_popup(&error, true, false, anchor, None, last_anchor);
+            return;
+        }
+        Ok(clipboard::CopyResult::NothingNew) => {
             show_popup(empty_message, false, false, anchor, None, last_anchor);
             return;
         }
+        Ok(clipboard::CopyResult::Text(text)) => text,
     };
     if text.trim().is_empty() {
         show_popup(empty_message, false, false, anchor, None, last_anchor);
@@ -220,7 +268,48 @@ fn handle_icon_clipboard(
         );
         return;
     }
-    let my_generation = *generation;
+    let app_settings = match config::load_settings() {
+        Ok(app_settings) => app_settings,
+        Err(error) => {
+            show_popup(&error, true, false, anchor, None, last_anchor);
+            return;
+        }
+    };
+    if app_settings.current_model().is_empty() {
+        show_popup(
+            "Choose a model first: click the Writely menu-bar icon › Settings…",
+            false,
+            false,
+            anchor,
+            None,
+            last_anchor,
+        );
+        return;
+    }
+    let key: Option<String> = match app_settings.provider {
+        config::Provider::Ollama => None,
+        provider => match settings::load_api_key_for(provider) {
+            Ok(key) => key,
+            Err(error) => {
+                show_popup(&error, true, false, anchor, None, last_anchor);
+                return;
+            }
+        },
+    };
+    if key.is_none() && app_settings.provider != config::Provider::Ollama {
+        show_popup(
+            &format!(
+                "Add your {} API key first: click the Writely menu-bar icon › Settings…",
+                app_settings.provider.display_name()
+            ),
+            false,
+            false,
+            anchor,
+            None,
+            last_anchor,
+        );
+        return;
+    }
     let end = text.chars().count();
     show_popup("Checking…", false, false, anchor, None, last_anchor);
     *checking = Some(Checking {
@@ -236,7 +325,7 @@ fn handle_icon_clipboard(
         app_settings,
         key,
         text,
-        my_generation,
+        event_generation,
         checking,
         anchor,
         last_anchor,
@@ -335,11 +424,7 @@ fn handle_icon_clicked(
                     pid,
                     live_anchor,
                     generation,
-                    checking,
-                    pending,
                     last_anchor,
-                    app_settings.clone(),
-                    key,
                     from_hotkey,
                 );
                 return;
@@ -421,11 +506,7 @@ fn handle_icon_clicked(
                         pid,
                         anchor,
                         generation,
-                        checking,
-                        pending,
                         last_anchor,
-                        app_settings.clone(),
-                        key,
                         from_hotkey,
                     );
                     return;
@@ -839,6 +920,25 @@ fn main() {
             }
             Event::UserEvent(UserEvent::PermissionGranted) => {
                 handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon);
+            }
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(UserEvent::CopiedText {
+                generation: event_generation,
+                result,
+                pid,
+                from_hotkey,
+            }) => {
+                handle_copied_text(
+                    &watcher_proxy,
+                    generation,
+                    event_generation,
+                    result,
+                    pid,
+                    from_hotkey,
+                    &mut checking,
+                    &mut pending,
+                    &mut last_anchor,
+                );
             }
             Event::UserEvent(UserEvent::Suggestion {
                 generation: event_generation,
