@@ -38,6 +38,10 @@ fn log_once(message: String) {
     }
 }
 
+pub fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
 pub struct WatcherInner {
     _private: (),
 }

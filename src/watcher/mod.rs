@@ -61,3 +61,13 @@ impl Watcher {
         {}
     }
 }
+
+#[cfg(target_os = "linux")]
+pub fn is_wayland_session() -> bool {
+    linux::is_wayland_session()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_wayland_session() -> bool {
+    false
+}

@@ -7,8 +7,6 @@ mod check_window;
 mod clipboard;
 mod config;
 mod diff;
-#[cfg(target_os = "linux")]
-mod ime_bridge;
 mod overlay;
 mod popup;
 mod providers;
@@ -33,10 +31,6 @@ pub enum UserEvent {
     HotkeyPressed,
     ReplaceClicked,
     PermissionGranted,
-    #[cfg(target_os = "linux")]
-    BridgeConnected {
-        bridge: String,
-    },
     #[cfg(target_os = "macos")]
     CopiedText {
         generation: u64,
@@ -790,8 +784,6 @@ fn main() {
         }
     }));
     let watcher_proxy = event_loop.create_proxy();
-    #[cfg(target_os = "linux")]
-    ime_bridge::start(watcher_proxy.clone());
     overlay::init(watcher_proxy.clone());
     popup::init(watcher_proxy.clone());
     check_window::init(watcher_proxy.clone());
@@ -880,11 +872,7 @@ fn main() {
                     }
                 }
 
-                #[cfg(target_os = "linux")]
-                let bridge_mode = text_access::uses_ime_bridge();
-                #[cfg(not(target_os = "linux"))]
-                let bridge_mode = false;
-                if bridge_mode {
+                if watcher::is_wayland_session() {
                     const WAITING: &str = "On Wayland, Writely can't see what you type in other apps. Open “Check text…” from the Writely menu and paste your text there.";
                     eprintln!("Writely: {WAITING}");
                     settings::set_permission_message(Some(WAITING.to_string()));
@@ -924,14 +912,9 @@ fn main() {
                 if event.id == settings_id {
                     popup::hide();
                     // A stale permission message (e.g. granted after startup)
-                    // is cleared here so Settings opens fresh. Skipped in
-                    // bridge mode: the watcher stays off and only the first
-                    // Hello clears the waiting-for-add-on message.
-                    #[cfg(target_os = "linux")]
-                    let in_bridge_mode = text_access::uses_ime_bridge();
-                    #[cfg(not(target_os = "linux"))]
-                    let in_bridge_mode = false;
-                    if !in_bridge_mode
+                    // is cleared here so Settings opens fresh. Skipped on
+                    // Wayland: the watcher stays off and the Wayland message stays.
+                    if !watcher::is_wayland_session()
                         && text_access::check_permission(false).is_ok()
                         && caret_watcher.is_none()
                     {
@@ -1005,17 +988,6 @@ fn main() {
             }
             Event::UserEvent(UserEvent::PermissionGranted) => {
                 handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon);
-            }
-            #[cfg(target_os = "linux")]
-            Event::UserEvent(UserEvent::BridgeConnected { .. }) => {
-                // Hello already logged the connection; just clear the
-                // waiting-for-add-on state and restore the normal tooltip.
-                settings::set_permission_message(None);
-                if let Some(tray) = &tray_icon {
-                    if let Err(error) = tray.set_tooltip(Some("Writely")) {
-                        eprintln!("Writely: could not update the tray tooltip: {error}");
-                    }
-                }
             }
             #[cfg(target_os = "macos")]
             Event::UserEvent(UserEvent::CopiedText {

@@ -105,7 +105,6 @@ atspi = { version = "0.30", features = ["zbus"] }
 futures-lite = "2"
 pollster = "0.4"
 gtk = "0.18"
-zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 
 [profile.release]
 opt-level = 3

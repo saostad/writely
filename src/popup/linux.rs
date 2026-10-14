@@ -18,8 +18,6 @@ struct PopupState {
 
 thread_local! {
     static STATE: RefCell<Option<PopupState>> = const { RefCell::new(None) };
-    // Bridge mode: the (sender, context) the message is shown on, if any.
-    static SHOWN_ON: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
 }
 
 pub fn init(proxy: EventLoopProxy<UserEvent>) {
@@ -104,26 +102,6 @@ fn ensure_window() -> Option<(Window, Label, Button)> {
 }
 
 pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &CaretRect) {
-    if crate::text_access::uses_ime_bridge() {
-        // No GTK window in bridge mode: the input method shows the text.
-        // `show_suggestion` reaches here via `popup::show_message`, so it
-        // emits ShowMessage(suggestion, false, true).
-        let Some((sender, context, _)) = crate::ime_bridge::focused_snapshot() else {
-            eprintln!(
-                "Writely: could not show the message in the input method panel: no text field has focus. Message: {text}"
-            );
-            hide();
-            return;
-        };
-        let _ = caret;
-        if let Err(error) =
-            crate::ime_bridge::emit_show_message(&sender, &context, text, is_error, show_button)
-        {
-            eprintln!("Writely: {error}");
-        }
-        SHOWN_ON.with(|shown| *shown.borrow_mut() = Some((sender, context)));
-        return;
-    }
     let Some((window, label, button)) = ensure_window() else {
         return;
     };
@@ -154,16 +132,6 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
 }
 
 pub fn hide() {
-    if crate::text_access::uses_ime_bridge() {
-        SHOWN_ON.with(|shown| {
-            if let Some((sender, context)) = shown.borrow_mut().take() {
-                if let Err(error) = crate::ime_bridge::emit_hide(&sender, &context) {
-                    eprintln!("Writely: {error}");
-                }
-            }
-        });
-        return;
-    }
     STATE.with(|state| {
         if let Some(popup) = state.borrow().as_ref() {
             popup.window.hide();
@@ -172,9 +140,6 @@ pub fn hide() {
 }
 
 pub fn is_visible() -> bool {
-    if crate::text_access::uses_ime_bridge() {
-        return SHOWN_ON.with(|shown| shown.borrow().is_some());
-    }
     STATE.with(|state| {
         state
             .borrow()
