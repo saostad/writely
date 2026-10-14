@@ -632,97 +632,6 @@ fn build_diff_attributed(
     full
 }
 
-/// Lays out the card for an attributed suggestion body. Returns the panel height.
-fn layout_attributed(body: &NSAttributedString) -> f64 {
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        let Some(popup) = state.as_mut() else {
-            return 0.0;
-        };
-        // SAFETY: the text storage exists for a freshly created NSTextView.
-        unsafe {
-            if let Some(storage) = popup.text.textStorage() {
-                storage.setAttributedString(body);
-            }
-        }
-        // The result arrived: the spinner stops and is removed.
-        // SAFETY: the spinner is alive in STATE for the life of the popup.
-        unsafe {
-            popup.spinner.stopAnimation(None);
-        }
-        popup.spinner.setHidden(true);
-        popup.text.setEditable(false);
-        popup.text.setSelectable(false);
-        let text_width = CARD_WIDTH - 2.0 * SIDE_PAD;
-        // SAFETY: the text container exists for a freshly created NSTextView.
-        unsafe {
-            if let Some(container) = popup.text.textContainer() {
-                container.setWidthTracksTextView(false);
-                container.setContainerSize(NSSize::new(text_width, 1_000_000.0));
-            }
-        }
-        popup.text.setFrame(NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(text_width, 1_000_000.0),
-        ));
-        // SAFETY: the layout manager exists for a freshly created NSTextView.
-        let mut needed: f64 = BODY_MIN;
-        unsafe {
-            if let (Some(layout), Some(container)) =
-                (popup.text.layoutManager(), popup.text.textContainer())
-            {
-                layout.ensureLayoutForTextContainer(&container);
-                needed = layout.usedRectForTextContainer(&container).size.height;
-            }
-        }
-        let body_height = needed.clamp(BODY_MIN, BODY_MAX);
-        let panel_height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
-
-        popup.card.setFrame(NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(CARD_WIDTH, panel_height),
-        ));
-        let subviews = popup.card.subviews();
-        if subviews.count() >= 2 {
-            let title_view = subviews.objectAtIndex(0);
-            title_view.setFrame(NSRect::new(
-                NSPoint::new(SIDE_PAD, panel_height - HEADER_HEIGHT + 4.0),
-                NSSize::new(300.0, 20.0),
-            ));
-            let close_view = subviews.objectAtIndex(1);
-            close_view.setFrame(NSRect::new(
-                NSPoint::new(CARD_WIDTH - 36.0, panel_height - HEADER_HEIGHT + 2.0),
-                NSSize::new(24.0, 24.0),
-            ));
-        }
-        popup.scroll.setFrame(NSRect::new(
-            NSPoint::new(4.0, FOOTER_HEIGHT),
-            NSSize::new(CARD_WIDTH - 8.0, body_height),
-        ));
-        popup.text.setFrame(NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(text_width, body_height.max(needed)),
-        ));
-        popup.tabs.setHidden(true);
-        popup.separator.setHidden(false);
-        popup.separator.setFrame(NSRect::new(
-            NSPoint::new(0.0, FOOTER_HEIGHT),
-            NSSize::new(CARD_WIDTH, 1.0),
-        ));
-        popup.cancel_button.setHidden(false);
-        popup.replace_button.setHidden(false);
-        popup.replace_button.setFrame(NSRect::new(
-            NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
-            NSSize::new(90.0, 24.0),
-        ));
-        popup.cancel_button.setFrame(NSRect::new(
-            NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
-            NSSize::new(90.0, 24.0),
-        ));
-        panel_height
-    })
-}
-
 /// Lays out the card for a tabbed diff body (today's diff view with the tab
 /// row above it). Cancel + Replace are visible. Returns the panel height.
 fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
@@ -924,21 +833,6 @@ fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: Po
         ));
         panel_height
     })
-}
-
-/// Shows the suggestion with the word-level diff (what changed) and the
-/// Cancel/Replace footer. Replace still inserts the plain suggestion.
-pub fn show_suggestion(original: &str, suggestion: &str, caret: &CaretRect) {
-    let Some(mtm) = MainThreadMarker::new() else {
-        eprintln!(
-            "Writely: could not show the suggestion: Writely must update it on the main thread."
-        );
-        return;
-    };
-    ensure_popup(mtm);
-    let text_width = CARD_WIDTH - 2.0 * SIDE_PAD;
-    let body = build_diff_attributed(original, suggestion, text_width);
-    show_body(layout_attributed(&body), caret, mtm);
 }
 
 /// Shows the popup with the tab row, `selected` highlighted: a word diff for

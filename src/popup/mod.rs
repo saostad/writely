@@ -53,19 +53,13 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
     }
 }
 
-/// Shows the suggestion with the word-level diff (what changed) and the
-/// Cancel/Replace footer. On platforms without the diff view this falls back
-/// to the plain suggestion text.
+/// Shows the suggestion with the Cancel/Replace footer. Only used off macOS:
+/// macOS shows every suggestion through `show_tabbed`, while the other
+/// platforms have no diff view and fall back to the plain suggestion text.
+#[cfg(not(target_os = "macos"))]
 pub fn show_suggestion(original: &str, suggestion: &str, caret: &CaretRect) {
-    #[cfg(target_os = "macos")]
-    {
-        macos::show_suggestion(original, suggestion, caret);
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        show_message(suggestion, false, true, caret);
-        let _ = original;
-    }
+    show_message(suggestion, false, true, caret);
+    let _ = original;
 }
 
 /// The tabs of the suggestion popup: the grammar correction, or one rewrite

@@ -46,6 +46,11 @@ pub enum UserEvent {
         generation: u64,
         result: Result<String, String>,
     },
+    Rewrite {
+        generation: u64,
+        style: providers::RewriteStyle,
+        result: Result<String, String>,
+    },
     TextCheckResult {
         generation: u64,
         result: Result<String, String>,
@@ -63,15 +68,65 @@ struct Checking {
     via_clipboard: bool,
 }
 
-/// A shown suggestion waiting for Replace.
+/// A shown suggestion waiting for Replace: the grammar correction plus the
+/// per-tab rewrite cache for this popup.
 struct Pending {
     snap: Option<FieldSnapshot>,
     range: Range<usize>,
-    suggestion: String,
+    /// The checked text the tabs rewrite.
+    original: String,
+    /// The grammar result; `None` when the text was already correct.
+    correction: Option<String>,
+    /// Cached rewrites, indexed by position in `RewriteStyle::ALL`.
+    rewrites: [Option<String>; 5],
+    selected: popup::PopupTab,
+    /// Per-style in-flight flags, so a style is never requested twice.
+    rewrite_in_flight: [bool; 5],
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pid: u32,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     via_clipboard: bool,
+}
+
+/// Index into `Pending::rewrites` for a style (its position in
+/// `RewriteStyle::ALL`).
+fn style_index(style: providers::RewriteStyle) -> usize {
+    // Every style is in ALL, so this always finds a position.
+    providers::RewriteStyle::ALL
+        .iter()
+        .position(|candidate| *candidate == style)
+        .unwrap_or_default()
+}
+
+/// The text the selected tab would insert, or `None` when there is nothing to
+/// insert (a still-loading or failed rewrite, a rewrite that leaves the text
+/// unchanged, or `Correct` with no correction).
+fn selected_text(pending: &Pending) -> Option<&str> {
+    match pending.selected {
+        popup::PopupTab::Correct => pending.correction.as_deref(),
+        popup::PopupTab::Rewrite(style) => {
+            let cached = pending.rewrites[style_index(style)].as_deref()?;
+            match providers::classify_suggestion(cached, &pending.original) {
+                providers::SuggestionOutcome::Suggestion => Some(cached),
+                providers::SuggestionOutcome::Unclear | providers::SuggestionOutcome::Unchanged => {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// The "already correct" body for the Correct tab: on macOS it points at the
+/// rewrite tabs; elsewhere it is today's plain message (no tabs there).
+fn looks_good_message() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Looks good — no changes needed. Pick a style above to rewrite it."
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "Looks good — no changes needed."
+    }
 }
 
 /// Mouse-pointer anchor for the hotkey popup when no caret or container is
@@ -151,6 +206,55 @@ fn show_popup(
     }
 }
 
+/// Why settings/key loading failed: the popup message and whether it renders
+/// as an error (red). Load failures are errors; "set up a model/key first"
+/// prompts are plain guidance.
+struct SettingsFailure {
+    message: String,
+    is_error: bool,
+}
+
+impl SettingsFailure {
+    fn error(message: String) -> Self {
+        Self {
+            message,
+            is_error: true,
+        }
+    }
+
+    fn guidance(message: String) -> Self {
+        Self {
+            message,
+            is_error: false,
+        }
+    }
+}
+
+/// Loads the app settings and the selected provider's API key, exactly as the
+/// grammar check does. `Ok` carries `(settings, key)` with `key == None` only
+/// for Ollama; `Err` is the user-facing popup message with its severity.
+fn resolve_settings() -> Result<(config::AppSettings, Option<String>), SettingsFailure> {
+    let app_settings = config::load_settings().map_err(SettingsFailure::error)?;
+    if app_settings.current_model().is_empty() {
+        return Err(SettingsFailure::guidance(
+            "Choose a model first: click the Writely menu-bar icon › Settings…".to_string(),
+        ));
+    }
+    // Ollama runs locally and needs no key; the other providers read the
+    // selected provider's key from the keychain (never shown or logged).
+    let key: Option<String> = match app_settings.provider {
+        config::Provider::Ollama => None,
+        provider => settings::load_api_key_for(provider).map_err(SettingsFailure::error)?,
+    };
+    if key.is_none() && app_settings.provider != config::Provider::Ollama {
+        return Err(SettingsFailure::guidance(format!(
+            "Add your {} API key first: click the Writely menu-bar icon › Settings…",
+            app_settings.provider.display_name()
+        )));
+    }
+    Ok((app_settings, key))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_check_thread(
     proxy: &EventLoopProxy<UserEvent>,
@@ -187,6 +291,39 @@ fn spawn_check_thread(
             last_anchor,
         );
     }
+}
+
+/// One rewrite worker (same pattern as the grammar check): calls
+/// `providers::rewrite` off the main thread and sends `UserEvent::Rewrite`.
+/// Returns the spawn error for the caller to show; the popup already says
+/// "Rewriting…", so the caller replaces it with the failure.
+fn spawn_rewrite_thread(
+    proxy: &EventLoopProxy<UserEvent>,
+    app_settings: config::AppSettings,
+    key: Option<String>,
+    text: String,
+    style: providers::RewriteStyle,
+    my_generation: u64,
+) -> Result<(), String> {
+    let worker_proxy = proxy.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("writely-rewrite".to_string())
+        .spawn(move || {
+            // The key lives only in this thread's request; it is never
+            // logged or put in an error.
+            let result = providers::rewrite(&app_settings, key.as_deref(), &text, style);
+            if let Err(error) = worker_proxy.send_event(UserEvent::Rewrite {
+                generation: my_generation,
+                style,
+                result,
+            }) {
+                eprintln!("Writely: could not deliver the rewrite: {error}");
+            }
+        })
+    {
+        return Err(format!("Could not rewrite the text: {error}"));
+    }
+    Ok(())
 }
 
 /// Copy-and-paste flow (macOS): the layered chain (AX selection, menu-bar
@@ -281,48 +418,20 @@ fn handle_copied_text(
         );
         return;
     }
-    let app_settings = match config::load_settings() {
-        Ok(app_settings) => app_settings,
-        Err(error) => {
-            show_popup(&error, true, false, anchor, None, last_anchor);
+    let (app_settings, key) = match resolve_settings() {
+        Ok(loaded) => loaded,
+        Err(failure) => {
+            show_popup(
+                &failure.message,
+                failure.is_error,
+                false,
+                anchor,
+                None,
+                last_anchor,
+            );
             return;
         }
     };
-    if app_settings.current_model().is_empty() {
-        show_popup(
-            "Choose a model first: click the Writely menu-bar icon › Settings…",
-            false,
-            false,
-            anchor,
-            None,
-            last_anchor,
-        );
-        return;
-    }
-    let key: Option<String> = match app_settings.provider {
-        config::Provider::Ollama => None,
-        provider => match settings::load_api_key_for(provider) {
-            Ok(key) => key,
-            Err(error) => {
-                show_popup(&error, true, false, anchor, None, last_anchor);
-                return;
-            }
-        },
-    };
-    if key.is_none() && app_settings.provider != config::Provider::Ollama {
-        show_popup(
-            &format!(
-                "Add your {} API key first: click the Writely menu-bar icon › Settings…",
-                app_settings.provider.display_name()
-            ),
-            false,
-            false,
-            anchor,
-            None,
-            last_anchor,
-        );
-        return;
-    }
     let end = text.chars().count();
     show_popup("Checking…", false, false, anchor, None, last_anchor);
     *checking = Some(Checking {
@@ -379,50 +488,20 @@ fn handle_icon_clicked(
     };
     #[cfg(not(target_os = "macos"))]
     let _ = from_hotkey;
-    let app_settings = match config::load_settings() {
-        Ok(app_settings) => app_settings,
-        Err(error) => {
-            show_popup(&error, true, false, live_anchor, None, last_anchor);
+    let (app_settings, key) = match resolve_settings() {
+        Ok(loaded) => loaded,
+        Err(failure) => {
+            show_popup(
+                &failure.message,
+                failure.is_error,
+                false,
+                live_anchor,
+                None,
+                last_anchor,
+            );
             return;
         }
     };
-    if app_settings.current_model().is_empty() {
-        show_popup(
-            "Choose a model first: click the Writely menu-bar icon › Settings…",
-            false,
-            false,
-            live_anchor,
-            None,
-            last_anchor,
-        );
-        return;
-    }
-    // Ollama runs locally and needs no key; the other providers read the
-    // selected provider's key from the keychain (never shown or logged).
-    let key: Option<String> = match app_settings.provider {
-        config::Provider::Ollama => None,
-        provider => match settings::load_api_key_for(provider) {
-            Ok(key) => key,
-            Err(error) => {
-                show_popup(&error, true, false, live_anchor, None, last_anchor);
-                return;
-            }
-        },
-    };
-    if key.is_none() && app_settings.provider != config::Provider::Ollama {
-        show_popup(
-            &format!(
-                "Add your {} API key first: click the Writely menu-bar icon › Settings…",
-                app_settings.provider.display_name()
-            ),
-            false,
-            false,
-            live_anchor,
-            None,
-            last_anchor,
-        );
-        return;
-    }
     let Some(snap) = (match text_access::focused_field() {
         Ok(snap) => snap,
         Err(error) => {
@@ -621,21 +700,19 @@ fn handle_suggestion(
                     );
                 }
                 providers::SuggestionOutcome::Unchanged => {
-                    show_popup(
-                        "Looks good — no changes needed.",
-                        false,
-                        false,
-                        *last_anchor,
-                        active.snap.as_ref().map(|snap| snap.caret_rect),
-                        last_anchor,
-                    );
-                }
-                providers::SuggestionOutcome::Suggestion => {
                     if let Some(rect) =
                         (*last_anchor).or(active.snap.as_ref().map(|snap| snap.caret_rect))
                     {
                         *last_anchor = Some(rect);
-                        popup::show_suggestion(&active.sentence, &suggestion, &rect);
+                        popup::show_tabbed(
+                            popup::PopupTab::Correct,
+                            popup::TabContent::Message {
+                                text: looks_good_message(),
+                                is_error: false,
+                                loading: false,
+                            },
+                            &rect,
+                        );
                     } else {
                         eprintln!(
                             "Writely: could not show the suggestion: the caret position is unknown."
@@ -644,10 +721,250 @@ fn handle_suggestion(
                     *pending = Some(Pending {
                         snap: active.snap,
                         range: active.range,
-                        suggestion,
+                        original: active.sentence,
+                        correction: None,
+                        rewrites: [None, None, None, None, None],
+                        selected: popup::PopupTab::Correct,
+                        rewrite_in_flight: [false; 5],
                         pid: active.pid,
                         via_clipboard: active.via_clipboard,
                     });
+                }
+                providers::SuggestionOutcome::Suggestion => {
+                    if let Some(rect) =
+                        (*last_anchor).or(active.snap.as_ref().map(|snap| snap.caret_rect))
+                    {
+                        *last_anchor = Some(rect);
+                        popup::show_tabbed(
+                            popup::PopupTab::Correct,
+                            popup::TabContent::Diff {
+                                original: &active.sentence,
+                                suggestion: &suggestion,
+                            },
+                            &rect,
+                        );
+                    } else {
+                        eprintln!(
+                            "Writely: could not show the suggestion: the caret position is unknown."
+                        );
+                    }
+                    *pending = Some(Pending {
+                        snap: active.snap,
+                        range: active.range,
+                        original: active.sentence,
+                        correction: Some(suggestion),
+                        rewrites: [None, None, None, None, None],
+                        selected: popup::PopupTab::Correct,
+                        rewrite_in_flight: [false; 5],
+                        pid: active.pid,
+                        via_clipboard: active.via_clipboard,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Shows a finished rewrite on its tab: the word diff, or the note that this
+/// style leaves the text unchanged (or that the text was unclear).
+fn show_rewrite_result(tab: popup::PopupTab, rewrite: &str, original: &str, anchor: &CaretRect) {
+    match providers::classify_suggestion(rewrite, original) {
+        providers::SuggestionOutcome::Suggestion => {
+            popup::show_tabbed(
+                tab,
+                popup::TabContent::Diff {
+                    original,
+                    suggestion: rewrite,
+                },
+                anchor,
+            );
+        }
+        providers::SuggestionOutcome::Unchanged => {
+            popup::show_tabbed(
+                tab,
+                popup::TabContent::Message {
+                    text: "This style doesn't change your text.",
+                    is_error: false,
+                    loading: false,
+                },
+                anchor,
+            );
+        }
+        providers::SuggestionOutcome::Unclear => {
+            popup::show_tabbed(
+                tab,
+                popup::TabContent::Message {
+                    text: providers::UNCLEAR_MESSAGE,
+                    is_error: false,
+                    loading: false,
+                },
+                anchor,
+            );
+        }
+    }
+}
+
+fn handle_tab_clicked(
+    proxy: &EventLoopProxy<UserEvent>,
+    tab: popup::PopupTab,
+    current_generation: u64,
+    pending: &mut Option<Pending>,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    let Some(active) = pending.as_mut() else {
+        return;
+    };
+    if !popup::is_visible() {
+        return;
+    };
+    let Some(anchor) = *last_anchor else {
+        eprintln!("Writely: could not show the rewrite: the caret position is unknown.");
+        return;
+    };
+    active.selected = tab;
+    match tab {
+        popup::PopupTab::Correct => match active.correction.as_deref() {
+            Some(correction) => {
+                popup::show_tabbed(
+                    tab,
+                    popup::TabContent::Diff {
+                        original: &active.original,
+                        suggestion: correction,
+                    },
+                    &anchor,
+                );
+            }
+            None => {
+                popup::show_tabbed(
+                    tab,
+                    popup::TabContent::Message {
+                        text: looks_good_message(),
+                        is_error: false,
+                        loading: false,
+                    },
+                    &anchor,
+                );
+            }
+        },
+        popup::PopupTab::Rewrite(style) => {
+            let index = style_index(style);
+            if let Some(cached) = active.rewrites[index].as_deref() {
+                show_rewrite_result(tab, cached, &active.original, &anchor);
+            } else if active.rewrite_in_flight[index] {
+                // A request for this style is already running: keep showing
+                // its loading state instead of starting a second one.
+                popup::show_tabbed(
+                    tab,
+                    popup::TabContent::Message {
+                        text: "Rewriting…",
+                        is_error: false,
+                        loading: true,
+                    },
+                    &anchor,
+                );
+            } else {
+                popup::show_tabbed(
+                    tab,
+                    popup::TabContent::Message {
+                        text: "Rewriting…",
+                        is_error: false,
+                        loading: true,
+                    },
+                    &anchor,
+                );
+                active.rewrite_in_flight[index] = true;
+                let (app_settings, key) = match resolve_settings() {
+                    Ok(loaded) => loaded,
+                    Err(failure) => {
+                        active.rewrite_in_flight[index] = false;
+                        popup::show_tabbed(
+                            tab,
+                            popup::TabContent::Message {
+                                text: &failure.message,
+                                is_error: failure.is_error,
+                                loading: false,
+                            },
+                            &anchor,
+                        );
+                        return;
+                    }
+                };
+                let text = active.original.clone();
+                if let Err(error) =
+                    spawn_rewrite_thread(proxy, app_settings, key, text, style, current_generation)
+                {
+                    active.rewrite_in_flight[index] = false;
+                    popup::show_tabbed(
+                        tab,
+                        popup::TabContent::Message {
+                            text: &error,
+                            is_error: true,
+                            loading: false,
+                        },
+                        &anchor,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn handle_rewrite(
+    current_generation: u64,
+    event_generation: u64,
+    style: providers::RewriteStyle,
+    result: Result<String, String>,
+    pending: &mut Option<Pending>,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    // Drop late replies: a newer click, typing that hid the popup, or a move
+    // to another tab wins. The generation is never bumped for a rewrite.
+    if event_generation != current_generation || !popup::is_visible() {
+        return;
+    }
+    let Some(active) = pending.as_mut() else {
+        return;
+    };
+    let index = style_index(style);
+    active.rewrite_in_flight[index] = false;
+    let tab = popup::PopupTab::Rewrite(style);
+    let still_selected = active.selected == tab;
+    match result {
+        Ok(rewrite) => {
+            let outcome = providers::classify_suggestion(&rewrite, &active.original);
+            if still_selected {
+                match *last_anchor {
+                    Some(anchor) => show_rewrite_result(tab, &rewrite, &active.original, &anchor),
+                    None => eprintln!(
+                        "Writely: could not show the rewrite: the caret position is unknown."
+                    ),
+                }
+            }
+            // Unclear is not cached, so clicking the tab again retries.
+            if outcome != providers::SuggestionOutcome::Unclear {
+                active.rewrites[index] = Some(rewrite);
+            }
+        }
+        Err(error) => {
+            // Not cached, so clicking the tab again retries.
+            let message = format!("Could not rewrite the text ({}): {error}", style.label());
+            eprintln!("Writely: {message}");
+            if still_selected {
+                match *last_anchor {
+                    Some(anchor) => {
+                        popup::show_tabbed(
+                            tab,
+                            popup::TabContent::Message {
+                                text: &message,
+                                is_error: true,
+                                loading: false,
+                            },
+                            &anchor,
+                        );
+                    }
+                    None => eprintln!(
+                        "Writely: could not show the rewrite: the caret position is unknown."
+                    ),
                 }
             }
         }
@@ -658,10 +975,16 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
     let Some(active) = pending.take() else {
         return;
     };
+    let Some(text) = selected_text(&active).map(str::to_string) else {
+        // Nothing to insert (loading, error, or an already-correct tab):
+        // put the pending suggestion back and do nothing.
+        *pending = Some(active);
+        return;
+    };
     // The copy-and-paste path pastes the suggestion over the selection.
     #[cfg(target_os = "macos")]
     if active.via_clipboard {
-        match clipboard::paste_suggestion(active.pid, &active.suggestion) {
+        match clipboard::paste_suggestion(active.pid, &text) {
             Ok(()) => {
                 popup::hide();
             }
@@ -675,7 +998,7 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
         eprintln!("Writely: no text to replace.");
         return;
     };
-    match text_access::replace_range(&snap, active.range.clone(), &active.suggestion) {
+    match text_access::replace_range(&snap, active.range.clone(), &text) {
         Ok(()) => {
             popup::hide();
         }
@@ -687,7 +1010,7 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
             if !active.via_clipboard && !text_access::covers_whole_field(&snap) {
                 match text_access::macos_helpers::reselect_range(&snap, active.range.clone()) {
                     Ok(()) => {
-                        match clipboard::paste_suggestion(active.pid, &active.suggestion) {
+                        match clipboard::paste_suggestion(active.pid, &text) {
                             Ok(()) => {
                                 popup::hide();
                             }
@@ -990,6 +1313,15 @@ fn main() {
             Event::UserEvent(UserEvent::ReplaceClicked) => {
                 handle_replace_clicked(&mut pending, &mut last_anchor);
             }
+            Event::UserEvent(UserEvent::TabClicked(tab)) => {
+                handle_tab_clicked(
+                    &watcher_proxy,
+                    tab,
+                    generation,
+                    &mut pending,
+                    &mut last_anchor,
+                );
+            }
             Event::UserEvent(UserEvent::PermissionGranted) => {
                 handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon);
             }
@@ -1025,6 +1357,20 @@ fn main() {
                     &mut last_anchor,
                 );
             }
+            Event::UserEvent(UserEvent::Rewrite {
+                generation: event_generation,
+                style,
+                result,
+            }) => {
+                handle_rewrite(
+                    generation,
+                    event_generation,
+                    style,
+                    result,
+                    &mut pending,
+                    &mut last_anchor,
+                );
+            }
             Event::UserEvent(UserEvent::TextCheckResult {
                 generation: event_generation,
                 result,
@@ -1034,4 +1380,60 @@ fn main() {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{selected_text, style_index, Pending};
+    use crate::popup::PopupTab;
+    use crate::providers::RewriteStyle;
+
+    fn test_pending() -> Pending {
+        Pending {
+            snap: None,
+            range: 0..16,
+            original: "She go to school.".to_string(),
+            correction: Some("She goes to school.".to_string()),
+            rewrites: [None, None, None, None, None],
+            selected: PopupTab::Correct,
+            rewrite_in_flight: [false; 5],
+            pid: 0,
+            via_clipboard: false,
+        }
+    }
+
+    #[test]
+    fn style_index_matches_all_order() {
+        for (index, style) in RewriteStyle::ALL.iter().enumerate() {
+            assert_eq!(style_index(*style), index);
+        }
+    }
+
+    #[test]
+    fn selected_text_correct_tab() {
+        let pending = test_pending();
+        assert_eq!(selected_text(&pending), Some("She goes to school."));
+        let mut without_correction = test_pending();
+        without_correction.correction = None;
+        assert_eq!(selected_text(&without_correction), None);
+    }
+
+    #[test]
+    fn selected_text_rewrite_tab() {
+        // Uncached: nothing to insert.
+        let mut pending = test_pending();
+        pending.selected = PopupTab::Rewrite(RewriteStyle::Friendly);
+        assert_eq!(selected_text(&pending), None);
+        // Cached rewrite: insert it.
+        pending.rewrites[style_index(RewriteStyle::Friendly)] =
+            Some("She goes to school, you know!".to_string());
+        assert_eq!(
+            selected_text(&pending),
+            Some("She goes to school, you know!")
+        );
+        // Cached but unchanged: nothing to insert.
+        pending.rewrites[style_index(RewriteStyle::Friendly)] =
+            Some("She go to school.".to_string());
+        assert_eq!(selected_text(&pending), None);
+    }
 }
