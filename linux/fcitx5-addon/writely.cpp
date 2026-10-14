@@ -3,14 +3,18 @@
 
 #include <cstdint>
 #include <fcitx-utils/capabilityflags.h>
+#include <fcitx-utils/dbus/matchrule.h>
 #include <fcitx-utils/log.h>
 #include <fcitx-module/dbus/dbus_public.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addonmanager.h>
 #include <fcitx/event.h>
 #include <fcitx/inputcontextmanager.h>
+#include <fcitx/inputpanel.h>
 #include <fcitx/instance.h>
 #include <fcitx/surroundingtext.h>
+#include <fcitx/text.h>
+#include <fcitx/userinterface.h>
 
 namespace {
 
@@ -83,6 +87,9 @@ Writely::Writely(fcitx::Instance *instance) : instance_(instance) {
                 onWritelyAppeared();
             }
         });
+    signalMatch_ = bus_->addMatch(
+        fcitx::dbus::MatchRule(kBusName, kObjectPath, kInterface),
+        [this](fcitx::dbus::Message &msg) { return onSignal(msg); });
 }
 
 Writely::~Writely() = default;
@@ -106,6 +113,15 @@ void Writely::onWritelyAppeared() {
 void Writely::onWritelyDisappeared() {
     writelyAvailable_ = false;
     announced_.clear();
+    // Drop pending panel state; clicking a stale candidate would send Clicked
+    // to nobody.
+    instance_->inputContextManager().foreach([this](fcitx::InputContext *ic) {
+        if (hideWritelyPanel(ic, contextId(ic))) {
+            ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+        }
+        return true;
+    });
+    shown_.clear();
     FCITX_INFO() << "Writely is not running; the Writely add-on is idle.";
 }
 
@@ -138,6 +154,7 @@ void Writely::onDestroyed(fcitx::InputContext *ic) {
         hasFocused_ = false;
     }
     announced_.erase(ctx);
+    shown_.erase(ctx);
     if (bus_) {
         fcitx::dbus::Message msg =
             bus_->createMethodCall(kBusName, kObjectPath, kInterface, "Destroy");
@@ -223,6 +240,191 @@ std::string Writely::uuidToHex(const fcitx::ICUUID &uuid) {
         out.push_back(kHex[byte & 0xF]);
     }
     return out;
+}
+
+bool Writely::hexToUuid(const std::string &hex, fcitx::ICUUID &uuid) {
+    if (hex.size() != 32) {
+        return false;
+    }
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f') {
+            return c - 'a' + 10;
+        }
+        if (c >= 'A' && c <= 'F') {
+            return c - 'A' + 10;
+        }
+        return -1;
+    };
+    for (size_t i = 0; i < 16; i++) {
+        int hi = nibble(hex[2 * i]);
+        int lo = nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        uuid[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+fcitx::InputContext *Writely::findContext(const std::string &ctx) {
+    fcitx::ICUUID uuid{};
+    if (!hexToUuid(ctx, uuid)) {
+        return nullptr;
+    }
+    return instance_->inputContextManager().findByUUID(uuid);
+}
+
+bool Writely::onSignal(fcitx::dbus::Message &msg) {
+    const std::string member = msg.member();
+    if (member != "ShowIcon" && member != "ShowMessage" && member != "Hide" &&
+        member != "Replace") {
+        return true;
+    }
+    std::string ctx;
+    msg >> ctx;
+    if (!msg) {
+        FCITX_WARN() << "Writely: ignoring a malformed " << member
+                     << " signal from Writely.";
+        return true;
+    }
+    if (member == "ShowIcon") {
+        onShowIcon(ctx);
+    } else if (member == "Hide") {
+        onHide(ctx);
+    } else if (member == "ShowMessage") {
+        std::string text;
+        bool isError = false;
+        bool canApply = false;
+        msg >> text >> isError >> canApply;
+        if (!msg) {
+            FCITX_WARN() << "Writely: ignoring a malformed ShowMessage signal "
+                            "from Writely.";
+            return true;
+        }
+        onShowMessage(ctx, text, isError, canApply);
+    }
+    // Replace is handled in the next item; unknown members are ignored.
+    return true;
+}
+
+bool Writely::panelAvailableForWritely(fcitx::InputContext *ic) {
+    const fcitx::InputPanel &panel = ic->inputPanel();
+    if (!panel.preedit().empty() || !panel.clientPreedit().empty()) {
+        return false;
+    }
+    auto list = panel.candidateList();
+    return !list || dynamic_cast<WritelyCandidateList *>(list.get()) != nullptr;
+}
+
+bool Writely::hasWritelyList(fcitx::InputContext *ic) {
+    auto list = ic->inputPanel().candidateList();
+    return list && dynamic_cast<WritelyCandidateList *>(list.get()) != nullptr;
+}
+
+bool Writely::hideWritelyPanel(fcitx::InputContext *ic, const std::string &ctx) {
+    bool changed = false;
+    fcitx::InputPanel &panel = ic->inputPanel();
+    if (hasWritelyList(ic)) {
+        panel.setCandidateList(std::unique_ptr<fcitx::CandidateList>());
+        changed = true;
+    }
+    auto shown = shown_.find(ctx);
+    if (shown != shown_.end() && shown->second.isMessage &&
+        panel.auxUp().toString() == shown->second.auxText) {
+        panel.setAuxUp(fcitx::Text());
+        changed = true;
+    }
+    shown_.erase(ctx);
+    return changed;
+}
+
+void Writely::onShowIcon(const std::string &ctx) {
+    fcitx::InputContext *ic = findContext(ctx);
+    if (!ic) {
+        return;
+    }
+    // Idempotent: ShowIcon repeats on every caret change.
+    auto shown = shown_.find(ctx);
+    if (shown != shown_.end() && !shown->second.isMessage && hasWritelyList(ic)) {
+        return;
+    }
+    if (!panelAvailableForWritely(ic)) {
+        return;
+    }
+    auto list = std::make_unique<WritelyCandidateList>();
+    // No selection keys: typed digits must never trigger a candidate.
+    list->setSelectionKey({});
+    list->append(
+        std::make_unique<WritelyCandidateWord>(this, "W  Check grammar", "check"));
+    // Replacing our own message also drops its aux text.
+    hideWritelyPanel(ic, ctx);
+    ic->inputPanel().setCandidateList(std::move(list));
+    shown_[ctx] = ShownPanel{false, ""};
+    ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+}
+
+void Writely::onShowMessage(const std::string &ctx, const std::string &text,
+                            bool isError, bool canApply) {
+    fcitx::InputContext *ic = findContext(ctx);
+    if (!ic) {
+        return;
+    }
+    if (!panelAvailableForWritely(ic)) {
+        FCITX_WARN() << "Writely: the input panel is in use by the input "
+                        "method; skipped a Writely message.";
+        return;
+    }
+    const std::string aux =
+        (isError ? std::string("Writely error: ") : std::string("Writely: ")) +
+        text;
+    auto list = std::make_unique<WritelyCandidateList>();
+    // No selection keys: typed digits must never trigger a candidate.
+    list->setSelectionKey({});
+    if (canApply) {
+        list->append(
+            std::make_unique<WritelyCandidateWord>(this, "Apply", "apply"));
+    }
+    list->append(
+        std::make_unique<WritelyCandidateWord>(this, "Dismiss", "dismiss"));
+    hideWritelyPanel(ic, ctx);
+    ic->inputPanel().setAuxUp(fcitx::Text(aux));
+    ic->inputPanel().setCandidateList(std::move(list));
+    shown_[ctx] = ShownPanel{true, aux};
+    ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+}
+
+void Writely::onHide(const std::string &ctx) {
+    fcitx::InputContext *ic = findContext(ctx);
+    if (!ic) {
+        shown_.erase(ctx);
+        return;
+    }
+    if (hideWritelyPanel(ic, ctx)) {
+        ic->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+    }
+}
+
+void Writely::sendClicked(fcitx::InputContext *ic, const std::string &action) {
+    if (!bus_) {
+        return;
+    }
+    fcitx::dbus::Message msg =
+        bus_->createMethodCall(kBusName, kObjectPath, kInterface, "Clicked");
+    msg << contextId(ic) << action;
+    send(std::move(msg), "Clicked");
+}
+
+WritelyCandidateWord::WritelyCandidateWord(Writely *writely,
+                                           const std::string &label,
+                                           const std::string &action)
+    : fcitx::CandidateWord(fcitx::Text(label)), writely_(writely),
+      action_(action) {}
+
+void WritelyCandidateWord::select(fcitx::InputContext *inputContext) const {
+    writely_->sendClicked(inputContext, action_);
 }
 
 class WritelyFactory : public fcitx::AddonFactory {
