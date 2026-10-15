@@ -457,6 +457,23 @@ fn handle_copied_text(
         show_popup(empty_message, false, false, anchor, None, last_anchor);
         return;
     }
+    if clipboard::looks_like_line_copy(&text) {
+        #[cfg(target_os = "windows")]
+        let line_copy_message = if from_hotkey {
+            "Writely copied a whole line, which usually means nothing was selected. Select the text you want to check, then press Ctrl+Alt+G."
+        } else {
+            "Writely copied a whole line, which usually means nothing was selected. Select the text you want to check, then click W."
+        };
+        #[cfg(not(target_os = "windows"))]
+        let line_copy_message = if from_hotkey {
+            "Writely copied a whole line, which usually means nothing was selected. Select the text you want to check, then press ⌃⌥G."
+        } else {
+            "Writely copied a whole line, which usually means nothing was selected. Select the text you want to check, then click W."
+        };
+        eprintln!("Writely: the copied text was a whole line; asked the user to select text.");
+        show_popup(line_copy_message, false, false, anchor, None, last_anchor);
+        return;
+    }
     if text.chars().count() > text_access::MAX_SELECTION_CHARS {
         show_popup(
             text_access::SELECTION_TOO_LONG_MESSAGE,
