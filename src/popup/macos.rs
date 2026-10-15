@@ -7,9 +7,9 @@ use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventMask, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSMutableParagraphStyle, NSPanel,
-    NSParagraphStyleAttributeName, NSProgressIndicator, NSProgressIndicatorStyle, NSScreen,
-    NSScrollView, NSSegmentSwitchTracking, NSSegmentedControl, NSStatusWindowLevel,
+    NSFontWeightSemibold, NSForegroundColorAttributeName, NSImage, NSMenu, NSMenuItem,
+    NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName, NSPopUpButton,
+    NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSScrollView, NSStatusWindowLevel,
     NSStrikethroughStyleAttributeName, NSTextField, NSTextView, NSView, NSVisualEffectMaterial,
     NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
@@ -29,8 +29,10 @@ use crate::UserEvent;
 const CARD_WIDTH: f64 = 440.0;
 const SIDE_PAD: f64 = 12.0;
 const HEADER_HEIGHT: f64 = 28.0;
-const TABS_ROW_HEIGHT: f64 = 30.0;
 const FOOTER_HEIGHT: f64 = 40.0;
+/// Width of the style pop-up button in the footer: fits "Professional" plus
+/// its icon and the arrows.
+const STYLE_BUTTON_WIDTH: f64 = 160.0;
 const BODY_MIN: f64 = 40.0;
 const BODY_MAX: f64 = 340.0;
 /// Height of the icon panel, used to place the popup below the icon.
@@ -119,10 +121,12 @@ define_class!(
         #[unsafe(method(tabClicked:))]
         fn tab_clicked(&self, _sender: Option<&AnyObject>) {
             let tab = STATE.with(|state| {
-                state
-                    .borrow()
-                    .as_ref()
-                    .and_then(|popup| tab_for_segment(popup.tabs.selectedSegment()))
+                state.borrow().as_ref().and_then(|popup| {
+                    popup
+                        .style_button
+                        .selectedItem()
+                        .and_then(|item| tab_for_tag(item.tag()))
+                })
             });
             let Some(tab) = tab else {
                 return;
@@ -144,33 +148,169 @@ impl TabTarget {
     }
 }
 
-/// Segment 0 is `Correct`; segments 1..=5 follow `RewriteStyle::ALL`.
-/// Returns `None` for an unexpected segment (single selection always keeps
-/// one segment selected, so this is only defensive).
-fn tab_for_segment(selected: NSInteger) -> Option<PopupTab> {
-    if selected == 0 {
+/// Tag for menu items that never map to a tab (separators, section headers).
+const MENU_TAG_NONE: NSInteger = -1;
+
+/// Tag 0 is `Correct`; tags 1..=5 follow `RewriteStyle::ALL`.
+/// Returns `None` for header/separator tags and anything unexpected.
+fn tab_for_tag(tag: NSInteger) -> Option<PopupTab> {
+    if tag == 0 {
         Some(PopupTab::Correct)
     } else {
-        usize::try_from(selected)
+        usize::try_from(tag)
             .ok()
             .and_then(|index| RewriteStyle::ALL.get(index - 1))
             .map(|style| PopupTab::Rewrite(*style))
     }
 }
 
-fn segment_for_tab(tab: PopupTab) -> NSInteger {
+fn tag_for_tab(tab: PopupTab) -> NSInteger {
     match tab {
         PopupTab::Correct => 0,
-        PopupTab::Rewrite(style) => {
-            match RewriteStyle::ALL
-                .iter()
-                .position(|candidate| *candidate == style)
-            {
-                Some(index) => index as NSInteger + 1,
-                None => 0,
-            }
+        PopupTab::Rewrite(style) => RewriteStyle::ALL
+            .iter()
+            .position(|candidate| *candidate == style)
+            .map(|index| index as NSInteger + 1)
+            .unwrap_or(0),
+    }
+}
+
+/// SF Symbol shown next to each style in the pop-up menu.
+fn style_symbol(style: RewriteStyle) -> &'static str {
+    match style {
+        RewriteStyle::Friendly => "face.smiling",
+        RewriteStyle::Formal => "building.columns",
+        RewriteStyle::Professional => "briefcase",
+        RewriteStyle::Shorter => "text.badge.minus",
+        RewriteStyle::Longer => "text.badge.plus",
+    }
+}
+
+/// Loads an SF Symbol for a menu item (~14 pt, template so it tints with the
+/// button). A symbol missing on this macOS version logs once — the menu is
+/// built once — and the item shows without an icon.
+fn menu_icon(symbol: &str, label: &str) -> Option<Retained<NSImage>> {
+    let name = NSString::from_str(symbol);
+    let description = NSString::from_str(label);
+    match NSImage::imageWithSystemSymbolName_accessibilityDescription(&name, Some(&description)) {
+        Some(image) => {
+            image.setTemplate(true);
+            image.setSize(NSSize::new(14.0, 14.0));
+            Some(image)
+        }
+        None => {
+            eprintln!("Writely: the menu icon {symbol} is missing on this macOS version.");
+            None
         }
     }
+}
+
+/// Small semibold secondary-label title for a disabled section-header item.
+fn section_header_title(text: &str) -> Retained<NSAttributedString> {
+    // SAFETY: NSFontWeightSemibold is a framework-provided constant.
+    let weight: f64 = unsafe { NSFontWeightSemibold };
+    let font = NSFont::systemFontOfSize_weight(11.0, weight);
+    let color = NSColor::secondaryLabelColor();
+    let font_key: &NSAttributedStringKey =
+        // SAFETY: NSFontAttributeName is a framework-provided constant.
+        unsafe { NSFontAttributeName };
+    let color_key: &NSAttributedStringKey =
+        // SAFETY: NSForegroundColorAttributeName is a framework-provided constant.
+        unsafe { NSForegroundColorAttributeName };
+    let keys: [&NSAttributedStringKey; 2] = [font_key, color_key];
+    let objects: Vec<&AnyObject> = vec![&font, &color];
+    let dict = NSDictionary::from_slices(&keys, &objects);
+    // SAFETY: the string and attribute dictionary hold valid objects of the expected kinds.
+    unsafe {
+        NSAttributedString::initWithString_attributes(
+            NSAttributedString::alloc(),
+            &NSString::from_str(text),
+            Some(&dict),
+        )
+    }
+}
+
+/// A selectable style item for the pop-up menu: `tag` maps back to the tab.
+fn style_menu_item(
+    mtm: MainThreadMarker,
+    title: &str,
+    symbol: &str,
+    tag: NSInteger,
+) -> Retained<NSMenuItem> {
+    // SAFETY: initWithTitle:action:keyEquivalent: is NSMenuItem's designated
+    // initializer; a nil action is fine — the pop-up button's own
+    // target/action fires when the selection changes.
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    item.setTag(tag);
+    if let Some(icon) = menu_icon(symbol, title) {
+        item.setImage(Some(&icon));
+    }
+    item
+}
+
+/// A disabled section header: never selectable, tag -1.
+fn section_header_item(mtm: MainThreadMarker, title: &str) -> Retained<NSMenuItem> {
+    // SAFETY: initWithTitle:action:keyEquivalent: is NSMenuItem's designated
+    // initializer; no action, so the item can never fire.
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    item.setTag(MENU_TAG_NONE);
+    item.setEnabled(false);
+    item.setAttributedTitle(Some(&section_header_title(title)));
+    item
+}
+
+fn separator_menu_item(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
+    let item = NSMenuItem::separatorItem(mtm);
+    item.setTag(MENU_TAG_NONE);
+    item.setEnabled(false);
+    item
+}
+
+/// The style menu for the pop-up button: "Fix grammar", then the tone styles
+/// and the length styles under disabled section headers.
+fn build_style_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let menu = NSMenu::new(mtm);
+    menu.setAutoenablesItems(false);
+    menu.addItem(&style_menu_item(mtm, "Fix grammar", "checkmark.circle", 0));
+    menu.addItem(&separator_menu_item(mtm));
+    menu.addItem(&section_header_item(mtm, "Change tone"));
+    for style in [
+        RewriteStyle::Friendly,
+        RewriteStyle::Formal,
+        RewriteStyle::Professional,
+    ] {
+        menu.addItem(&style_menu_item(
+            mtm,
+            style.label(),
+            style_symbol(style),
+            tag_for_tab(PopupTab::Rewrite(style)),
+        ));
+    }
+    menu.addItem(&separator_menu_item(mtm));
+    menu.addItem(&section_header_item(mtm, "Change length"));
+    for style in [RewriteStyle::Shorter, RewriteStyle::Longer] {
+        menu.addItem(&style_menu_item(
+            mtm,
+            style.label(),
+            style_symbol(style),
+            tag_for_tab(PopupTab::Rewrite(style)),
+        ));
+    }
+    menu
 }
 
 define_class!(
@@ -211,7 +351,7 @@ struct PopupState {
     cancel_button: Retained<NSButton>,
     replace_button: Retained<NSButton>,
     spinner: Retained<NSProgressIndicator>,
-    tabs: Retained<NSSegmentedControl>,
+    style_button: Retained<NSPopUpButton>,
     #[allow(dead_code)]
     replace_target: Retained<ReplaceTarget>,
     #[allow(dead_code)]
@@ -364,37 +504,35 @@ fn ensure_popup(mtm: MainThreadMarker) {
         spinner.setHidden(true);
         card.addSubview(&spinner);
 
-        // Tab row: "Correct" plus the five rewrite styles. Added last so the
-        // title/close views stay at subview indices 0 and 1.
+        // Style menu button in the footer: "Fix grammar" plus the five rewrite
+        // styles under section headers. Added last so the title/close views
+        // stay at subview indices 0 and 1.
         let tab_target = TabTarget::new(mtm);
         let tab_object: &AnyObject = &tab_target;
-        // SAFETY: initWithFrame: is the designated initializer and mtm is the main thread.
-        let tabs = NSSegmentedControl::initWithFrame(
-            NSSegmentedControl::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 24.0)),
+        // SAFETY: initWithFrame:pullsDown: is the designated initializer and mtm is the main thread.
+        let style_button = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(STYLE_BUTTON_WIDTH, 24.0),
+            ),
+            false,
         );
-        tabs.setSegmentCount(6);
-        tabs.setTrackingMode(NSSegmentSwitchTracking::SelectOne);
-        tabs.setLabel_forSegment(&NSString::from_str("Correct"), 0);
-        for (index, style) in RewriteStyle::ALL.iter().enumerate() {
-            tabs.setLabel_forSegment(&NSString::from_str(style.label()), index as NSInteger + 1);
-        }
-        // Small control size and the small system font so all six labels
-        // (notably "Professional") fit the 416 pt content width.
-        // SAFETY: setControlSize: exists on NSControl; 1 is NSControlSizeSmall.
+        style_button.setMenu(Some(&build_style_menu(mtm)));
+        style_button.setBordered(true);
+        // Regular control size; set explicitly (0 is NSControlSizeRegular).
+        // SAFETY: setControlSize: exists on NSControl.
         unsafe {
-            let _: () = msg_send![&tabs, setControlSize: 1usize];
+            let _: () = msg_send![&style_button, setControlSize: 0usize];
         }
-        tabs.setFont(Some(&NSFont::systemFontOfSize(
-            NSFont::smallSystemFontSize(),
-        )));
+        style_button.setFont(Some(&NSFont::systemFontOfSize(13.0)));
         // SAFETY: tab target implements tabClicked: and lives in STATE while the panel is alive.
         unsafe {
-            tabs.setTarget(Some(tab_object));
-            tabs.setAction(Some(sel!(tabClicked:)));
+            style_button.setTarget(Some(tab_object));
+            style_button.setAction(Some(sel!(tabClicked:)));
         }
-        tabs.setHidden(true);
-        card.addSubview(&tabs);
+        style_button.setHidden(true);
+        card.addSubview(&style_button);
 
         panel.setContentView(Some(&card));
         *state.borrow_mut() = Some(PopupState {
@@ -406,7 +544,7 @@ fn ensure_popup(mtm: MainThreadMarker) {
             cancel_button,
             replace_button,
             spinner,
-            tabs,
+            style_button,
             replace_target,
             dismiss_target,
             tab_target,
@@ -546,7 +684,7 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
             unsafe { popup.spinner.stopAnimation(None) };
             popup.spinner.setHidden(true);
         }
-        popup.tabs.setHidden(true);
+        popup.style_button.setHidden(true);
         popup.separator.setHidden(!show_footer);
         if show_footer {
             popup.separator.setFrame(NSRect::new(
@@ -632,8 +770,9 @@ fn build_diff_attributed(
     full
 }
 
-/// Lays out the card for a tabbed diff body (today's diff view with the tab
-/// row above it). Cancel + Replace are visible. Returns the panel height.
+/// Lays out the card for a tabbed diff body (today's diff view with the style
+/// menu button in the footer). Cancel + Replace are visible. Returns the
+/// panel height.
 fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -676,7 +815,7 @@ fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
             }
         }
         let body_height = needed.clamp(BODY_MIN, BODY_MAX);
-        let panel_height = HEADER_HEIGHT + TABS_ROW_HEIGHT + body_height + FOOTER_HEIGHT;
+        let panel_height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
 
         popup.card.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
@@ -695,15 +834,6 @@ fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
                 NSSize::new(24.0, 24.0),
             ));
         }
-        popup.tabs.setHidden(false);
-        popup.tabs.setSelectedSegment(segment_for_tab(selected));
-        popup.tabs.setFrame(NSRect::new(
-            NSPoint::new(
-                SIDE_PAD,
-                panel_height - HEADER_HEIGHT - TABS_ROW_HEIGHT + 3.0,
-            ),
-            NSSize::new(CARD_WIDTH - 2.0 * SIDE_PAD, 24.0),
-        ));
         popup.scroll.setFrame(NSRect::new(
             NSPoint::new(4.0, FOOTER_HEIGHT),
             NSSize::new(CARD_WIDTH - 8.0, body_height),
@@ -716,6 +846,12 @@ fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
         popup.separator.setFrame(NSRect::new(
             NSPoint::new(0.0, FOOTER_HEIGHT),
             NSSize::new(CARD_WIDTH, 1.0),
+        ));
+        popup.style_button.setHidden(false);
+        popup.style_button.selectItemWithTag(tag_for_tab(selected));
+        popup.style_button.setFrame(NSRect::new(
+            NSPoint::new(SIDE_PAD, 8.0),
+            NSSize::new(STYLE_BUTTON_WIDTH, 24.0),
         ));
         popup.cancel_button.setHidden(false);
         popup.replace_button.setHidden(false);
@@ -732,8 +868,8 @@ fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
 }
 
 /// Lays out the card for a tabbed plain-text body (a rewrite state: loading,
-/// error, or an informational note). The footer shows Cancel only. Returns
-/// the panel height.
+/// error, or an informational note). The footer shows the style menu button
+/// and Cancel only. Returns the panel height.
 fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: PopupTab) -> f64 {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -771,7 +907,7 @@ fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: Po
             }
         }
         let body_height = needed.clamp(BODY_MIN, BODY_MAX);
-        let panel_height = HEADER_HEIGHT + TABS_ROW_HEIGHT + body_height + FOOTER_HEIGHT;
+        let panel_height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
 
         popup.card.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
@@ -790,15 +926,6 @@ fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: Po
                 NSSize::new(24.0, 24.0),
             ));
         }
-        popup.tabs.setHidden(false);
-        popup.tabs.setSelectedSegment(segment_for_tab(selected));
-        popup.tabs.setFrame(NSRect::new(
-            NSPoint::new(
-                SIDE_PAD,
-                panel_height - HEADER_HEIGHT - TABS_ROW_HEIGHT + 3.0,
-            ),
-            NSSize::new(CARD_WIDTH - 2.0 * SIDE_PAD, 24.0),
-        ));
         popup.scroll.setFrame(NSRect::new(
             NSPoint::new(4.0 + text_indent, FOOTER_HEIGHT),
             NSSize::new(CARD_WIDTH - 8.0 - text_indent, body_height),
@@ -825,6 +952,12 @@ fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: Po
             NSPoint::new(0.0, FOOTER_HEIGHT),
             NSSize::new(CARD_WIDTH, 1.0),
         ));
+        popup.style_button.setHidden(false);
+        popup.style_button.selectItemWithTag(tag_for_tab(selected));
+        popup.style_button.setFrame(NSRect::new(
+            NSPoint::new(SIDE_PAD, 8.0),
+            NSSize::new(STYLE_BUTTON_WIDTH, 24.0),
+        ));
         popup.cancel_button.setHidden(false);
         popup.replace_button.setHidden(true);
         popup.cancel_button.setFrame(NSRect::new(
@@ -835,10 +968,10 @@ fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: Po
     })
 }
 
-/// Shows the popup with the tab row, `selected` highlighted: a word diff for
-/// `Diff` (Cancel + Replace), plain text for `Message` (Cancel only, with the
-/// spinner while `loading`). Positioned like every other body: the same anchor
-/// and height-driven sizing, so switching tabs never moves the popup.
+/// Shows the popup with the style menu button showing `selected`: a word diff
+/// for `Diff` (Cancel + Replace), plain text for `Message` (Cancel only, with
+/// the spinner while `loading`). Positioned like every other body: the same
+/// anchor and height-driven sizing, so switching styles never moves the popup.
 pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     let Some(mtm) = MainThreadMarker::new() else {
         eprintln!(
@@ -982,4 +1115,32 @@ pub fn is_visible() -> bool {
             .map(|popup| popup.visible)
             .unwrap_or(false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tab_for_tag, tag_for_tab, NSInteger, PopupTab, RewriteStyle, MENU_TAG_NONE};
+
+    #[test]
+    fn style_tags_round_trip() {
+        assert_eq!(tag_for_tab(PopupTab::Correct), 0);
+        for (index, style) in RewriteStyle::ALL.iter().enumerate() {
+            assert_eq!(
+                tag_for_tab(PopupTab::Rewrite(*style)),
+                index as NSInteger + 1
+            );
+        }
+        for tab in [PopupTab::Correct]
+            .into_iter()
+            .chain(RewriteStyle::ALL.map(PopupTab::Rewrite))
+        {
+            assert_eq!(tab_for_tag(tag_for_tab(tab)), Some(tab));
+        }
+    }
+
+    #[test]
+    fn unknown_tags_map_to_no_tab() {
+        assert_eq!(tab_for_tag(MENU_TAG_NONE), None);
+        assert_eq!(tab_for_tag(99), None);
+    }
 }

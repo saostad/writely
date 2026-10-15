@@ -63,16 +63,16 @@ pub fn show_suggestion(original: &str, suggestion: &str, caret: &CaretRect) {
 }
 
 /// The tabs of the suggestion popup: the grammar correction, or one rewrite
-/// style. macOS shows them as a segmented control; other platforms keep
-/// today's single-view popup.
+/// style. macOS shows them in a pop-up menu button in the footer; other
+/// platforms keep today's single-view popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PopupTab {
     Correct,
     Rewrite(RewriteStyle),
 }
 
-/// The body shown under the tabs: a word diff, or a plain message (with an
-/// optional spinner while a rewrite loads).
+/// The body shown above the style menu: a word diff, or a plain message (with
+/// an optional spinner while a rewrite loads).
 pub enum TabContent<'a> {
     Diff {
         original: &'a str,
@@ -85,9 +85,9 @@ pub enum TabContent<'a> {
     },
 }
 
-/// Shows the popup with the tab row, `selected` highlighted. Off macOS this
-/// falls back to today's behaviour: `Diff` shows the suggestion, `Message`
-/// shows plain text without the Replace button.
+/// Shows the popup with the style menu button showing `selected`. Off macOS
+/// this falls back to today's behaviour: `Diff` shows the suggestion,
+/// `Message` shows plain text without the Replace button.
 pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     #[cfg(target_os = "macos")]
     {
