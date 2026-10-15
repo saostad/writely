@@ -13,12 +13,12 @@ use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    Arc, BeginPaint, CreateFontIndirectW, CreatePen, DeleteObject, EndPaint, GetDC,
-    GetMonitorInfoW, GetStockObject, GetSysColor, GetSysColorBrush, InvalidateRect, LineTo,
+    Arc, BeginPaint, CreateFontIndirectW, CreatePen, DeleteObject, DrawTextW, EndPaint, FillRect,
+    GetDC, GetMonitorInfoW, GetStockObject, GetSysColor, GetSysColorBrush, InvalidateRect, LineTo,
     MonitorFromPoint, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    COLOR_3DSHADOW, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, FW_BOLD, HDC,
-    HFONT, HGDIOBJ, HOLLOW_BRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID,
-    TRANSPARENT,
+    COLOR_3DSHADOW, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT,
+    DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD, HDC, HFONT, HGDIOBJ, HOLLOW_BRUSH, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::Win32::System::WindowsProgramming::MulDiv;
@@ -27,17 +27,19 @@ use windows::Win32::UI::Controls::RichEdit::{
     ECOOP_SET, ECO_READONLY, EM_EXSETSEL, EM_FORMATRANGE, EM_SETCHARFORMAT, EM_SETEVENTMASK,
     EM_SETOPTIONS, ENM_REQUESTRESIZE, FORMATRANGE, SCF_SELECTION,
 };
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetClientRect,
     GetForegroundWindow, GetWindowRect, IsWindow, KillTimer, RegisterClassW, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
-    BN_CLICKED, BS_DEFPUSHBUTTON, BS_FLAT, BS_PUSHBUTTON, CS_DROPSHADOW, HMENU, HWND_TOPMOST,
+    BN_CLICKED, BS_DEFPUSHBUTTON, BS_OWNERDRAW, BS_PUSHBUTTON, CS_DROPSHADOW, HMENU, HWND_TOPMOST,
     MA_NOACTIVATE, MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_SEPARATOR, NONCLIENTMETRICSW,
     SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, TPM_LEFTALIGN,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_MOUSEACTIVATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_TIMER,
-    WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_MOUSEACTIVATE, WM_NOTIFY, WM_PAINT, WM_SETFONT,
+    WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_VISIBLE,
 };
 
 use crate::providers::RewriteStyle;
@@ -458,6 +460,48 @@ extern "system" fn popup_proc(
             }
             LRESULT(0)
         }
+        WM_DRAWITEM => {
+            if (wparam.0 & 0xffff) as i32 == ID_CLOSE {
+                // SAFETY: lParam points to a DRAWITEMSTRUCT for WM_DRAWITEM.
+                let item = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+                let font = STATE.with(|state| {
+                    state
+                        .borrow()
+                        .as_ref()
+                        .map(|popup| popup.font)
+                        .unwrap_or_default()
+                });
+                // SAFETY: item.hDC and item.rcItem come from the owner-draw message.
+                unsafe {
+                    let brush = if item.itemState.0 & ODS_SELECTED.0 != 0 {
+                        GetSysColorBrush(COLOR_BTNFACE)
+                    } else {
+                        GetSysColorBrush(COLOR_WINDOW)
+                    };
+                    FillRect(item.hDC, &item.rcItem, brush);
+                    let old_font = if font.0.is_null() {
+                        HGDIOBJ::default()
+                    } else {
+                        SelectObject(item.hDC, HGDIOBJ(font.0))
+                    };
+                    SetTextColor(item.hDC, COLORREF(GetSysColor(COLOR_GRAYTEXT)));
+                    SetBkMode(item.hDC, TRANSPARENT);
+                    let mut text = wide("\u{2715}");
+                    let mut rect = item.rcItem;
+                    DrawTextW(
+                        item.hDC,
+                        &mut text,
+                        &mut rect,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                    );
+                    if !font.0.is_null() {
+                        SelectObject(item.hDC, old_font);
+                    }
+                }
+                return LRESULT(1);
+            }
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == SPINNER_TIMER_ID {
                 let rect = STATE.with(|state| {
@@ -753,7 +797,7 @@ fn ensure_window() -> Option<HWND> {
         "BUTTON",
         "\u{2715}",
         WINDOW_EX_STYLE(0),
-        WINDOW_STYLE(BS_FLAT as u32 | BS_PUSHBUTTON as u32),
+        WINDOW_STYLE(BS_OWNERDRAW as u32),
         ID_CLOSE,
     )?;
     let body = make_child(
