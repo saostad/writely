@@ -298,6 +298,13 @@ pub fn focused_field() -> Result<Option<FieldSnapshot>, String> {
     }
 }
 
+/// Selects `range` in the field so a paste replaces exactly that text.
+/// Windows only; other platforms have no caller.
+#[cfg(target_os = "windows")]
+pub(crate) fn select_range(snap: &FieldSnapshot, range: Range<usize>) -> Result<(), String> {
+    windows::select_range(snap, range)
+}
+
 pub fn replace_range(
     snap: &FieldSnapshot,
     range: Range<usize>,

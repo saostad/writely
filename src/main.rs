@@ -981,6 +981,8 @@ fn handle_rewrite(
     }
 }
 
+// On Windows the paste-fallback block always returns, so the shared tail is unreachable there.
+#[cfg_attr(target_os = "windows", allow(unreachable_code))]
 fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Option<CaretRect>) {
     let Some(active) = pending.take() else {
         return;
@@ -1013,6 +1015,30 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
             popup::hide();
         }
         Err(error) => {
+            // Paste fallback on Windows: select the checked range through
+            // UI Automation, verify it, and paste over it. The original
+            // replace error is never dropped.
+            #[cfg(target_os = "windows")]
+            {
+                let paste_result = text_access::select_range(&snap, active.range.clone())
+                    .and_then(|()| clipboard::paste_suggestion(active.pid, &text));
+                match paste_result {
+                    Ok(()) => {
+                        popup::hide();
+                    }
+                    Err(paste_error) => {
+                        show_popup(
+                            &format!("{error} Writely also couldn't paste it: {paste_error}"),
+                            true,
+                            false,
+                            *last_anchor,
+                            Some(snap.caret_rect),
+                            last_anchor,
+                        );
+                    }
+                }
+                return;
+            }
             // Paste fallback for partial snapshots: the text is still
             // selected from step 1 of the AX path, so re-select the snapshot
             // range first and paste over it instead of showing an error.

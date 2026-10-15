@@ -3,7 +3,7 @@ use std::sync::Once;
 
 use uiautomation::core::{UIAutomation, UIElement};
 use uiautomation::patterns::{UITextPattern, UIValuePattern};
-use uiautomation::types::TextPatternRangeEndpoint;
+use uiautomation::types::{TextPatternRangeEndpoint, TextUnit};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -342,4 +342,100 @@ pub(crate) fn replace_range(
         return Err("The app didn't accept the replacement text.".to_string());
     }
     Ok(())
+}
+
+/// Selects `range` (char indices into `snap.text`) in the field through
+/// UI Automation and verifies the selection reads back as the snapshot
+/// text for that range, so a paste replaces exactly the checked text.
+pub(crate) fn select_range(snap: &FieldSnapshot, range: Range<usize>) -> Result<(), String> {
+    let char_count = snap.text.chars().count();
+    let expected = selected_text_for_range(&snap.text, &range)?;
+    let pattern = snap
+        .handle
+        .element
+        .get_pattern::<UITextPattern>()
+        .map_err(|error| format!("Could not select the text to replace: {error}"))?;
+    let document = pattern
+        .get_document_range()
+        .map_err(|error| format!("Could not select the text to replace: {error}"))?;
+    let target = document.clone();
+    target
+        .move_endpoint_by_unit(
+            TextPatternRangeEndpoint::Start,
+            TextUnit::Character,
+            range.start as i32,
+        )
+        .map_err(|error| format!("Could not select the text to replace: {error}"))?;
+    let after_end = char_count - range.end;
+    target
+        .move_endpoint_by_unit(
+            TextPatternRangeEndpoint::End,
+            TextUnit::Character,
+            -(after_end as i32),
+        )
+        .map_err(|error| format!("Could not select the text to replace: {error}"))?;
+    target
+        .select()
+        .map_err(|error| format!("Could not select the text to replace: {error}"))?;
+    let selections = pattern
+        .get_selection()
+        .map_err(|error| format!("Could not select the text to replace: {error}"))?;
+    let selected = match selections.into_iter().next() {
+        Some(selection) => selection
+            .get_text(-1)
+            .map_err(|error| format!("Could not select the text to replace: {error}"))?,
+        None => {
+            return Err(
+                "Could not select the text to replace: the app reported no selection.".to_string(),
+            )
+        }
+    };
+    if selected != expected {
+        return Err(
+            "Could not select the text to replace: the selected text doesn't match the checked text."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The snapshot text for `range` (char indices), or an error when the range
+/// is out of bounds. Pure so the char-index (not byte-index) slicing and
+/// the bounds check can be tested without a live field.
+fn selected_text_for_range(text: &str, range: &Range<usize>) -> Result<String, String> {
+    let char_count = text.chars().count();
+    if range.start > range.end || range.end > char_count {
+        return Err(
+            "Could not select the text to replace: the range is out of bounds.".to_string(),
+        );
+    }
+    Ok(text
+        .chars()
+        .skip(range.start)
+        .take(range.end - range.start)
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_text_for_range;
+
+    #[test]
+    fn selected_text_uses_char_indices_not_bytes() {
+        // The emoji is one char but four bytes: a byte slice would split it.
+        let text = "a\u{1F600} bad day.";
+        assert_eq!(selected_text_for_range(text, &(2..6)).unwrap(), " bad");
+        assert_eq!(
+            selected_text_for_range(text, &(0..2)).unwrap(),
+            "a\u{1F600}"
+        );
+    }
+
+    #[test]
+    fn selected_text_rejects_out_of_bounds_ranges() {
+        let text = "short";
+        assert!(selected_text_for_range(text, &(0..6)).is_err());
+        assert!(selected_text_for_range(text, &std::ops::Range { start: 3, end: 2 }).is_err());
+        assert_eq!(selected_text_for_range(text, &(5..5)).unwrap(), "");
+    }
 }
