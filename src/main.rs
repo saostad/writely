@@ -130,14 +130,14 @@ fn looks_good_message() -> &'static str {
     }
 }
 
-/// Mouse-pointer anchor for the hotkey popup when no caret or container is
-/// known: a zero-size rect at the pointer, converted from AppKit
-/// bottom-left coords to the top-left coords the popup uses.
 #[cfg(target_os = "macos")]
 const HOTKEY_LABEL: &str = "⌃⌥G";
 #[cfg(target_os = "windows")]
 const HOTKEY_LABEL: &str = "Ctrl+Alt+G";
 
+/// Mouse-pointer anchor for the hotkey popup when no caret or container is
+/// known: a zero-size rect at the pointer, converted from AppKit
+/// bottom-left coords to the top-left coords the popup uses.
 #[cfg(target_os = "macos")]
 fn mouse_anchor() -> Option<CaretRect> {
     use objc2_app_kit::NSScreen;
