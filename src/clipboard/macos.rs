@@ -28,6 +28,8 @@ use objc2_core_graphics::{
 };
 use objc2_foundation::{NSArray, NSData, NSInteger, NSString};
 
+use super::CopyResult;
+
 /// Key codes for C and V (used with the Command flag for copy/paste).
 const KEY_C: CGKeyCode = 8;
 const KEY_V: CGKeyCode = 9;
@@ -371,14 +373,6 @@ fn copy_via_simulated_key(pasteboard: &NSPasteboard) -> Result<Option<String>, S
 
 /// How long to wait after posting ⌘V before restoring the pasteboard.
 const PASTE_WAIT_MS: u64 = 300;
-
-#[derive(Debug)]
-pub enum CopyResult {
-    /// The newly copied text.
-    Text(String),
-    /// Nothing new was copied (or it was empty): the user should select text.
-    NothingNew,
-}
 
 /// One saved pasteboard item: every type with its data.
 struct SavedItem {
