@@ -4,7 +4,7 @@ use std::sync::Once;
 use uiautomation::core::{UIAutomation, UIElement};
 use uiautomation::patterns::{UITextPattern, UIValuePattern};
 use uiautomation::types::{TextPatternRangeEndpoint, TextUnit};
-use windows::core::BOOL;
+use windows::core::{Interface, BOOL};
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Com::{
@@ -14,12 +14,14 @@ use windows::Win32::System::Ole::{
     SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
     SafeArrayUnaccessData,
 };
+use windows::Win32::System::Variant::{VARIANT, VT_I4};
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern2,
-    UIA_TextPattern2Id,
+    AccessibleObjectFromWindow, CUIAutomation, IAccessible, IUIAutomation, IUIAutomationElement,
+    IUIAutomationTextPattern2, UIA_TextPattern2Id,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, CHILDID_SELF, GUITHREADINFO,
+    OBJID_CARET,
 };
 
 use super::{replaced_text, CaretInfo, CaretRect, FieldSnapshot};
@@ -84,6 +86,56 @@ impl Drop for SafeArrayGuard {
             }
         }
     }
+}
+
+/// Whether an MSAA caret rectangle is usable: it must have extent and
+/// must not be the (0, 0) placeholder some apps report when there is no
+/// caret. A zero width is fine (Chrome reports a 0-wide caret); a caret
+/// on a monitor left of the primary one has a negative x and is usable.
+fn usable_msaa_caret(x: i32, y: i32, width: i32, height: i32) -> bool {
+    width + height > 0 && !(x == 0 && y == 0)
+}
+
+/// Caret rectangle from MSAA `OBJID_CARET` (screen physical pixels), or
+/// `Ok(None)` when the accessible object reports no usable caret.
+/// Callers treat an `Err` as "try the next step", not as fatal.
+fn msaa_caret_rect(hwnd: HWND, pid: u32) -> Result<Option<CaretInfo>, String> {
+    ensure_com();
+    let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: hwnd is a live window, the IID identifies IAccessible, and
+    // raw receives the owned interface pointer on success.
+    unsafe { AccessibleObjectFromWindow(hwnd, OBJID_CARET.0 as u32, &IAccessible::IID, &mut raw) }
+        .map_err(read_error)?;
+    if raw.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: raw is the owned IAccessible pointer from the call above.
+    let accessible: IAccessible = unsafe { IAccessible::from_raw(raw) };
+    let mut child = VARIANT::default();
+    // SAFETY: child is a zeroed VARIANT; setting its tag and i32 payload
+    // to VT_I4 / CHILDID_SELF matches what accLocation expects.
+    unsafe {
+        (*child.Anonymous.Anonymous).vt = VT_I4;
+        (*child.Anonymous.Anonymous).Anonymous.lVal = CHILDID_SELF as i32;
+    }
+    let (mut left, mut top, mut width, mut height) = (0i32, 0i32, 0i32, 0i32);
+    // SAFETY: accessible is a live COM object, the four out-parameters are
+    // writable, and child is the VARIANT built above.
+    unsafe { accessible.accLocation(&mut left, &mut top, &mut width, &mut height, &child) }
+        .map_err(read_error)?;
+    if !usable_msaa_caret(left, top, width, height) {
+        return Ok(None);
+    }
+    Ok(Some(CaretInfo {
+        pid,
+        caret_rect: CaretRect {
+            x: left as f64,
+            y: top as f64,
+            width: width.max(0) as f64,
+            height: height.max(0) as f64,
+            physical: true,
+        },
+    }))
 }
 
 /// Caret rectangle from the UIA caret range (physical pixels), or `Ok(None)`
@@ -248,7 +300,8 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
     let mut thread_info: GUITHREADINFO = unsafe { std::mem::zeroed() };
     thread_info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
     // SAFETY: thread_info is writable with cbSize set.
-    if unsafe { GetGUIThreadInfo(foreground_thread, &mut thread_info) }.is_ok()
+    let gui_ok = unsafe { GetGUIThreadInfo(foreground_thread, &mut thread_info) }.is_ok();
+    if gui_ok
         && !thread_info.hwndCaret.is_invalid()
         && (thread_info.rcCaret.right > thread_info.rcCaret.left
             || thread_info.rcCaret.bottom > thread_info.rcCaret.top)
@@ -278,6 +331,17 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
                 },
             }));
         }
+    }
+    // MSAA caret: Chrome and VS Code expose no system or UIA caret, but
+    // their caret is reachable as OBJID_CARET. A failure here only means
+    // "try UIA next"; the UIA result (or its error) decides the outcome.
+    let msaa_hwnd = if gui_ok && !thread_info.hwndFocus.is_invalid() {
+        thread_info.hwndFocus
+    } else {
+        foreground
+    };
+    if let Ok(Some(info)) = msaa_caret_rect(msaa_hwnd, pid) {
+        return Ok(Some(info));
     }
     uia_caret_rect(&element, pid)
 }
@@ -418,7 +482,18 @@ fn selected_text_for_range(text: &str, range: &Range<usize>) -> Result<String, S
 
 #[cfg(test)]
 mod tests {
-    use super::selected_text_for_range;
+    use super::{selected_text_for_range, usable_msaa_caret};
+
+    #[test]
+    fn msaa_caret_accepts_only_rects_with_extent_off_the_origin() {
+        // The two live probes from Chrome and VS Code.
+        assert!(usable_msaa_caret(390, 224, 0, 27));
+        assert!(usable_msaa_caret(767, 252, 1, 35));
+        assert!(!usable_msaa_caret(0, 0, 0, 0));
+        assert!(!usable_msaa_caret(0, 0, 1, 20));
+        // A caret on a monitor left of the primary one.
+        assert!(usable_msaa_caret(-1200, 300, 1, 20));
+    }
 
     #[test]
     fn selected_text_uses_char_indices_not_bytes() {
