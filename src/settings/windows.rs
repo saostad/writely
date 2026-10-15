@@ -13,15 +13,21 @@ use windows::Win32::UI::Controls::{EM_SETCUEBANNER, NMHDR, NM_CLICK, NM_RETURN};
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, SetFocus, VK_RETURN, VK_SHIFT, VK_TAB,
+};
+use windows::Win32::UI::Shell::{
+    DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowTextLengthW,
-    GetWindowTextW, IsWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
-    SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
-    BS_PUSHBUTTON, CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
-    ES_AUTOHSCROLL, ES_PASSWORD, HMENU, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_NOTIFY, WM_SETFONT, WNDCLASSW, WS_CAPTION,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetNextDlgTabItem,
+    GetWindowTextLengthW, GetWindowTextW, IsWindow, RegisterClassW, SendMessageW,
+    SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK,
+    BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CBN_SELCHANGE, CBS_DROPDOWNLIST,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, DLGC_WANTTAB, ES_AUTOHSCROLL, ES_PASSWORD, HMENU,
+    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DPICHANGED, WM_GETDLGCODE, WM_KEYDOWN, WM_NOTIFY, WM_SETFONT, WNDCLASSW, WS_CAPTION,
     WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
@@ -36,6 +42,7 @@ const ID_MODEL: i32 = 1006;
 const ID_EFFORT: i32 = 1007;
 const ID_URL: i32 = 1008;
 const ID_AUTOSTART: i32 = 1009;
+const TAB_SUBCLASS_ID: usize = 1;
 
 const PROVIDER_NAMES: [&str; 3] = [
     "Google Gemini",
@@ -764,6 +771,78 @@ fn open_key_page(provider: Provider) {
     }
 }
 
+fn focusable_children(handles: &Handles) -> [HWND; 9] {
+    [
+        handles.provider_combo,
+        handles.model_edit,
+        handles.effort_combo,
+        handles.edit,
+        handles.url_edit,
+        handles.link,
+        handles.autostart_checkbox,
+        handles.save,
+        handles.remove,
+    ]
+}
+
+extern "system" fn settings_child_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    ref_data: usize,
+) -> LRESULT {
+    if msg == WM_GETDLGCODE {
+        // SAFETY: hwnd is a subclassed child of the Settings window.
+        let base = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+        return LRESULT(base.0 | DLGC_WANTTAB as isize);
+    }
+    if msg == WM_KEYDOWN && wparam.0 == VK_TAB.0 as usize {
+        let parent = HWND(ref_data as *mut core::ffi::c_void);
+        // SAFETY: VK_SHIFT is a valid virtual-key code for the state query.
+        let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+        // SAFETY: parent is the Settings window and hwnd is one of its children.
+        match unsafe { GetNextDlgTabItem(parent, Some(hwnd), shift_down) } {
+            Ok(next) if !next.is_invalid() => {
+                // SAFETY: next is the next tab-stop child of the Settings window.
+                let _previous = unsafe { SetFocus(Some(next)) };
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("Writely: Tab won't move between Settings fields: {error}");
+            }
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_KEYDOWN && wparam.0 == VK_RETURN.0 as usize {
+        let is_edit = STATE.with(|state| {
+            state
+                .borrow()
+                .as_ref()
+                .map(|handles| {
+                    handles.model_edit == hwnd || handles.edit == hwnd || handles.url_edit == hwnd
+                })
+                .unwrap_or(false)
+        });
+        if is_edit {
+            let parent = HWND(ref_data as *mut core::ffi::c_void);
+            // SAFETY: parent is the Settings window; this runs Save's WM_COMMAND code.
+            let _sent = unsafe {
+                SendMessageW(
+                    parent,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(hwnd.0 as isize)),
+                )
+            };
+            return LRESULT(0);
+        }
+    }
+    // SAFETY: all other messages go to the child's original window procedure.
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_COMMAND => {
@@ -958,6 +1037,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_DESTROY => {
+            let children = STATE.with(|state| state.borrow().as_ref().map(focusable_children));
+            if let Some(children) = children {
+                for child in children {
+                    // SAFETY: child was subclassed when the window opened.
+                    let _removed = unsafe {
+                        RemoveWindowSubclass(child, Some(settings_child_proc), TAB_SUBCLASS_ID)
+                    };
+                }
+            }
             let font = STATE.with(|state| state.borrow().as_ref().map(|handles| handles.font));
             if let Some(font) = font {
                 delete_font(font);
@@ -1187,7 +1275,7 @@ pub fn show_settings() -> Result<(), String> {
     let autostart_checkbox = make_child(
         "BUTTON",
         "Start Writely at login",
-        WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+        WINDOW_STYLE((BS_AUTOCHECKBOX as u32) | WS_TABSTOP.0),
         lay.autostart,
         ID_AUTOSTART,
     )?;
@@ -1201,14 +1289,14 @@ pub fn show_settings() -> Result<(), String> {
     let save = make_child(
         "BUTTON",
         "Save",
-        WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
+        WINDOW_STYLE((BS_DEFPUSHBUTTON as u32) | WS_TABSTOP.0),
         lay.save,
         ID_SAVE,
     )?;
     let remove = make_child(
         "BUTTON",
         "Remove key",
-        WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WINDOW_STYLE((BS_PUSHBUTTON as u32) | WS_TABSTOP.0),
         lay.remove,
         ID_REMOVE,
     )?;
@@ -1297,6 +1385,28 @@ pub fn show_settings() -> Result<(), String> {
         }
     });
     size_and_center_window(window, dpi);
+    // Subclass every focusable child so Tab moves between fields (tao's
+    // loop never calls IsDialogMessageW).
+    STATE.with(|state| {
+        if let Some(handles) = state.borrow().as_ref() {
+            for child in focusable_children(handles) {
+                // SAFETY: child is a live child and window outlives the subclass.
+                if !unsafe {
+                    SetWindowSubclass(
+                        child,
+                        Some(settings_child_proc),
+                        TAB_SUBCLASS_ID,
+                        window.0 as usize,
+                    )
+                }
+                .as_bool()
+                {
+                    let error = windows::core::Error::from_thread();
+                    eprintln!("Writely: Tab won't move between Settings fields: {error}");
+                }
+            }
+        }
+    });
     refresh_provider_rows();
     if let Some(error) = initial_error {
         set_status(&error, true);
@@ -1309,6 +1419,8 @@ pub fn show_settings() -> Result<(), String> {
     unsafe {
         let _ = ShowWindow(window, SW_SHOW);
         let _ = SetForegroundWindow(window);
+        // SAFETY: provider_combo is a live child of the Settings window.
+        let _previous = SetFocus(Some(provider_combo));
     }
     Ok(())
 }
