@@ -3,7 +3,7 @@
 mod autostart;
 mod check_text;
 mod check_window;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod clipboard;
 mod config;
 mod diff;
@@ -35,7 +35,7 @@ pub enum UserEvent {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     TabClicked(popup::PopupTab),
     PermissionGranted,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     CopiedText {
         generation: u64,
         result: Result<clipboard::CopyResult, String>,
@@ -82,9 +82,9 @@ struct Pending {
     selected: popup::PopupTab,
     /// Per-style in-flight flags, so a style is never requested twice.
     rewrite_in_flight: [bool; 5],
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pid: u32,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     via_clipboard: bool,
 }
 
@@ -331,7 +331,7 @@ fn spawn_rewrite_thread(
 /// Copy, simulated ⌘C) runs in a `writely-copy` worker thread — it can take
 /// up to 2 s — which sends `UserEvent::CopiedText`. Never runs for a secure
 /// field (the caller checks that first).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn handle_icon_clipboard(
     proxy: &EventLoopProxy<UserEvent>,
     pid: u32,
@@ -370,7 +370,7 @@ fn handle_icon_clipboard(
 
 /// Handles the worker's layered-copy result: starts a check on the copied
 /// text, or tells the user to select text first.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
 fn handle_copied_text(
     proxy: &EventLoopProxy<UserEvent>,
@@ -387,6 +387,12 @@ fn handle_copied_text(
     if event_generation != current_generation || !popup::is_visible() {
         return;
     }
+    #[cfg(target_os = "windows")]
+    let empty_message = {
+        let _ = from_hotkey;
+        "Select the text you want to check, then click W."
+    };
+    #[cfg(not(target_os = "windows"))]
     let empty_message = if from_hotkey {
         "Select the text you want to check, then press ⌃⌥G."
     } else {
@@ -470,7 +476,10 @@ fn handle_icon_clicked(
     *checking = None;
     // `live_pid` is only consumed by macOS-only paths below; keep the
     // binding on all targets and allow it to be unused elsewhere.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "windows")),
+        allow(unused_variables)
+    )]
     let (live_anchor, live_pid) = match text_access::caret_info() {
         Ok(Some(info)) => (Some(info.caret_rect), Some(info.pid)),
         Ok(None) => (None, None),
@@ -512,8 +521,8 @@ fn handle_icon_clicked(
     }) else {
         // No AX text for the focused element (e.g. Warp): on macOS fall back
         // to copy-and-paste, but never for a secure field.
-        #[cfg(target_os = "macos")]
-        if !text_access::macos_helpers::focused_is_secure() {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if !text_access::focused_is_secure() {
             if let Some(pid) = live_pid {
                 handle_icon_clipboard(
                     proxy,
@@ -595,7 +604,7 @@ fn handle_icon_clicked(
             text_access::NoCaretDecision::TooLong => {
                 // The whole field doesn't fit: on macOS try the clipboard
                 // (which re-applies the limit to the copied text).
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 if let Some(pid) = live_pid.or(Some(snap.pid)) {
                     handle_icon_clipboard(proxy, pid, anchor, generation, last_anchor, from_hotkey);
                     return;
@@ -983,7 +992,7 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
         return;
     };
     // The copy-and-paste path pastes the suggestion over the selection.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if active.via_clipboard {
         match clipboard::paste_suggestion(active.pid, &text) {
             Ok(()) => {
@@ -1475,7 +1484,7 @@ fn main() {
             Event::UserEvent(UserEvent::PermissionGranted) => {
                 handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon, paused);
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Event::UserEvent(UserEvent::CopiedText {
                 generation: event_generation,
                 result,

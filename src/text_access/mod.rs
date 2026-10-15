@@ -222,6 +222,24 @@ pub(crate) fn replaced_text(text: &str, range: &Range<usize>, new_text: &str) ->
     out
 }
 
+/// Whether the currently focused element is a secure (password) field.
+/// Unknown or unreadable focus counts as secure: the copy-and-paste
+/// fallback must never run for a password field.
+pub(crate) fn focused_is_secure() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::focused_is_secure()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::focused_is_secure()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        true
+    }
+}
+
 pub fn check_permission(prompt: bool) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {

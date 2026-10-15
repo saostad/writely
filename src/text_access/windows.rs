@@ -282,6 +282,35 @@ pub(crate) fn caret_info() -> Result<Option<CaretInfo>, String> {
     uia_caret_rect(&element, pid)
 }
 
+/// Whether the currently focused element is a secure (password) field.
+/// Unknown or unreadable focus counts as secure: the copy-and-paste fallback
+/// must never run for a password field.
+pub(crate) fn focused_is_secure() -> bool {
+    let automation = match uia_client() {
+        Ok(automation) => automation,
+        Err(error) => {
+            eprintln!("Writely: {error}");
+            return true;
+        }
+    };
+    // SAFETY: the automation client is a live in-process COM object.
+    let element = match unsafe { automation.GetFocusedElement() } {
+        Ok(element) => element,
+        Err(error) => {
+            eprintln!("Writely: {}", read_error(error));
+            return true;
+        }
+    };
+    // SAFETY: the element is a live COM object from the call above.
+    match unsafe { element.CurrentIsPassword() } {
+        Ok(is_password) => is_password.as_bool(),
+        Err(error) => {
+            eprintln!("Writely: {}", read_error(error));
+            true
+        }
+    }
+}
+
 pub(crate) fn read_text(handle: &PlatformHandle) -> Result<String, String> {
     document_text(&handle.element)
 }
