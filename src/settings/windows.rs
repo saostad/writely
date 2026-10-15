@@ -3,12 +3,13 @@ use std::cell::RefCell;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, GetMonitorInfoW, MonitorFromPoint, SetBkMode, SetTextColor,
-    HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
+    CreateFontIndirectW, DeleteObject, GetMonitorInfoW, GetSysColor, GetSysColorBrush,
+    MonitorFromPoint, SetBkMode, SetTextColor, COLOR_GRAYTEXT, COLOR_WINDOW, HBRUSH, HDC, HFONT,
+    HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::WindowsProgramming::MulDiv;
-use windows::Win32::UI::Controls::EM_SETCUEBANNER;
+use windows::Win32::UI::Controls::{EM_SETCUEBANNER, NMHDR, NM_CLICK, NM_RETURN};
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi,
 };
@@ -16,12 +17,12 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowTextLengthW,
     GetWindowTextW, IsWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
-    SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON,
-    CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, ES_PASSWORD, HMENU,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY,
-    WM_DPICHANGED, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU,
-    WS_VISIBLE, WS_VSCROLL,
+    SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
+    BS_PUSHBUTTON, CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
+    ES_AUTOHSCROLL, ES_PASSWORD, HMENU, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_NOTIFY, WM_SETFONT, WNDCLASSW, WS_CAPTION,
+    WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{AppSettings, Effort, Provider};
@@ -400,13 +401,25 @@ fn child_rects(handles: &Handles) -> Vec<(HWND, Rect)> {
     let lay = layout(handles.settings.provider == Provider::Ollama);
     vec![
         (handles.provider_label, lay.provider_label),
-        (handles.provider_combo, lay.provider_combo),
+        (
+            handles.provider_combo,
+            Rect {
+                height: lay.provider_combo.height + 200,
+                ..lay.provider_combo
+            },
+        ),
         (handles.provider_help, lay.provider_help),
         (handles.model_label, lay.model_label),
         (handles.model_edit, lay.model_edit),
         (handles.model_help, lay.model_help),
         (handles.effort_label, lay.effort_label),
-        (handles.effort_combo, lay.effort_combo),
+        (
+            handles.effort_combo,
+            Rect {
+                height: lay.effort_combo.height + 200,
+                ..lay.effort_combo
+            },
+        ),
         (handles.effort_help, lay.effort_help),
         (handles.key_label, lay.key_label),
         (handles.edit, lay.key_edit),
@@ -664,8 +677,8 @@ fn refresh_provider_rows() {
         eprintln!("Writely: could not update the Settings help text: {error}");
     }
     if let Some(page) = super::api_key_page_for(rows.provider) {
-        let link_text = wide(page);
-        // SAFETY: link is a live BUTTON while the window is open.
+        let link_text = wide(&format!("<a>{page}</a>"));
+        // SAFETY: link is a live SysLink while the window is open.
         if let Err(error) = unsafe { SetWindowTextW(rows.link, PCWSTR(link_text.as_ptr())) } {
             eprintln!("Writely: could not update the Settings link: {error}");
         }
@@ -838,8 +851,6 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         Err(error) => set_status(&error, true),
                     }
                 }
-            } else if id == ID_LINK {
-                open_key_page(current_provider());
             } else if id as u32 == ID_PROVIDER as u32 && notification == CBN_SELCHANGE {
                 // Stash the model text for the previous provider first, so
                 // switching providers keeps each one's model.
@@ -848,27 +859,51 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             LRESULT(0)
         }
+        WM_NOTIFY => {
+            // SAFETY: lParam points to an NMHDR for WM_NOTIFY.
+            let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.idFrom == ID_LINK as usize
+                && (header.code == NM_CLICK || header.code == NM_RETURN)
+            {
+                open_key_page(current_provider());
+            }
+            LRESULT(0)
+        }
         WM_CTLCOLORSTATIC => {
             let target = HWND(lparam.0 as *mut core::ffi::c_void);
-            let is_status = STATE.with(|state| {
+            let (is_help, is_status_error) = STATE.with(|state| {
                 state
                     .borrow()
                     .as_ref()
-                    .map(|handles| handles.status == target && handles.error)
-                    .unwrap_or(false)
+                    .map(|handles| {
+                        let helps = [
+                            handles.provider_help,
+                            handles.model_help,
+                            handles.effort_help,
+                            handles.key_help,
+                            handles.url_help,
+                            handles.autostart_help,
+                        ];
+                        (
+                            helps.contains(&target),
+                            handles.status == target && handles.error,
+                        )
+                    })
+                    .unwrap_or((false, false))
             });
-            if is_status {
-                // SAFETY: wparam is the STATIC control device context for this message.
-                unsafe {
-                    SetTextColor(
-                        HDC(wparam.0 as *mut core::ffi::c_void),
-                        COLORREF(0x000000FF),
-                    );
-                    SetBkMode(HDC(wparam.0 as *mut core::ffi::c_void), TRANSPARENT);
+            // SAFETY: wparam is the STATIC control device context for this message.
+            unsafe {
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                if is_status_error {
+                    // RGB(196, 43, 28) as a COLORREF (0x00BBGGRR).
+                    SetTextColor(hdc, COLORREF(0x001C2BC4));
+                } else if is_help {
+                    SetTextColor(hdc, COLORREF(GetSysColor(COLOR_GRAYTEXT)));
                 }
+                SetBkMode(hdc, TRANSPARENT);
             }
-            // SAFETY: falling through to the default procedure is valid for this message.
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            // SAFETY: the COLOR_WINDOW brush matches the window background.
+            LRESULT(unsafe { GetSysColorBrush(COLOR_WINDOW) }.0 as isize)
         }
         WM_CLOSE => {
             // SAFETY: hwnd is the settings window created by show_settings.
@@ -958,6 +993,7 @@ pub fn show_settings() -> Result<(), String> {
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance,
         lpszClassName: PCWSTR(class_name.as_ptr()),
+        hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as *mut core::ffi::c_void),
         ..Default::default()
     };
     // SAFETY: window_class points at a live WNDCLASSW with a valid proc.
@@ -989,18 +1025,19 @@ pub fn show_settings() -> Result<(), String> {
     let dpi = if dpi == 0 { 96 } else { dpi };
     let font = settings_font(dpi);
     // SAFETY: parent is the live settings window and instance is the module handle.
-    let make_child = |class: &str,
-                      text: &str,
-                      style: WINDOW_STYLE,
-                      rect: Rect,
-                      id: i32|
+    let make_child_ex = |class: &str,
+                         text: &str,
+                         style: WINDOW_STYLE,
+                         ex_style: WINDOW_EX_STYLE,
+                         rect: Rect,
+                         id: i32|
      -> Result<HWND, String> {
         let class_wide = wide(class);
         let text_wide = wide(text);
         // SAFETY: class/text strings outlive the call and parent is live.
         unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                ex_style,
                 PCWSTR(class_wide.as_ptr()),
                 PCWSTR(text_wide.as_ptr()),
                 WS_CHILD | WS_VISIBLE | style,
@@ -1017,10 +1054,28 @@ pub fn show_settings() -> Result<(), String> {
         .map_err(|error| format!("Could not open the settings window: {error}"))
     };
 
-    let combo_style = WINDOW_STYLE((CBS_DROPDOWNLIST as u32) | WS_VSCROLL.0);
+    let make_child = |class: &str,
+                      text: &str,
+                      style: WINDOW_STYLE,
+                      rect: Rect,
+                      id: i32|
+     -> Result<HWND, String> {
+        make_child_ex(class, text, style, WINDOW_EX_STYLE(0), rect, id)
+    };
+
+    let combo_style = WINDOW_STYLE((CBS_DROPDOWNLIST as u32) | WS_VSCROLL.0 | WS_TABSTOP.0);
 
     let provider_label = make_child("STATIC", "Provider", WINDOW_STYLE(0), lay.provider_label, 0)?;
-    let provider_combo = make_child("COMBOBOX", "", combo_style, lay.provider_combo, ID_PROVIDER)?;
+    let provider_combo = make_child(
+        "COMBOBOX",
+        "",
+        combo_style,
+        Rect {
+            height: lay.provider_combo.height + 200,
+            ..lay.provider_combo
+        },
+        ID_PROVIDER,
+    )?;
     for name in PROVIDER_NAMES {
         let entry = wide(name);
         // SAFETY: provider_combo is a live COMBOBOX and entry outlives the call.
@@ -1041,10 +1096,26 @@ pub fn show_settings() -> Result<(), String> {
         0,
     )?;
     let model_label = make_child("STATIC", "Model", WINDOW_STYLE(0), lay.model_label, 0)?;
-    let model_edit = make_child("EDIT", "", WINDOW_STYLE(0), lay.model_edit, ID_MODEL)?;
+    let model_edit = make_child_ex(
+        "EDIT",
+        "",
+        WINDOW_STYLE((ES_AUTOHSCROLL as u32) | WS_TABSTOP.0),
+        WS_EX_CLIENTEDGE,
+        lay.model_edit,
+        ID_MODEL,
+    )?;
     let model_help = make_child("STATIC", "Paste the model name, e.g. gemini-3.5-flash-lite / deepseek-ai/DeepSeek-V4.1-Flash / llama3.2", WINDOW_STYLE(0), lay.model_help, 0)?;
     let effort_label = make_child("STATIC", "Effort", WINDOW_STYLE(0), lay.effort_label, 0)?;
-    let effort_combo = make_child("COMBOBOX", "", combo_style, lay.effort_combo, ID_EFFORT)?;
+    let effort_combo = make_child(
+        "COMBOBOX",
+        "",
+        combo_style,
+        Rect {
+            height: lay.effort_combo.height + 200,
+            ..lay.effort_combo
+        },
+        ID_EFFORT,
+    )?;
     for name in EFFORT_NAMES {
         let entry = wide(name);
         // SAFETY: effort_combo is a live COMBOBOX and entry outlives the call.
@@ -1065,14 +1136,22 @@ pub fn show_settings() -> Result<(), String> {
         lay.key_label,
         0,
     )?;
-    let edit_style = WINDOW_STYLE(ES_PASSWORD as u32);
-    let edit = make_child("EDIT", "", edit_style, lay.key_edit, ID_EDIT)?;
+    let edit_style = WINDOW_STYLE((ES_PASSWORD as u32) | (ES_AUTOHSCROLL as u32) | WS_TABSTOP.0);
+    let edit = make_child_ex(
+        "EDIT",
+        "",
+        edit_style,
+        WS_EX_CLIENTEDGE,
+        lay.key_edit,
+        ID_EDIT,
+    )?;
     let key_help = make_child("STATIC", "Writely sends the sentence you're editing to Google Gemini to check its grammar. Get a free key at ", WINDOW_STYLE(0), lay.key_help, 0)?;
     let default_page = super::api_key_page_for(Provider::Gemini).unwrap_or(super::API_KEY_PAGE);
+    let link_text = format!("<a>{default_page}</a>");
     let link = make_child(
-        "BUTTON",
-        default_page,
-        WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        "SysLink",
+        &link_text,
+        WINDOW_STYLE(WS_TABSTOP.0),
         lay.link,
         ID_LINK,
     )?;
@@ -1084,7 +1163,14 @@ pub fn show_settings() -> Result<(), String> {
         lay.url_label,
         0,
     )?;
-    let url_edit = make_child("EDIT", "", WINDOW_STYLE(0), lay.url_edit, ID_URL)?;
+    let url_edit = make_child_ex(
+        "EDIT",
+        "",
+        WINDOW_STYLE((ES_AUTOHSCROLL as u32) | WS_TABSTOP.0),
+        WS_EX_CLIENTEDGE,
+        lay.url_edit,
+        ID_URL,
+    )?;
     let url_help = make_child(
         "STATIC",
         "Where Ollama runs on your computer. No key needed.",
@@ -1109,7 +1195,7 @@ pub fn show_settings() -> Result<(), String> {
     let save = make_child(
         "BUTTON",
         "Save",
-        WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
         lay.save,
         ID_SAVE,
     )?;
