@@ -31,14 +31,18 @@ use super::{PopupTab, TabContent};
 use crate::diff::DiffOp;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, IsWindow, RegisterClassW, SendMessageW,
-    SetWindowPos, SetWindowTextW, ShowWindow, BN_CLICKED, BS_DEFPUSHBUTTON, BS_FLAT, BS_PUSHBUTTON,
-    CS_DROPSHADOW, HMENU, HWND_TOPMOST, MA_NOACTIVATE, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
-    SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetClientRect,
+    GetForegroundWindow, GetWindowRect, IsWindow, RegisterClassW, SendMessageW,
+    SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx, BN_CLICKED,
+    BS_DEFPUSHBUTTON, BS_FLAT, BS_PUSHBUTTON, CS_DROPSHADOW, HMENU, HWND_TOPMOST, MA_NOACTIVATE,
+    MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_SEPARATOR, NONCLIENTMETRICSW,
+    SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, TPM_LEFTALIGN,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_MOUSEACTIVATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WNDCLASSW,
     WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
+use crate::providers::RewriteStyle;
 use crate::text_access::CaretRect;
 use crate::UserEvent;
 
@@ -51,11 +55,13 @@ const BODY_MIN: i32 = 40;
 const BODY_MAX: i32 = 340;
 const BUTTON_WIDTH: i32 = 90;
 const BUTTON_HEIGHT: i32 = 24;
+const STYLE_BUTTON_WIDTH: i32 = 160;
 const ICON_SIZE: i32 = 20;
 
 const ID_CLOSE: i32 = 2001;
 const ID_CANCEL: i32 = 2002;
 const ID_REPLACE: i32 = 2003;
+const ID_STYLE: i32 = 2004;
 
 // RichEdit styles: ES_MULTILINE | ES_READONLY | WS_VSCROLL.
 const BODY_STYLE: u32 = 0x0004 | 0x0800 | 0x0020_0000;
@@ -70,6 +76,7 @@ struct PopupState {
     close: HWND,
     body: HWND,
     progress: HWND,
+    style: HWND,
     cancel: HWND,
     replace: HWND,
     selected: PopupTab,
@@ -118,6 +125,170 @@ fn send_replace() {
     }
 }
 
+fn send_tab(tab: PopupTab) {
+    if let Some(proxy) = PROXY.get() {
+        if let Err(error) = proxy.send_event(UserEvent::TabClicked(tab)) {
+            eprintln!("Writely: could not deliver the tab event: {error}");
+        }
+    }
+}
+
+fn tab_label(tab: PopupTab) -> &'static str {
+    match tab {
+        PopupTab::Correct => "Fix grammar",
+        PopupTab::Rewrite(style) => style.label(),
+    }
+}
+
+// Menu ids 1..=6: 1 is `Correct`; 2..=6 follow `RewriteStyle::ALL`.
+// Id 0 is reserved for separators, headers and "no selection".
+fn menu_id_for_tab(tab: PopupTab) -> u32 {
+    match tab {
+        PopupTab::Correct => 1,
+        PopupTab::Rewrite(style) => RewriteStyle::ALL
+            .iter()
+            .position(|candidate| *candidate == style)
+            .map(|index| index as u32 + 2)
+            .unwrap_or(1),
+    }
+}
+
+fn tab_for_menu_id(id: u32) -> Option<PopupTab> {
+    match id {
+        1 => Some(PopupTab::Correct),
+        2..=6 => RewriteStyle::ALL
+            .get((id - 2) as usize)
+            .map(|style| PopupTab::Rewrite(*style)),
+        _ => None,
+    }
+}
+
+// Shows the style menu below the style button, like `build_style_menu` on
+// macOS. The popup must be in front for the menu, so focus always goes
+// back to the app that was in front before Replace can paste into it.
+fn show_style_menu(window: HWND) {
+    let Some((selected, style)) = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|popup| (popup.selected, popup.style))
+    }) else {
+        return;
+    };
+    let mut button_rect = RECT::default();
+    // SAFETY: style is a live child window and button_rect is writable.
+    if let Err(error) = unsafe { GetWindowRect(style, &mut button_rect) } {
+        eprintln!("Writely: could not show the style menu: {error}");
+        return;
+    }
+    // SAFETY: querying the foreground window takes no borrowed state.
+    let previous = unsafe { GetForegroundWindow() };
+    // SAFETY: window is a live popup window on this thread.
+    if !unsafe { SetForegroundWindow(window) }.as_bool() {
+        eprintln!("Writely: could not bring the popup to the front for the style menu.");
+    }
+    let chosen = show_style_menu_inner(window, selected, button_rect);
+    // Always give focus back, even when the menu failed or was dismissed.
+    if !previous.is_invalid() {
+        // SAFETY: previous was the foreground window before the menu.
+        if !unsafe { SetForegroundWindow(previous) }.as_bool() {
+            let error = windows::core::Error::from_thread();
+            eprintln!("Writely: could not give focus back to the previous app: {error}");
+        }
+    }
+    if let Some(tab) = chosen {
+        if tab != selected {
+            send_tab(tab);
+        }
+    }
+}
+
+fn show_style_menu_inner(window: HWND, selected: PopupTab, button_rect: RECT) -> Option<PopupTab> {
+    // SAFETY: CreatePopupMenu takes no borrowed state.
+    let menu = match unsafe { CreatePopupMenu() } {
+        Ok(menu) => menu,
+        Err(error) => {
+            eprintln!("Writely: could not show the style menu: {error}");
+            return None;
+        }
+    };
+    let append =
+        |flags: MENU_ITEM_FLAGS, id: u32, text: &str| -> Result<(), windows::core::Error> {
+            let text_wide = wide(text);
+            // SAFETY: menu is a live popup menu and the text outlives the call.
+            unsafe { AppendMenuW(menu, flags, id as usize, PCWSTR(text_wide.as_ptr())) }
+        };
+    let checked = |tab: PopupTab| -> MENU_ITEM_FLAGS {
+        if tab == selected {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        }
+    };
+    let builds = [
+        append(
+            MENU_ITEM_FLAGS(0) | checked(PopupTab::Correct),
+            1,
+            "Fix grammar",
+        ),
+        append(MF_SEPARATOR, 0, ""),
+        append(MF_DISABLED, 0, "Change tone"),
+        append(
+            MENU_ITEM_FLAGS(0) | checked(PopupTab::Rewrite(RewriteStyle::Friendly)),
+            menu_id_for_tab(PopupTab::Rewrite(RewriteStyle::Friendly)),
+            RewriteStyle::Friendly.label(),
+        ),
+        append(
+            MENU_ITEM_FLAGS(0) | checked(PopupTab::Rewrite(RewriteStyle::Formal)),
+            menu_id_for_tab(PopupTab::Rewrite(RewriteStyle::Formal)),
+            RewriteStyle::Formal.label(),
+        ),
+        append(
+            MENU_ITEM_FLAGS(0) | checked(PopupTab::Rewrite(RewriteStyle::Professional)),
+            menu_id_for_tab(PopupTab::Rewrite(RewriteStyle::Professional)),
+            RewriteStyle::Professional.label(),
+        ),
+        append(MF_SEPARATOR, 0, ""),
+        append(MF_DISABLED, 0, "Change length"),
+        append(
+            MENU_ITEM_FLAGS(0) | checked(PopupTab::Rewrite(RewriteStyle::Shorter)),
+            menu_id_for_tab(PopupTab::Rewrite(RewriteStyle::Shorter)),
+            RewriteStyle::Shorter.label(),
+        ),
+        append(
+            MENU_ITEM_FLAGS(0) | checked(PopupTab::Rewrite(RewriteStyle::Longer)),
+            menu_id_for_tab(PopupTab::Rewrite(RewriteStyle::Longer)),
+            RewriteStyle::Longer.label(),
+        ),
+    ];
+    let mut chosen = None;
+    if let Err(error) = builds
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map(|_| ())
+    {
+        eprintln!("Writely: could not build the style menu: {error}");
+    } else {
+        // SAFETY: menu is a live popup menu and window is its live owner.
+        let picked = unsafe {
+            TrackPopupMenuEx(
+                menu,
+                (TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN).0,
+                button_rect.left,
+                button_rect.bottom,
+                window,
+                None,
+            )
+        };
+        chosen = tab_for_menu_id(picked.0 as u32);
+    }
+    // SAFETY: menu was created above and is destroyed exactly once here.
+    if let Err(error) = unsafe { DestroyMenu(menu) } {
+        eprintln!("Writely: could not close the style menu: {error}");
+    }
+    chosen
+}
+
 extern "system" fn popup_proc(
     window: HWND,
     message: u32,
@@ -134,6 +305,7 @@ extern "system" fn popup_proc(
                 match id {
                     ID_CLOSE | ID_CANCEL => send_dismiss(),
                     ID_REPLACE => send_replace(),
+                    ID_STYLE => show_style_menu(window),
                     _ => {}
                 }
             }
@@ -298,6 +470,7 @@ fn refresh_fonts(dpi: u32) {
             (popup.header, bold_font),
             (popup.close, font),
             (popup.body, font),
+            (popup.style, font),
             (popup.cancel, font),
             (popup.replace, font),
         ];
@@ -520,6 +693,13 @@ fn ensure_window() -> Option<HWND> {
         WINDOW_STYLE(PBS_MARQUEE),
         0,
     )?;
+    let style = make_child(
+        "BUTTON",
+        "Fix grammar \u{25be}",
+        WINDOW_EX_STYLE(0),
+        WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        ID_STYLE,
+    )?;
     let cancel = make_child(
         "BUTTON",
         "Cancel",
@@ -541,6 +721,7 @@ fn ensure_window() -> Option<HWND> {
             close,
             body,
             progress,
+            style,
             cancel,
             replace,
             selected: PopupTab::Correct,
@@ -744,19 +925,28 @@ fn show_card(window: HWND, caret: &CaretRect, width: i32, height: i32) -> bool {
     true
 }
 
+#[derive(Clone, Copy)]
+struct ChildHandles {
+    header: HWND,
+    close: HWND,
+    body: HWND,
+    progress: HWND,
+    style: HWND,
+    cancel: HWND,
+    replace: HWND,
+}
+
 // Copies the child handles out of STATE for one show.
-fn handles() -> Option<(HWND, HWND, HWND, HWND, HWND, HWND, HWND)> {
+fn handles() -> Option<ChildHandles> {
     STATE.with(|state| {
-        state.borrow().as_ref().map(|popup| {
-            (
-                popup.window,
-                popup.header,
-                popup.close,
-                popup.body,
-                popup.progress,
-                popup.cancel,
-                popup.replace,
-            )
+        state.borrow().as_ref().map(|popup| ChildHandles {
+            header: popup.header,
+            close: popup.close,
+            body: popup.body,
+            progress: popup.progress,
+            style: popup.style,
+            cancel: popup.cancel,
+            replace: popup.replace,
         })
     })
 }
@@ -865,13 +1055,23 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
     let Some(window) = ensure_window() else {
         return;
     };
-    let Some((_, header, close, body, progress, cancel, replace)) = handles() else {
+    let Some(ChildHandles {
+        header,
+        close,
+        body,
+        progress,
+        style,
+        cancel,
+        replace,
+    }) = handles()
+    else {
         return;
     };
     let dpi = dpi_for_anchor(caret);
     refresh_fonts(dpi);
     set_marquee(progress, false);
     show_child(progress, false);
+    show_child(style, false);
     if !set_plain_text(body, text, is_error) {
         return;
     }
@@ -937,11 +1137,27 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     let Some(window) = ensure_window() else {
         return;
     };
-    let Some((_, header, close, body, progress, cancel, replace)) = handles() else {
+    let Some(ChildHandles {
+        header,
+        close,
+        body,
+        progress,
+        style,
+        cancel,
+        replace,
+    }) = handles()
+    else {
         return;
     };
     let dpi = dpi_for_anchor(caret);
     refresh_fonts(dpi);
+    let caption = wide(&format!("{} \u{25be}", tab_label(selected)));
+    // SAFETY: style is a live child window on this thread.
+    if let Err(error) = unsafe { SetWindowTextW(style, PCWSTR(caption.as_ptr())) } {
+        eprintln!("Writely: could not update the suggestion popup: {error}");
+        return;
+    }
+    show_child(style, true);
     STATE.with(|state| {
         if let Some(popup) = state.borrow_mut().as_mut() {
             popup.selected = selected;
@@ -983,6 +1199,14 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     show_child(cancel, true);
     show_child(replace, show_replace);
     let footer_y = HEADER_HEIGHT + body_height;
+    set_child_pos(
+        style,
+        SIDE_PAD,
+        footer_y + 8,
+        STYLE_BUTTON_WIDTH,
+        BUTTON_HEIGHT,
+        dpi,
+    );
     set_child_pos(
         cancel,
         CARD_WIDTH - SIDE_PAD - BUTTON_WIDTH - 8 - BUTTON_WIDTH,
@@ -1038,7 +1262,7 @@ pub fn is_visible() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{diff_runs, DiffStyle};
+    use super::{diff_runs, menu_id_for_tab, tab_for_menu_id, DiffStyle, PopupTab, RewriteStyle};
 
     #[test]
     fn diff_runs_cover_equal_delete_and_insert_with_spacing() {
@@ -1059,6 +1283,18 @@ mod tests {
             .map(|(text, _)| text.as_str())
             .collect();
         assert_eq!(rebuilt, "Today is a good day.");
+    }
+
+    #[test]
+    fn menu_ids_round_trip_for_all_tabs() {
+        let tabs = [PopupTab::Correct]
+            .into_iter()
+            .chain(RewriteStyle::ALL.map(PopupTab::Rewrite));
+        for tab in tabs {
+            assert_eq!(tab_for_menu_id(menu_id_for_tab(tab)), Some(tab));
+        }
+        assert_eq!(tab_for_menu_id(0), None);
+        assert_eq!(tab_for_menu_id(99), None);
     }
 
     #[test]
