@@ -6,9 +6,10 @@ use tao::event_loop::EventLoopProxy;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, MonitorFromPoint,
-    ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    BLENDFUNCTION, DIB_RGB_COLORS, HGDIOBJ, MONITOR_DEFAULTTONEAREST,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW,
+    MonitorFromPoint, ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HGDIOBJ, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::WindowsProgramming::MulDiv;
@@ -467,14 +468,68 @@ fn ensure_window() -> Option<HWND> {
     }
 }
 
+// Unclamped icon origin: caret right + `gap`, vertically centred on the
+// caret. `caret` is (x, y, width, height); all values are physical pixels.
+fn raw_icon_origin(caret: (f64, f64, f64, f64), size: i32, gap: i32) -> (i32, i32) {
+    (
+        (caret.0 + caret.2 + gap as f64) as i32,
+        (caret.1 + caret.3 / 2.0 - size as f64 / 2.0) as i32,
+    )
+}
+
+/// Icon origin clamped inside the monitor work area `work`
+/// (left, top, right, bottom), all in physical pixels.
+fn icon_origin(
+    caret: (f64, f64, f64, f64),
+    size: i32,
+    gap: i32,
+    work: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (x, y) = raw_icon_origin(caret, size, gap);
+    (
+        x.clamp(work.0, (work.2 - size).max(work.0)),
+        y.clamp(work.1, (work.3 - size).max(work.1)),
+    )
+}
+
 pub fn show_at(rect: &CaretRect) {
     let dpi = dpi_for_caret(rect);
     let size = scale(ICON_SIZE, dpi).max(1) as u32;
     let glyph = scale(GLYPH_SIZE, dpi).max(0) as u32;
     let radius = CORNER_RADIUS * dpi as f64 / 96.0;
-    // Caret coordinates are physical pixels; the window position is too.
-    let x = (rect.x + rect.width + 4.0) as i32;
-    let y = (rect.y + rect.height / 2.0 - size as f64 / 2.0) as i32;
+    // 4 logical px right of the caret; caret coords are physical pixels.
+    let gap = scale(4, dpi);
+    let caret = (rect.x, rect.y, rect.width, rect.height);
+    let (x, y) = {
+        let point = POINT {
+            x: (rect.x + rect.width / 2.0) as i32,
+            y: (rect.y + rect.height / 2.0) as i32,
+        };
+        // SAFETY: point is plain integers for the monitor lookup below.
+        let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: info is writable with cbSize set for the monitor query.
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            icon_origin(
+                caret,
+                size as i32,
+                gap,
+                (
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                ),
+            )
+        } else {
+            let error = windows::core::Error::from_thread();
+            eprintln!("Writely: could not read the monitor work area: {error}");
+            raw_icon_origin(caret, size as i32, gap)
+        }
+    };
     let Some(window) = ensure_window() else {
         return;
     };
@@ -532,7 +587,7 @@ pub fn hide() {
 
 #[cfg(test)]
 mod tests {
-    use super::render_icon;
+    use super::{icon_origin, render_icon};
 
     #[test]
     fn render_icon_length_and_corners() {
@@ -561,6 +616,39 @@ mod tests {
             }
         }
         assert!(near_white > 0, "no near-white glyph pixels in the centre");
+    }
+
+    #[test]
+    fn icon_origin_normal_case() {
+        // Right of the caret, vertically centred, inside the work area.
+        assert_eq!(
+            icon_origin((100.0, 100.0, 2.0, 20.0), 20, 4, (0, 0, 1920, 1080)),
+            (106, 100)
+        );
+    }
+
+    #[test]
+    fn icon_origin_clamped_at_right_edge() {
+        assert_eq!(
+            icon_origin((1900.0, 100.0, 2.0, 20.0), 20, 4, (0, 0, 1920, 1080)),
+            (1900, 100)
+        );
+    }
+
+    #[test]
+    fn icon_origin_clamped_at_bottom() {
+        assert_eq!(
+            icon_origin((100.0, 1070.0, 2.0, 20.0), 20, 4, (0, 0, 1920, 1080)),
+            (106, 1060)
+        );
+    }
+
+    #[test]
+    fn icon_origin_second_monitor_negative_x() {
+        assert_eq!(
+            icon_origin((-500.0, 100.0, 2.0, 20.0), 20, 4, (-1920, 0, 0, 1080)),
+            (-494, 100)
+        );
     }
 
     #[test]
