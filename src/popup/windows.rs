@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use tao::event_loop::EventLoopProxy;
 use windows::core::PCWSTR;
@@ -91,6 +92,37 @@ struct PopupState {
 
 thread_local! {
     static STATE: RefCell<Option<PopupState>> = const { RefCell::new(None) };
+    static FOCUS_HANDOFF: RefCell<Option<(Instant, bool)>> = const { RefCell::new(None) };
+}
+
+// Pure 500 ms window check for a focus handoff at `handoff` seen at `now`.
+fn focus_handoff_is_recent(handoff: Instant, now: Instant) -> bool {
+    now.checked_duration_since(handoff)
+        .map(|elapsed| elapsed < Duration::from_millis(500))
+        .unwrap_or(false)
+}
+
+fn record_focus_handoff() {
+    FOCUS_HANDOFF.with(|handoff| {
+        *handoff.borrow_mut() = Some((Instant::now(), false));
+    });
+}
+
+pub fn focus_handoff_recent() -> bool {
+    FOCUS_HANDOFF.with(|handoff| {
+        let mut handoff = handoff.borrow_mut();
+        let Some((at, logged)) = *handoff else {
+            return false;
+        };
+        if !focus_handoff_is_recent(at, Instant::now()) {
+            return false;
+        }
+        if !logged {
+            *handoff = Some((at, true));
+            eprintln!("Writely: ignored the focus change from the style menu.");
+        }
+        true
+    })
 }
 
 pub fn init(proxy: EventLoopProxy<UserEvent>) {
@@ -196,6 +228,7 @@ fn show_style_menu(window: HWND) {
             eprintln!("Writely: could not give focus back to the previous app: {error}");
         }
     }
+    record_focus_handoff();
     if let Some(tab) = chosen {
         if tab != selected {
             send_tab(tab);
@@ -1262,7 +1295,11 @@ pub fn is_visible() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{diff_runs, menu_id_for_tab, tab_for_menu_id, DiffStyle, PopupTab, RewriteStyle};
+    use super::{
+        diff_runs, focus_handoff_is_recent, menu_id_for_tab, tab_for_menu_id, DiffStyle, PopupTab,
+        RewriteStyle,
+    };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn diff_runs_cover_equal_delete_and_insert_with_spacing() {
@@ -1295,6 +1332,24 @@ mod tests {
         }
         assert_eq!(tab_for_menu_id(0), None);
         assert_eq!(tab_for_menu_id(99), None);
+    }
+
+    #[test]
+    fn focus_handoff_window_is_500_ms() {
+        let handoff = Instant::now();
+        assert!(focus_handoff_is_recent(handoff, handoff));
+        assert!(focus_handoff_is_recent(
+            handoff,
+            handoff + Duration::from_millis(499)
+        ));
+        assert!(!focus_handoff_is_recent(
+            handoff,
+            handoff + Duration::from_millis(500)
+        ));
+        assert!(!focus_handoff_is_recent(
+            handoff,
+            handoff + Duration::from_secs(2)
+        ));
     }
 
     #[test]

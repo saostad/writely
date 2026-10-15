@@ -134,6 +134,17 @@ pub fn hide() {
     {}
 }
 
+pub fn focus_handoff_recent() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::focus_handoff_recent()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 pub fn is_visible() -> bool {
     #[cfg(target_os = "macos")]
     {

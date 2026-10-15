@@ -1494,7 +1494,7 @@ fn main() {
                 }
                 // Typing or moving focus hides the popup and drops any
                 // in-flight suggestion.
-                if popup::is_visible() {
+                if popup::is_visible() && !popup::focus_handoff_recent() {
                     popup::hide();
                     generation = generation.wrapping_add(1);
                     checking = None;
