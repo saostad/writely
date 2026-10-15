@@ -92,6 +92,7 @@ struct Layout {
     autostart_help: Rect,
     save: Rect,
     remove: Rect,
+    tip: Rect,
     status: Rect,
 }
 
@@ -139,6 +140,7 @@ fn layout(show_url: bool) -> Layout {
         width: 110,
         height: 26,
     };
+    let tip = row(18, 10);
     let status = row(36, 0);
     Layout {
         show_url,
@@ -164,6 +166,7 @@ fn layout(show_url: bool) -> Layout {
         autostart_help,
         save,
         remove,
+        tip,
         status,
     }
 }
@@ -200,6 +203,7 @@ mod layout_tests {
             lay.autostart,
             lay.autostart_help,
             lay.save,
+            lay.tip,
             lay.status,
         ]
     }
@@ -325,6 +329,7 @@ struct Handles {
     autostart_help: HWND,
     save: HWND,
     remove: HWND,
+    tip: HWND,
     status: HWND,
     font: HFONT,
     dpi: u32,
@@ -432,6 +437,7 @@ fn child_rects(handles: &Handles) -> Vec<(HWND, Rect)> {
         (handles.autostart_help, lay.autostart_help),
         (handles.save, lay.save),
         (handles.remove, lay.remove),
+        (handles.tip, lay.tip),
         (handles.status, lay.status),
     ]
 }
@@ -1206,6 +1212,13 @@ pub fn show_settings() -> Result<(), String> {
         lay.remove,
         ID_REMOVE,
     )?;
+    let tip = make_child(
+        "STATIC",
+        "Tip: select text in any app and press Ctrl+Alt+G to check it.",
+        WINDOW_STYLE(0),
+        lay.tip,
+        0,
+    )?;
     let status = make_child("STATIC", "", WINDOW_STYLE(0), lay.status, 0)?;
 
     // Load the draft: a missing file means defaults; an unreadable or invalid
@@ -1242,6 +1255,7 @@ pub fn show_settings() -> Result<(), String> {
             autostart_help,
             save,
             remove,
+            tip,
             status,
             font,
             dpi,
@@ -1287,6 +1301,8 @@ pub fn show_settings() -> Result<(), String> {
     if let Some(error) = initial_error {
         set_status(&error, true);
     } else if let Some(error) = super::autostart_message() {
+        set_status(&error, true);
+    } else if let Some(error) = super::hotkey_message() {
         set_status(&error, true);
     }
     // SAFETY: window is a live top-level window on this thread.

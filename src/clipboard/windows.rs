@@ -528,7 +528,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn paste_write_error_keeps_original_when_restore_succeeds() {
         assert_eq!(
             paste_write_error(

@@ -134,6 +134,11 @@ fn looks_good_message() -> &'static str {
 /// known: a zero-size rect at the pointer, converted from AppKit
 /// bottom-left coords to the top-left coords the popup uses.
 #[cfg(target_os = "macos")]
+const HOTKEY_LABEL: &str = "⌃⌥G";
+#[cfg(target_os = "windows")]
+const HOTKEY_LABEL: &str = "Ctrl+Alt+G";
+
+#[cfg(target_os = "macos")]
 fn mouse_anchor() -> Option<CaretRect> {
     use objc2_app_kit::NSScreen;
     use objc2_foundation::MainThreadMarker;
@@ -153,10 +158,47 @@ fn mouse_anchor() -> Option<CaretRect> {
     })
 }
 
+/// Mouse-pointer anchor for the hotkey popup on Windows: a zero-size rect
+/// at the pointer in physical pixels.
+#[cfg(target_os = "windows")]
+fn mouse_anchor() -> Option<CaretRect> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut point = POINT::default();
+    // SAFETY: point is a live POINT for the cursor position.
+    unsafe { GetCursorPos(&mut point) }.ok()?;
+    Some(CaretRect {
+        x: point.x as f64,
+        y: point.y as f64,
+        width: 0.0,
+        height: 0.0,
+        physical: true,
+    })
+}
+
+/// The foreground window's pid on Windows, when it isn't Writely itself.
+#[cfg(target_os = "windows")]
+fn foreground_pid() -> Option<u32> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    // SAFETY: querying the foreground window takes no borrowed state.
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_invalid() {
+        return None;
+    }
+    let mut pid: u32 = 0;
+    // SAFETY: foreground is a live window and pid is writable.
+    let _thread = unsafe { GetWindowThreadProcessId(foreground, Some(&mut pid)) };
+    if pid == 0 || pid == std::process::id() {
+        None
+    } else {
+        Some(pid)
+    }
+}
+
 /// Registers the global hotkey (⌃⌥G) on macOS. Returns the manager (kept
 /// alive by the caller) or `None` when registration failed; failures are
 /// logged and shown in the Settings status line with the real error.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn register_hotkey(
     proxy: &EventLoopProxy<UserEvent>,
 ) -> Option<global_hotkey::GlobalHotKeyManager> {
@@ -165,7 +207,7 @@ fn register_hotkey(
     let manager = match GlobalHotKeyManager::new() {
         Ok(manager) => manager,
         Err(error) => {
-            let message = format!("Could not register the ⌃⌥G hotkey: {error}");
+            let message = format!("Could not register the {HOTKEY_LABEL} hotkey: {error}");
             eprintln!("Writely: {message}");
             settings::set_hotkey_message(Some(message));
             return None;
@@ -173,7 +215,7 @@ fn register_hotkey(
     };
     let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyG);
     if let Err(error) = manager.register(hotkey) {
-        let message = format!("Could not register the ⌃⌥G hotkey: {error}");
+        let message = format!("Could not register the {HOTKEY_LABEL} hotkey: {error}");
         eprintln!("Writely: {message}");
         settings::set_hotkey_message(Some(message));
         return None;
@@ -388,8 +430,9 @@ fn handle_copied_text(
         return;
     }
     #[cfg(target_os = "windows")]
-    let empty_message = {
-        let _ = from_hotkey;
+    let empty_message = if from_hotkey {
+        "Select the text you want to check, then press Ctrl+Alt+G."
+    } else {
         "Select the text you want to check, then click W."
     };
     #[cfg(not(target_os = "windows"))]
@@ -490,14 +533,22 @@ fn handle_icon_clicked(
     };
     // The hotkey popup anchors at the caret if one is known, else at the
     // input-area container (already in `live_anchor`), else at the mouse.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let (live_anchor, live_pid) = if from_hotkey && live_anchor.is_none() {
         (mouse_anchor().or(live_anchor), live_pid)
     } else {
         (live_anchor, live_pid)
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = from_hotkey;
+    // On Windows a hotkey press with no caret still needs a pid for the
+    // copy fallback: use the foreground app (never Writely itself).
+    #[cfg(target_os = "windows")]
+    let live_pid = if from_hotkey {
+        live_pid.or_else(foreground_pid)
+    } else {
+        live_pid
+    };
     let (app_settings, key) = match resolve_settings() {
         Ok(loaded) => loaded,
         Err(failure) => {
@@ -1217,7 +1268,7 @@ fn main() {
     check_window::init(watcher_proxy.clone());
 
     let mut tray_icon: Option<TrayIcon> = None;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let mut _hotkey_manager: Option<global_hotkey::GlobalHotKeyManager> = None;
     let mut settings_id = tray_icon::menu::MenuId::new("settings");
     let mut pause_id = tray_icon::menu::MenuId::new("pause");
@@ -1357,7 +1408,7 @@ fn main() {
                         }
                     }
                 }
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
                     _hotkey_manager = register_hotkey(&watcher_proxy);
                 }
