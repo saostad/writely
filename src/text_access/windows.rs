@@ -17,7 +17,8 @@ use windows::Win32::System::Ole::{
 use windows::Win32::System::Variant::{VARIANT, VT_I4};
 use windows::Win32::UI::Accessibility::{
     AccessibleObjectFromWindow, CUIAutomation, IAccessible, IUIAutomation, IUIAutomationElement,
-    IUIAutomationTextPattern2, UIA_TextPattern2Id,
+    IUIAutomationTextPattern, IUIAutomationTextPattern2, IUIAutomationTextRange,
+    TextPatternRangeEndpoint_Start, TextUnit_Character, UIA_TextPattern2Id, UIA_TextPatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, CHILDID_SELF, GUITHREADINFO,
@@ -138,26 +139,13 @@ fn msaa_caret_rect(hwnd: HWND, pid: u32) -> Result<Option<CaretInfo>, String> {
     }))
 }
 
-/// Caret rectangle from the UIA caret range (physical pixels), or `Ok(None)`
-/// when the focused element has no text caret.
-fn uia_caret_rect(element: &IUIAutomationElement, pid: u32) -> Result<Option<CaretInfo>, String> {
-    // SAFETY: the element is a live COM object.
-    let pattern: IUIAutomationTextPattern2 =
-        match unsafe { element.GetCurrentPatternAs(UIA_TextPattern2Id) } {
-            Ok(pattern) => pattern,
-            // Not a text field (e.g. a focused button): no caret to follow.
-            Err(_) => return Ok(None),
-        };
-    let mut active = BOOL(0);
-    // SAFETY: the pattern is a live COM object and active is a writable flag.
-    let range = unsafe { pattern.GetCaretRange(&mut active) }.map_err(read_error)?;
-    if !active.as_bool() {
-        return Ok(None);
-    }
+/// Bounding rectangles of a text range as flat `[x, y, width, height, ...]`
+/// groups (empty when the range has no rectangle, e.g. a collapsed caret).
+fn range_rects(range: &IUIAutomationTextRange) -> Result<Vec<f64>, String> {
     // SAFETY: the range is a live COM object.
     let raw = unsafe { range.GetBoundingRectangles() }.map_err(read_error)?;
     if raw.is_null() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let _guard = SafeArrayGuard(raw);
     // SAFETY: raw is a valid SAFEARRAY while the guard is alive.
@@ -165,28 +153,115 @@ fn uia_caret_rect(element: &IUIAutomationElement, pid: u32) -> Result<Option<Car
     // SAFETY: raw is a valid SAFEARRAY while the guard is alive.
     let upper = unsafe { SafeArrayGetUBound(raw, 1) }.map_err(read_error)?;
     let count = (upper - lower + 1).max(0) as usize;
-    if count < 4 {
-        return Ok(None);
+    if count == 0 {
+        return Ok(Vec::new());
     }
     let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
     // SAFETY: raw is a valid SAFEARRAY while the guard is alive, and data
     // receives the locked pointer, released below before the guard drops.
     unsafe { SafeArrayAccessData(raw, &mut data) }.map_err(read_error)?;
-    // SAFETY: UIA bounding rectangles are doubles; count was checked above.
+    // SAFETY: UIA bounding rectangles are doubles; count is the element count.
     let values: &[f64] = unsafe { std::slice::from_raw_parts(data as *const f64, count) };
-    let (x, y, width, height) = (values[0], values[1], values[2], values[3]);
+    let result = values.to_vec();
     // SAFETY: the array was locked above and is still owned by the guard.
     unsafe { SafeArrayUnaccessData(raw) }.map_err(read_error)?;
-    Ok(Some(CaretInfo {
+    Ok(result)
+}
+
+/// Caret at the right edge of the last rectangle in `values` (flat
+/// `[x, y, width, height, ...]` groups), 1 px wide. `None` when empty.
+fn caret_at_right_edge(values: &[f64], pid: u32) -> Option<CaretInfo> {
+    if values.len() < 4 {
+        return None;
+    }
+    let last = values.len() - 4;
+    let (x, y, width, height) = (
+        values[last],
+        values[last + 1],
+        values[last + 2],
+        values[last + 3],
+    );
+    Some(CaretInfo {
         pid,
         caret_rect: CaretRect {
-            x,
+            x: x + width.max(0.0),
             y,
-            width: width.max(0.0),
+            width: 1.0,
             height: height.max(0.0),
             physical: true,
         },
-    }))
+    })
+}
+
+/// Caret from UIA TextPattern (v1) selection, for apps without
+/// TextPattern2. The caret sits at the end of the selection; a collapsed
+/// selection has no rectangle, so the character before it is measured
+/// and its right edge is used instead.
+fn text_pattern_caret(
+    element: &IUIAutomationElement,
+    pid: u32,
+) -> Result<Option<CaretInfo>, String> {
+    // SAFETY: the element is a live COM object.
+    let pattern: IUIAutomationTextPattern =
+        match unsafe { element.GetCurrentPatternAs(UIA_TextPatternId) } {
+            Ok(pattern) => pattern,
+            // Not a text field (e.g. a focused button): no caret to follow.
+            Err(_) => return Ok(None),
+        };
+    // SAFETY: the pattern is a live COM object.
+    let selections = unsafe { pattern.GetSelection() }.map_err(read_error)?;
+    // SAFETY: the selection array is a live COM object.
+    let length = unsafe { selections.Length() }.map_err(read_error)?;
+    if length <= 0 {
+        return Ok(None);
+    }
+    // SAFETY: the selection array is live and index 0 is within its length.
+    let range = unsafe { selections.GetElement(0) }.map_err(read_error)?;
+    let values = range_rects(&range)?;
+    if let Some(info) = caret_at_right_edge(&values, pid) {
+        return Ok(Some(info));
+    }
+    // Empty rectangles: measure the character before the caret.
+    // SAFETY: the range is a live COM object.
+    let previous = unsafe { range.Clone() }.map_err(read_error)?;
+    // SAFETY: the cloned range is a live COM object.
+    unsafe { previous.MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, -1) }
+        .map_err(read_error)?;
+    let values = range_rects(&previous)?;
+    Ok(caret_at_right_edge(&values, pid))
+}
+
+/// Caret rectangle from the UIA caret range (physical pixels), or `Ok(None)`
+/// when the focused element has no text caret.
+fn uia_caret_rect(element: &IUIAutomationElement, pid: u32) -> Result<Option<CaretInfo>, String> {
+    // SAFETY: the element is a live COM object.
+    if let Ok(pattern) =
+        unsafe { element.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id) }
+    {
+        let mut active = BOOL(0);
+        // SAFETY: the pattern is a live COM object and active is a writable flag.
+        if let Ok(range) = unsafe { pattern.GetCaretRange(&mut active) } {
+            if active.as_bool() {
+                let values = range_rects(&range)?;
+                if values.len() >= 4 {
+                    let (x, y, width, height) = (values[0], values[1], values[2], values[3]);
+                    return Ok(Some(CaretInfo {
+                        pid,
+                        caret_rect: CaretRect {
+                            x,
+                            y,
+                            width: width.max(0.0),
+                            height: height.max(0.0),
+                            physical: true,
+                        },
+                    }));
+                }
+            }
+        }
+    }
+    // No TextPattern2 caret (missing pattern, inactive, or no rectangle):
+    // fall back to the TextPattern (v1) selection as the last step.
+    text_pattern_caret(element, pid)
 }
 
 fn document_text(element: &UIElement) -> Result<String, String> {
