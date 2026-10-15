@@ -289,6 +289,18 @@ fn set_format(format: u32, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+/// Builds the error returned when writing the suggestion failed: the
+/// original error, with the restore failure appended when restoring the
+/// saved clipboard also failed. Pure for testing.
+pub fn paste_write_error(original: &str, restore_error: Option<&str>) -> String {
+    match restore_error {
+        Some(error) => {
+            format!("{original} Writely also couldn't put your clipboard back: {error}")
+        }
+        None => original.to_string(),
+    }
+}
+
 /// Restores a snapshot onto the clipboard (opened and closed here).
 fn restore_clipboard(saved: &[SavedFormat]) -> Result<(), String> {
     let _guard = open_clipboard()?;
@@ -402,37 +414,67 @@ pub fn layered_copy_text(pid: u32) -> Result<CopyResult, String> {
 pub fn paste_suggestion(pid: u32, suggestion: &str) -> Result<(), String> {
     check_foreground(pid, "paste")?;
     let saved = take_snapshot()?;
-    let our_sequence = {
+    let write_result: Result<u32, String> = {
         let _guard = open_clipboard()?;
         // SAFETY: the clipboard is open (this guard holds it).
         unsafe { EmptyClipboard() }
             .map_err(|error| format!("Could not write the suggestion to the clipboard: {error}"))?;
-        let units: Vec<u16> = suggestion
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut bytes = Vec::with_capacity(units.len() * 2);
-        for unit in &units {
-            bytes.extend_from_slice(&unit.to_le_bytes());
-        }
-        set_format(CF_UNICODETEXT_FORMAT, &bytes)
-            .map_err(|error| format!("Could not write the suggestion to the clipboard: {error}"))?;
-        // History/cloud exclusion markers; a failure to register one is a
-        // real failure to keep the suggestion out of history, so surface it.
-        let exclude = registered_format("ExcludeClipboardContentFromMonitorProcessing")
-            .map_err(|error| format!("Could not write the suggestion to the clipboard: {error}"))?;
-        set_format(exclude, &[])
-            .map_err(|error| format!("Could not write the suggestion to the clipboard: {error}"))?;
-        for name in ["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"] {
-            let format_id = registered_format(name).map_err(|error| {
+        let result = (|| -> Result<u32, String> {
+            let units: Vec<u16> = suggestion
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut bytes = Vec::with_capacity(units.len() * 2);
+            for unit in &units {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            set_format(CF_UNICODETEXT_FORMAT, &bytes).map_err(|error| {
                 format!("Could not write the suggestion to the clipboard: {error}")
             })?;
-            set_format(format_id, &0u32.to_le_bytes()).map_err(|error| {
-                format!("Could not write the suggestion to the clipboard: {error}")
-            })?;
+            // History/cloud exclusion markers are best-effort: a failure
+            // must not lose the paste (or the saved clipboard).
+            match registered_format("ExcludeClipboardContentFromMonitorProcessing") {
+                Ok(exclude) => {
+                    if let Err(error) = set_format(exclude, &[]) {
+                        eprintln!(
+                            "Writely: could not hide the suggestion from clipboard history: {error}"
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Writely: could not hide the suggestion from clipboard history: {error}"
+                    );
+                }
+            }
+            for name in ["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"] {
+                match registered_format(name) {
+                    Ok(format_id) => {
+                        if let Err(error) = set_format(format_id, &0u32.to_le_bytes()) {
+                            eprintln!("Writely: could not hide the suggestion from clipboard history: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Writely: could not hide the suggestion from clipboard history: {error}"
+                        );
+                    }
+                }
+            }
+            // SAFETY: reading the clipboard sequence number takes no state.
+            Ok(unsafe { GetClipboardSequenceNumber() })
+        })();
+        result
+        // The guard drops here, closing the clipboard before any restore.
+    };
+    let our_sequence = match write_result {
+        Ok(sequence) => sequence,
+        Err(original) => {
+            return Err(match restore_clipboard(&saved) {
+                Ok(()) => paste_write_error(&original, None),
+                Err(restore_error) => paste_write_error(&original, Some(&restore_error)),
+            });
         }
-        // SAFETY: reading the clipboard sequence number takes no state.
-        unsafe { GetClipboardSequenceNumber() }
     };
     release_modifiers();
     if let Err(error) = send_ctrl_key(VK_V) {
@@ -446,7 +488,7 @@ pub fn paste_suggestion(pid: u32, suggestion: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_skipped_format, should_restore};
+    use super::{is_skipped_format, paste_write_error, should_restore};
 
     #[test]
     fn gdi_handle_formats_are_skipped() {
@@ -459,6 +501,29 @@ mod tests {
         for format in [1, 13, 15, 0xC000] {
             assert!(!is_skipped_format(format), "format {format} must be saved");
         }
+    }
+
+    #[test]
+    #[test]
+    fn paste_write_error_keeps_original_when_restore_succeeds() {
+        assert_eq!(
+            paste_write_error(
+                "Could not write the suggestion to the clipboard: boom",
+                None
+            ),
+            "Could not write the suggestion to the clipboard: boom"
+        );
+    }
+
+    #[test]
+    fn paste_write_error_appends_restore_failure() {
+        assert_eq!(
+            paste_write_error(
+                "Could not write the suggestion to the clipboard: boom",
+                Some("Could not restore the clipboard: nope")
+            ),
+            "Could not write the suggestion to the clipboard: boom Writely also couldn't put your clipboard back: Could not restore the clipboard: nope"
+        );
     }
 
     #[test]
