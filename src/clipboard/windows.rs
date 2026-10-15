@@ -21,8 +21,9 @@ use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_C,
-    VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_V,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    VIRTUAL_KEY, VK_C, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL,
+    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -166,10 +167,33 @@ fn send_inputs(inputs: &[INPUT]) -> Result<(), String> {
     }
 }
 
-/// Releases Ctrl, Alt, Shift and both Win keys: the hotkey's modifiers may
-/// still be held when the copy/paste runs (same rule as macOS).
+/// Releases Ctrl, Alt, Shift and both Win keys, but only those actually
+/// down: a lone injected key-up for a Win/Alt key that was never pressed
+/// can open the Start menu or focus the target app's menu bar. Releasing
+/// Alt or Win is preceded by a Ctrl tap so it isn't read as a lone tap.
 fn release_modifiers() {
-    for key in [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN] {
+    for key in [
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_LMENU,
+        VK_RMENU,
+        VK_LSHIFT,
+        VK_RSHIFT,
+        VK_LWIN,
+        VK_RWIN,
+    ] {
+        // SAFETY: querying the async key state takes a plain virtual-key code.
+        let is_down = unsafe { GetAsyncKeyState(key.0 as i32) } < 0;
+        if !is_down {
+            continue;
+        }
+        if key == VK_LMENU || key == VK_RMENU || key == VK_LWIN || key == VK_RWIN {
+            if let Err(error) =
+                send_inputs(&[key_input(VK_CONTROL, false), key_input(VK_CONTROL, true)])
+            {
+                eprintln!("Writely: could not release a modifier key: {error}");
+            }
+        }
         if let Err(error) = send_inputs(&[key_input(key, true)]) {
             eprintln!("Writely: could not release a modifier key: {error}");
         }
