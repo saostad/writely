@@ -53,6 +53,16 @@ impl RewriteStyle {
         };
         format!("You rewrite English text. Fix its grammar, spelling and punctuation, and rewrite it {goal}. Keep the original meaning and every fact; never add new facts. Keep line breaks and paragraph breaks as they are. Return only the rewritten text, with no quotes or explanation. If the text is not understandable English (random letters or gibberish), reply with exactly UNCLEAR and nothing else.")
     }
+
+    pub fn progress_text(self) -> &'static str {
+        match self {
+            RewriteStyle::Friendly => "Making it friendlier…",
+            RewriteStyle::Formal => "Making it more formal…",
+            RewriteStyle::Professional => "Making it more professional…",
+            RewriteStyle::Shorter => "Making it shorter…",
+            RewriteStyle::Longer => "Making it longer…",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -253,6 +263,20 @@ mod tests {
                 instruction.starts_with("You rewrite English text."),
                 "instruction for {style:?} has the wrong shape"
             );
+        }
+    }
+
+    #[test]
+    fn rewrite_progress_texts() {
+        let texts = [
+            (RewriteStyle::Friendly, "Making it friendlier…"),
+            (RewriteStyle::Formal, "Making it more formal…"),
+            (RewriteStyle::Professional, "Making it more professional…"),
+            (RewriteStyle::Shorter, "Making it shorter…"),
+            (RewriteStyle::Longer, "Making it longer…"),
+        ];
+        for (style, expected) in texts {
+            assert_eq!(style.progress_text(), expected);
         }
     }
 }

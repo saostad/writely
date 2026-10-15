@@ -117,11 +117,12 @@ fn selected_text(pending: &Pending) -> Option<&str> {
 }
 
 /// The "already correct" body for the Correct tab: on macOS it points at the
-/// rewrite tabs; elsewhere it is today's plain message (no tabs there).
+/// style menu in the footer; elsewhere it is today's plain message (no menu
+/// there).
 fn looks_good_message() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "Looks good — no changes needed. Pick a style above to rewrite it."
+        "Looks good — no changes needed. Pick a style below to rewrite it."
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -296,7 +297,7 @@ fn spawn_check_thread(
 /// One rewrite worker (same pattern as the grammar check): calls
 /// `providers::rewrite` off the main thread and sends `UserEvent::Rewrite`.
 /// Returns the spawn error for the caller to show; the popup already says
-/// "Rewriting…", so the caller replaces it with the failure.
+/// the style's progress text, so the caller replaces it with the failure.
 fn spawn_rewrite_thread(
     proxy: &EventLoopProxy<UserEvent>,
     app_settings: config::AppSettings,
@@ -856,7 +857,7 @@ fn handle_tab_clicked(
                 popup::show_tabbed(
                     tab,
                     popup::TabContent::Message {
-                        text: "Rewriting…",
+                        text: style.progress_text(),
                         is_error: false,
                         loading: true,
                     },
@@ -866,7 +867,7 @@ fn handle_tab_clicked(
                 popup::show_tabbed(
                     tab,
                     popup::TabContent::Message {
-                        text: "Rewriting…",
+                        text: style.progress_text(),
                         is_error: false,
                         loading: true,
                     },
