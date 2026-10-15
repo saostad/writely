@@ -53,18 +53,18 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
     }
 }
 
-/// Shows the suggestion with the Cancel/Replace footer. Only used off macOS:
-/// macOS shows every suggestion through `show_tabbed`, while the other
-/// platforms have no diff view and fall back to the plain suggestion text.
-#[cfg(not(target_os = "macos"))]
+/// Shows the suggestion with the Cancel/Replace footer. Only used on Linux:
+/// macOS and Windows show every suggestion through `show_tabbed`, while Linux
+/// has no diff view and falls back to the plain suggestion text.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn show_suggestion(original: &str, suggestion: &str, caret: &CaretRect) {
     show_message(suggestion, false, true, caret);
     let _ = original;
 }
 
 /// The tabs of the suggestion popup: the grammar correction, or one rewrite
-/// style. macOS shows them in a pop-up menu button in the footer; other
-/// platforms keep today's single-view popup.
+/// style. macOS and Windows show them in a menu button in the footer; Linux
+/// keeps today's single-view popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PopupTab {
     Correct,
@@ -85,7 +85,7 @@ pub enum TabContent<'a> {
     },
 }
 
-/// Shows the popup with the style menu button showing `selected`. Off macOS
+/// Shows the popup with the style menu button showing `selected`. On Linux
 /// this falls back to today's behaviour: `Diff` shows the suggestion,
 /// `Message` shows plain text without the Replace button.
 pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
@@ -93,7 +93,11 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     {
         macos::show_tabbed(selected, content, caret);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::show_tabbed(selected, content, caret);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         match content {
             TabContent::Diff {

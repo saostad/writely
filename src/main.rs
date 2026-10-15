@@ -30,9 +30,9 @@ pub enum UserEvent {
     IconClicked,
     HotkeyPressed,
     ReplaceClicked,
-    // Fired only by the macOS popup menu; the handler lands with the rewrite
-    // wiring, so off macOS (no menu) this is never constructed.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    // Fired only by the macOS/Windows popup menu; the handler lands with the
+    // rewrite wiring, so elsewhere (no menu) this is never constructed.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     TabClicked(popup::PopupTab),
     PermissionGranted,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -116,15 +116,15 @@ fn selected_text(pending: &Pending) -> Option<&str> {
     }
 }
 
-/// The "already correct" body for the Correct tab: on macOS it points at the
-/// style menu in the footer; elsewhere it is today's plain message (no menu
-/// there).
+/// The "already correct" body for the Correct tab: on macOS and Windows it
+/// points at the style menu in the footer; elsewhere it is today's plain
+/// message (no menu there).
 fn looks_good_message() -> &'static str {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         "Looks good — no changes needed. Pick a style below to rewrite it."
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         "Looks good — no changes needed."
     }

@@ -19,10 +19,16 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::Win32::System::WindowsProgramming::MulDiv;
 use windows::Win32::UI::Controls::RichEdit::{
-    CHARFORMAT2W, CHARRANGE, ECOOP_SET, ECO_READONLY, EM_EXSETSEL, EM_FORMATRANGE,
-    EM_SETCHARFORMAT, EM_SETEVENTMASK, EM_SETOPTIONS, ENM_REQUESTRESIZE, FORMATRANGE,
-    SCF_SELECTION,
+    CFE_BOLD, CFE_STRIKEOUT, CFM_BOLD, CFM_COLOR, CFM_STRIKEOUT, CHARFORMAT2W, CHARRANGE,
+    ECOOP_SET, ECO_READONLY, EM_EXSETSEL, EM_FORMATRANGE, EM_SETCHARFORMAT, EM_SETEVENTMASK,
+    EM_SETOPTIONS, ENM_REQUESTRESIZE, FORMATRANGE, SCF_SELECTION,
 };
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, PBM_SETMARQUEE, PBS_MARQUEE,
+};
+
+use super::{PopupTab, TabContent};
+use crate::diff::DiffOp;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, IsWindow, RegisterClassW, SendMessageW,
@@ -63,8 +69,10 @@ struct PopupState {
     header: HWND,
     close: HWND,
     body: HWND,
+    progress: HWND,
     cancel: HWND,
     replace: HWND,
+    selected: PopupTab,
     font: HFONT,
     bold_font: HFONT,
     dpi: u32,
@@ -495,6 +503,23 @@ fn ensure_window() -> Option<HWND> {
             Some(LPARAM(ENM_REQUESTRESIZE as isize)),
         );
     }
+    // Progress bar for the loading body; InitCommonControlsEx registers it.
+    let progress_init = INITCOMMONCONTROLSEX {
+        dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_PROGRESS_CLASS,
+    };
+    // SAFETY: progress_init is a live INITCOMMONCONTROLSEX for the call.
+    if !unsafe { InitCommonControlsEx(&progress_init) }.as_bool() {
+        eprintln!("Writely: could not create the suggestion popup: InitCommonControlsEx failed.");
+        return None;
+    }
+    let progress = make_child(
+        "msctls_progress32",
+        "",
+        WINDOW_EX_STYLE(0),
+        WINDOW_STYLE(PBS_MARQUEE),
+        0,
+    )?;
     let cancel = make_child(
         "BUTTON",
         "Cancel",
@@ -515,8 +540,10 @@ fn ensure_window() -> Option<HWND> {
             header,
             close,
             body,
+            progress,
             cancel,
             replace,
+            selected: PopupTab::Correct,
             font: HFONT::default(),
             bold_font: HFONT::default(),
             dpi: 0,
@@ -718,7 +745,7 @@ fn show_card(window: HWND, caret: &CaretRect, width: i32, height: i32) -> bool {
 }
 
 // Copies the child handles out of STATE for one show.
-fn handles() -> Option<(HWND, HWND, HWND, HWND, HWND, HWND)> {
+fn handles() -> Option<(HWND, HWND, HWND, HWND, HWND, HWND, HWND)> {
     STATE.with(|state| {
         state.borrow().as_ref().map(|popup| {
             (
@@ -726,6 +753,7 @@ fn handles() -> Option<(HWND, HWND, HWND, HWND, HWND, HWND)> {
                 popup.header,
                 popup.close,
                 popup.body,
+                popup.progress,
                 popup.cancel,
                 popup.replace,
             )
@@ -733,15 +761,117 @@ fn handles() -> Option<(HWND, HWND, HWND, HWND, HWND, HWND)> {
     })
 }
 
+fn set_marquee(progress: HWND, on: bool) {
+    // SAFETY: progress is a live progress-bar child window.
+    unsafe {
+        SendMessageW(
+            progress,
+            PBM_SETMARQUEE,
+            Some(WPARAM(if on { 1 } else { 0 })),
+            Some(LPARAM(0)),
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffStyle {
+    Equal,
+    Delete,
+    Insert,
+}
+
+// Turns the word diff into styled runs for the RichEdit. The diff tokens
+// already carry their whitespace, so concatenating the runs keeps the
+// spacing between tokens exactly as `build_diff_attributed` does on macOS.
+fn diff_runs(original: &str, suggestion: &str) -> Vec<(String, DiffStyle)> {
+    crate::diff::diff_words(original, suggestion)
+        .into_iter()
+        .map(|op| match op {
+            DiffOp::Equal(text) => (text, DiffStyle::Equal),
+            DiffOp::Delete(text) => (text, DiffStyle::Delete),
+            DiffOp::Insert(text) => (text, DiffStyle::Insert),
+        })
+        .collect()
+}
+
+// Sets the body to the styled word diff, returning false when the text
+// could not be set.
+fn set_diff_text(body: HWND, original: &str, suggestion: &str) -> bool {
+    let runs = diff_runs(original, suggestion);
+    let display: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+    let value = wide(&display);
+    // SAFETY: body is a live RichEdit child window.
+    if let Err(error) = unsafe { SetWindowTextW(body, PCWSTR(value.as_ptr())) } {
+        eprintln!("Writely: could not update the suggestion popup: {error}");
+        return false;
+    }
+    let mut offset: i32 = 0;
+    for (text, style) in &runs {
+        let length = text.encode_utf16().count() as i32;
+        if length == 0 {
+            continue;
+        }
+        let (colour, effects) = match style {
+            DiffStyle::Equal => (
+                // SAFETY: COLOR_WINDOWTEXT is a valid system colour index.
+                COLORREF(unsafe { GetSysColor(COLOR_WINDOWTEXT) }),
+                windows::Win32::UI::Controls::RichEdit::CFE_EFFECTS(0),
+            ),
+            // RGB(196, 43, 28), struck out.
+            DiffStyle::Delete => (COLORREF(0x001C_2BC4), CFE_STRIKEOUT),
+            // RGB(16, 124, 16), bold.
+            DiffStyle::Insert => (COLORREF(0x0010_7C10), CFE_BOLD),
+        };
+        let mut format = CHARFORMAT2W::default();
+        format.Base.cbSize = std::mem::size_of::<CHARFORMAT2W>() as u32;
+        format.Base.dwMask = CFM_COLOR | CFM_BOLD | CFM_STRIKEOUT;
+        format.Base.dwEffects = effects;
+        format.Base.crTextColor = colour;
+        let range = CHARRANGE {
+            cpMin: offset,
+            cpMax: offset + length,
+        };
+        // SAFETY: body is a live RichEdit and format/range outlive the calls.
+        unsafe {
+            SendMessageW(
+                body,
+                EM_EXSETSEL,
+                Some(WPARAM(0)),
+                Some(LPARAM(&range as *const CHARRANGE as isize)),
+            );
+            SendMessageW(
+                body,
+                EM_SETCHARFORMAT,
+                Some(WPARAM(SCF_SELECTION as usize)),
+                Some(LPARAM(&format as *const CHARFORMAT2W as isize)),
+            );
+        }
+        offset += length;
+    }
+    let caret = CHARRANGE { cpMin: 0, cpMax: 0 };
+    // SAFETY: body is a live RichEdit and caret outlives the call.
+    unsafe {
+        SendMessageW(
+            body,
+            EM_EXSETSEL,
+            Some(WPARAM(0)),
+            Some(LPARAM(&caret as *const CHARRANGE as isize)),
+        );
+    }
+    true
+}
+
 pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &CaretRect) {
     let Some(window) = ensure_window() else {
         return;
     };
-    let Some((_, header, close, body, cancel, replace)) = handles() else {
+    let Some((_, header, close, body, progress, cancel, replace)) = handles() else {
         return;
     };
     let dpi = dpi_for_anchor(caret);
     refresh_fonts(dpi);
+    set_marquee(progress, false);
+    show_child(progress, false);
     if !set_plain_text(body, text, is_error) {
         return;
     }
@@ -803,6 +933,86 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
     );
 }
 
+pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
+    let Some(window) = ensure_window() else {
+        return;
+    };
+    let Some((_, header, close, body, progress, cancel, replace)) = handles() else {
+        return;
+    };
+    let dpi = dpi_for_anchor(caret);
+    refresh_fonts(dpi);
+    STATE.with(|state| {
+        if let Some(popup) = state.borrow_mut().as_mut() {
+            popup.selected = selected;
+        }
+    });
+    let (is_error, loading, show_replace, indent) = match content {
+        TabContent::Diff {
+            original,
+            suggestion,
+        } => {
+            if !set_diff_text(body, original, suggestion) {
+                return;
+            }
+            (false, false, true, false)
+        }
+        TabContent::Message {
+            text,
+            is_error,
+            loading,
+        } => {
+            if !set_plain_text(body, text, is_error) {
+                return;
+            }
+            (is_error, loading, false, loading)
+        }
+    };
+    set_marquee(progress, loading);
+    show_child(progress, loading);
+    let body_height = measure_body_height(body, dpi);
+    let card_height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
+    let body_x = if indent { SIDE_PAD + 18 } else { SIDE_PAD };
+    let body_width = CARD_WIDTH - SIDE_PAD - body_x;
+    set_child_pos(header, SIDE_PAD, 4, 300, 20, dpi);
+    set_child_pos(close, CARD_WIDTH - 36, 2, BUTTON_HEIGHT, BUTTON_HEIGHT, dpi);
+    set_child_pos(body, body_x, HEADER_HEIGHT, body_width, body_height, dpi);
+    if loading {
+        set_child_pos(progress, SIDE_PAD, HEADER_HEIGHT + 2, 16, 16, dpi);
+    }
+    show_child(cancel, true);
+    show_child(replace, show_replace);
+    let footer_y = HEADER_HEIGHT + body_height;
+    set_child_pos(
+        cancel,
+        CARD_WIDTH - SIDE_PAD - BUTTON_WIDTH - 8 - BUTTON_WIDTH,
+        footer_y + 8,
+        BUTTON_WIDTH,
+        BUTTON_HEIGHT,
+        dpi,
+    );
+    set_child_pos(
+        replace,
+        CARD_WIDTH - SIDE_PAD - BUTTON_WIDTH,
+        footer_y + 8,
+        BUTTON_WIDTH,
+        BUTTON_HEIGHT,
+        dpi,
+    );
+    STATE.with(|state| {
+        if let Some(popup) = state.borrow_mut().as_mut() {
+            popup.footer_y = scale(footer_y, dpi);
+            popup.error = is_error;
+        }
+    });
+    show_card(
+        window,
+        caret,
+        scale(CARD_WIDTH, dpi),
+        scale(card_height, dpi),
+    );
+}
+
 pub fn hide() {
     STATE.with(|state| {
         if let Some(popup) = state.borrow_mut().as_mut() {
@@ -824,4 +1034,38 @@ pub fn is_visible() -> bool {
             .map(|popup| popup.visible)
             .unwrap_or(false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{diff_runs, DiffStyle};
+
+    #[test]
+    fn diff_runs_cover_equal_delete_and_insert_with_spacing() {
+        let runs = diff_runs("Today are a good day.", "Today is a good day.");
+        assert_eq!(
+            runs,
+            vec![
+                ("Today ".to_string(), DiffStyle::Equal),
+                ("are".to_string(), DiffStyle::Delete),
+                ("is".to_string(), DiffStyle::Insert),
+                (" a good day.".to_string(), DiffStyle::Equal),
+            ]
+        );
+        // Dropping the deleted runs rebuilds the suggestion, spacing included.
+        let rebuilt: String = runs
+            .iter()
+            .filter(|(_, style)| *style != DiffStyle::Delete)
+            .map(|(text, _)| text.as_str())
+            .collect();
+        assert_eq!(rebuilt, "Today is a good day.");
+    }
+
+    #[test]
+    fn diff_runs_keep_identical_text_equal() {
+        assert_eq!(
+            diff_runs("Same text.", "Same text."),
+            vec![("Same text.".to_string(), DiffStyle::Equal)]
+        );
+    }
 }
