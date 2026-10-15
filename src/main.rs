@@ -1084,6 +1084,59 @@ fn pause_item_text(paused: bool) -> &'static str {
     }
 }
 
+/// Tooltip while Accessibility permission is missing.
+const ACCESSIBILITY_TOOLTIP: &str = "Writely needs Accessibility permission — see Settings";
+
+/// A copy of an RGBA buffer with every alpha byte scaled by 0.4 (rounded
+/// down); the RGB bytes are untouched.
+fn dimmed_rgba(rgba: &[u8]) -> Vec<u8> {
+    rgba.iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            if index % 4 == 3 {
+                (f32::from(*byte) * 0.4) as u8
+            } else {
+                *byte
+            }
+        })
+        .collect()
+}
+
+/// Refresh the tray icon and tooltip for the paused state. Failures are
+/// logged and never block the toggle.
+fn update_tray_paused(tray: &TrayIcon, paused: bool) {
+    let rgba = if paused {
+        dimmed_rgba(include_bytes!("../icons/tray-32.rgba"))
+    } else {
+        include_bytes!("../icons/tray-32.rgba").to_vec()
+    };
+    match Icon::from_rgba(rgba, 32, 32) {
+        Ok(icon) => {
+            if let Err(error) = tray.set_icon(Some(icon)) {
+                eprintln!("Writely: could not update the tray icon: {error}");
+            }
+            // set_icon drops the template flag on macOS, so restore it.
+            #[cfg(target_os = "macos")]
+            tray.set_icon_as_template(true);
+        }
+        Err(error) => {
+            eprintln!("Writely: could not update the tray icon: {error}");
+        }
+    }
+    let tooltip = if paused {
+        "Writely (paused)"
+    } else if settings::permission_message().is_some() {
+        // Pausing overwrote the Accessibility tooltip; put it back rather
+        // than plain "Writely" while permission is still missing.
+        ACCESSIBILITY_TOOLTIP
+    } else {
+        "Writely"
+    };
+    if let Err(error) = tray.set_tooltip(Some(tooltip)) {
+        eprintln!("Writely: could not update the tray tooltip: {error}");
+    }
+}
+
 fn handle_permission_granted(
     proxy: &EventLoopProxy<UserEvent>,
     caret_watcher: &mut Option<watcher::Watcher>,
@@ -1257,9 +1310,9 @@ fn main() {
                             eprintln!("Writely: {error}");
                             settings::set_permission_message(Some(error));
                             if let Some(tray) = &tray_icon {
-                                if let Err(tooltip_error) = tray.set_tooltip(Some(
-                                    "Writely needs Accessibility permission — see Settings",
-                                )) {
+                                if let Err(tooltip_error) =
+                                    tray.set_tooltip(Some(ACCESSIBILITY_TOOLTIP))
+                                {
                                     eprintln!(
                                         "Writely: could not update the tray tooltip: {tooltip_error}"
                                     );
@@ -1312,6 +1365,9 @@ fn main() {
                             caret_watcher = start_watcher(&watcher_proxy);
                         }
                         eprintln!("Writely: resumed.");
+                    }
+                    if let Some(tray) = tray_icon.as_ref() {
+                        update_tray_paused(tray, paused);
                     }
                 }
                 if event.id == settings_id {
@@ -1478,7 +1534,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{pause_item_text, selected_text, style_index, Pending};
+    use super::{dimmed_rgba, pause_item_text, selected_text, style_index, Pending};
     use crate::popup::PopupTab;
     use crate::providers::RewriteStyle;
 
@@ -1500,6 +1556,34 @@ mod tests {
     fn pause_item_text_toggles() {
         assert_eq!(pause_item_text(false), "Pause Writely");
         assert_eq!(pause_item_text(true), "Resume Writely");
+    }
+
+    #[test]
+    fn dimmed_rgba_scales_alpha_only() {
+        let input = [10, 20, 30, 255, 40, 50, 60, 100, 70, 80, 90, 1];
+        let dimmed = dimmed_rgba(&input);
+        assert_eq!(dimmed.len(), input.len());
+        assert_eq!(&dimmed[0..3], &[10, 20, 30]);
+        assert_eq!(dimmed[3], 102);
+        assert_eq!(&dimmed[4..7], &[40, 50, 60]);
+        assert_eq!(dimmed[7], 40);
+        assert_eq!(&dimmed[8..11], &[70, 80, 90]);
+        assert_eq!(dimmed[11], 0);
+    }
+
+    #[test]
+    fn dimmed_rgba_tray_icon() {
+        let rgba = include_bytes!("../icons/tray-32.rgba");
+        assert_eq!(rgba.len(), 32 * 32 * 4);
+        let dimmed = dimmed_rgba(rgba);
+        assert_eq!(dimmed.len(), 32 * 32 * 4);
+        for (index, byte) in dimmed.iter().enumerate() {
+            if index % 4 == 3 {
+                assert!(*byte <= 102, "alpha {byte} above 102 at {index}");
+            } else {
+                assert_eq!(*byte, rgba[index]);
+            }
+        }
     }
 
     #[test]
