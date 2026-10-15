@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use super::{PopupTab, TabContent};
+use crate::diff::DiffOp;
 use tao::event_loop::EventLoopProxy;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -11,11 +13,12 @@ use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontIndirectW, CreatePen, DeleteObject, EndPaint, GetDC, GetMonitorInfoW,
-    GetStockObject, GetSysColor, GetSysColorBrush, InvalidateRect, LineTo, MonitorFromPoint,
-    MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkMode, SetTextColor, COLOR_3DSHADOW,
-    COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, FW_BOLD, HDC, HFONT, HGDIOBJ, HOLLOW_BRUSH,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    Arc, BeginPaint, CreateFontIndirectW, CreatePen, DeleteObject, EndPaint, GetDC,
+    GetMonitorInfoW, GetStockObject, GetSysColor, GetSysColorBrush, InvalidateRect, LineTo,
+    MonitorFromPoint, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+    COLOR_3DSHADOW, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, FW_BOLD, HDC,
+    HFONT, HGDIOBJ, HOLLOW_BRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::Win32::System::WindowsProgramming::MulDiv;
@@ -24,23 +27,17 @@ use windows::Win32::UI::Controls::RichEdit::{
     ECOOP_SET, ECO_READONLY, EM_EXSETSEL, EM_FORMATRANGE, EM_SETCHARFORMAT, EM_SETEVENTMASK,
     EM_SETOPTIONS, ENM_REQUESTRESIZE, FORMATRANGE, SCF_SELECTION,
 };
-use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, PBM_SETMARQUEE, PBS_MARQUEE,
-};
-
-use super::{PopupTab, TabContent};
-use crate::diff::DiffOp;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetClientRect,
-    GetForegroundWindow, GetWindowRect, IsWindow, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx, BN_CLICKED,
-    BS_DEFPUSHBUTTON, BS_FLAT, BS_PUSHBUTTON, CS_DROPSHADOW, HMENU, HWND_TOPMOST, MA_NOACTIVATE,
-    MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_SEPARATOR, NONCLIENTMETRICSW,
+    GetForegroundWindow, GetWindowRect, IsWindow, KillTimer, RegisterClassW, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
+    BN_CLICKED, BS_DEFPUSHBUTTON, BS_FLAT, BS_PUSHBUTTON, CS_DROPSHADOW, HMENU, HWND_TOPMOST,
+    MA_NOACTIVATE, MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_SEPARATOR, NONCLIENTMETRICSW,
     SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, TPM_LEFTALIGN,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_MOUSEACTIVATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WNDCLASSW,
-    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_MOUSEACTIVATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_TIMER,
+    WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::providers::RewriteStyle;
@@ -63,6 +60,8 @@ const ID_CLOSE: i32 = 2001;
 const ID_CANCEL: i32 = 2002;
 const ID_REPLACE: i32 = 2003;
 const ID_STYLE: i32 = 2004;
+const SPINNER_TIMER_ID: usize = 1;
+const SPINNER_SIZE: i32 = 16;
 
 // RichEdit styles: ES_MULTILINE | ES_READONLY | WS_VSCROLL.
 const BODY_STYLE: u32 = 0x0004 | 0x0800 | 0x0020_0000;
@@ -76,7 +75,9 @@ struct PopupState {
     header: HWND,
     close: HWND,
     body: HWND,
-    progress: HWND,
+    loading: bool,
+    spinner_step: i32,
+    spinner_rect: RECT,
     style: HWND,
     cancel: HWND,
     replace: HWND,
@@ -402,6 +403,53 @@ extern "system" fn popup_proc(
                         let _ = MoveToEx(dc, client.left, footer_y, None);
                         let _ = LineTo(dc, client.right, footer_y);
                     }
+                    let spinner = STATE.with(|state| {
+                        state.borrow().as_ref().map(|popup| {
+                            (
+                                popup.loading,
+                                popup.spinner_step,
+                                popup.spinner_rect,
+                                popup.dpi,
+                            )
+                        })
+                    });
+                    if let Some((true, step, rect, dpi)) = spinner {
+                        // 270° ring in COLOR_HIGHLIGHT, rotated by `step`.
+                        // SAFETY: COLOR_HIGHLIGHT is a valid system colour index.
+                        let spinner_pen = CreatePen(
+                            PS_SOLID,
+                            scale(2, dpi),
+                            COLORREF(GetSysColor(COLOR_HIGHLIGHT)),
+                        );
+                        let old_spinner_pen = SelectObject(dc, HGDIOBJ(spinner_pen.0));
+                        let cx = (rect.left + rect.right) as f64 / 2.0;
+                        let cy = (rect.top + rect.bottom) as f64 / 2.0;
+                        let radius = ((rect.right - rect.left).min(rect.bottom - rect.top) as f64)
+                            / 2.0
+                            - 1.0;
+                        let point = |degrees: i32| -> (i32, i32) {
+                            let radians = (degrees as f64).to_radians();
+                            (
+                                (cx + radius * radians.cos()) as i32,
+                                (cy - radius * radians.sin()) as i32,
+                            )
+                        };
+                        let (x1, y1) = point(step);
+                        let (x2, y2) = point(step + 270);
+                        let _ = Arc(
+                            dc,
+                            rect.left,
+                            rect.top,
+                            rect.right,
+                            rect.bottom,
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                        );
+                        let _ = SelectObject(dc, old_spinner_pen);
+                        let _ = DeleteObject(HGDIOBJ(spinner_pen.0));
+                    }
                     let _ = SelectObject(dc, old_pen);
                     let _ = SelectObject(dc, old_brush);
                     let _ = DeleteObject(HGDIOBJ(pen.0));
@@ -410,7 +458,29 @@ extern "system" fn popup_proc(
             }
             LRESULT(0)
         }
+        WM_TIMER => {
+            if wparam.0 == SPINNER_TIMER_ID {
+                let rect = STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    let popup = state.as_mut()?;
+                    if !popup.loading || !popup.visible {
+                        return None;
+                    }
+                    popup.spinner_step = (popup.spinner_step + 30) % 360;
+                    Some(popup.spinner_rect)
+                });
+                if let Some(rect) = rect {
+                    // SAFETY: window is a live popup window and rect is its spinner area.
+                    unsafe {
+                        let _ = InvalidateRect(Some(window), Some(&rect), false);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            // SAFETY: window is a live popup window on this thread.
+            let _stopped = unsafe { KillTimer(Some(window), SPINNER_TIMER_ID) };
             let fonts = STATE.with(|state| {
                 state
                     .borrow_mut()
@@ -709,23 +779,6 @@ fn ensure_window() -> Option<HWND> {
             Some(LPARAM(ENM_REQUESTRESIZE as isize)),
         );
     }
-    // Progress bar for the loading body; InitCommonControlsEx registers it.
-    let progress_init = INITCOMMONCONTROLSEX {
-        dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_PROGRESS_CLASS,
-    };
-    // SAFETY: progress_init is a live INITCOMMONCONTROLSEX for the call.
-    if !unsafe { InitCommonControlsEx(&progress_init) }.as_bool() {
-        eprintln!("Writely: could not create the suggestion popup: InitCommonControlsEx failed.");
-        return None;
-    }
-    let progress = make_child(
-        "msctls_progress32",
-        "",
-        WINDOW_EX_STYLE(0),
-        WINDOW_STYLE(PBS_MARQUEE),
-        0,
-    )?;
     let style = make_child(
         "BUTTON",
         "Fix grammar \u{25be}",
@@ -753,7 +806,9 @@ fn ensure_window() -> Option<HWND> {
             header,
             close,
             body,
-            progress,
+            loading: false,
+            spinner_step: 0,
+            spinner_rect: RECT::default(),
             style,
             cancel,
             replace,
@@ -963,7 +1018,6 @@ struct ChildHandles {
     header: HWND,
     close: HWND,
     body: HWND,
-    progress: HWND,
     style: HWND,
     cancel: HWND,
     replace: HWND,
@@ -976,7 +1030,6 @@ fn handles() -> Option<ChildHandles> {
             header: popup.header,
             close: popup.close,
             body: popup.body,
-            progress: popup.progress,
             style: popup.style,
             cancel: popup.cancel,
             replace: popup.replace,
@@ -984,16 +1037,27 @@ fn handles() -> Option<ChildHandles> {
     })
 }
 
-fn set_marquee(progress: HWND, on: bool) {
-    // SAFETY: progress is a live progress-bar child window.
-    unsafe {
-        SendMessageW(
-            progress,
-            PBM_SETMARQUEE,
-            Some(WPARAM(if on { 1 } else { 0 })),
-            Some(LPARAM(0)),
-        );
+fn start_spinner(window: HWND) {
+    STATE.with(|state| {
+        if let Some(popup) = state.borrow_mut().as_mut() {
+            popup.loading = true;
+            popup.spinner_step = 0;
+        }
+    });
+    // SAFETY: window is a live popup window on this thread.
+    if unsafe { SetTimer(Some(window), SPINNER_TIMER_ID, 50, None) } == 0 {
+        eprintln!("Writely: could not start the popup spinner.");
     }
+}
+
+fn stop_spinner(window: HWND) {
+    STATE.with(|state| {
+        if let Some(popup) = state.borrow_mut().as_mut() {
+            popup.loading = false;
+        }
+    });
+    // SAFETY: window is a live popup window on this thread.
+    let _stopped = unsafe { KillTimer(Some(window), SPINNER_TIMER_ID) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1092,7 +1156,6 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         header,
         close,
         body,
-        progress,
         style,
         cancel,
         replace,
@@ -1102,8 +1165,7 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
     };
     let dpi = dpi_for_anchor(caret);
     refresh_fonts(dpi);
-    set_marquee(progress, false);
-    show_child(progress, false);
+    stop_spinner(window);
     show_child(style, false);
     if !set_plain_text(body, text, is_error) {
         return;
@@ -1174,7 +1236,6 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
         header,
         close,
         body,
-        progress,
         style,
         cancel,
         replace,
@@ -1184,6 +1245,7 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     };
     let dpi = dpi_for_anchor(caret);
     refresh_fonts(dpi);
+    stop_spinner(window);
     let caption = wide(&format!("{} \u{25be}", tab_label(selected)));
     // SAFETY: style is a live child window on this thread.
     if let Err(error) = unsafe { SetWindowTextW(style, PCWSTR(caption.as_ptr())) } {
@@ -1217,8 +1279,18 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
             (is_error, loading, false, loading)
         }
     };
-    set_marquee(progress, loading);
-    show_child(progress, loading);
+    if loading {
+        STATE.with(|state| {
+            if let Some(popup) = state.borrow_mut().as_mut() {
+                popup.spinner_rect = RECT {
+                    left: scale(SIDE_PAD, dpi),
+                    top: scale(HEADER_HEIGHT + 2, dpi),
+                    right: scale(SIDE_PAD + SPINNER_SIZE, dpi),
+                    bottom: scale(HEADER_HEIGHT + 2 + SPINNER_SIZE, dpi),
+                };
+            }
+        });
+    }
     let body_height = measure_body_height(body, dpi);
     let card_height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
     let body_x = if indent { SIDE_PAD + 18 } else { SIDE_PAD };
@@ -1226,9 +1298,6 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     set_child_pos(header, SIDE_PAD, 4, 300, 20, dpi);
     set_child_pos(close, CARD_WIDTH - 36, 2, BUTTON_HEIGHT, BUTTON_HEIGHT, dpi);
     set_child_pos(body, body_x, HEADER_HEIGHT, body_width, body_height, dpi);
-    if loading {
-        set_child_pos(progress, SIDE_PAD, HEADER_HEIGHT + 2, 16, 16, dpi);
-    }
     show_child(cancel, true);
     show_child(replace, show_replace);
     let footer_y = HEADER_HEIGHT + body_height;
@@ -1262,15 +1331,22 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
             popup.error = is_error;
         }
     });
-    show_card(
+    if show_card(
         window,
         caret,
         scale(CARD_WIDTH, dpi),
         scale(card_height, dpi),
-    );
+    ) && loading
+    {
+        start_spinner(window);
+    }
 }
 
 pub fn hide() {
+    let window = STATE.with(|state| state.borrow().as_ref().map(|popup| popup.window));
+    if let Some(window) = window {
+        stop_spinner(window);
+    }
     STATE.with(|state| {
         if let Some(popup) = state.borrow_mut().as_mut() {
             if popup.visible {
