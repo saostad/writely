@@ -16,6 +16,9 @@ ureq = { version = "3", default-features = false, features = ["rustls", "json"] 
 tao = "0.37"
 tray-icon = "0.25"
 
+[build-dependencies]
+embed-manifest = "1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 global-hotkey = "0.8"
