@@ -18,7 +18,7 @@ use std::ops::Range;
 
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use text_access::{CaretRect, FieldSnapshot};
@@ -30,8 +30,8 @@ pub enum UserEvent {
     IconClicked,
     HotkeyPressed,
     ReplaceClicked,
-    // Fired only by the macOS tab row; the handler lands with the rewrite
-    // wiring, so off macOS (no tabs) this is never constructed.
+    // Fired only by the macOS popup menu; the handler lands with the rewrite
+    // wiring, so off macOS (no menu) this is never constructed.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     TabClicked(popup::PopupTab),
     PermissionGranted,
@@ -1075,13 +1075,25 @@ fn spawn_permission_poll(proxy: EventLoopProxy<UserEvent>) {
     }
 }
 
+/// Text of the tray menu's pause item for the current paused state.
+fn pause_item_text(paused: bool) -> &'static str {
+    if paused {
+        "Resume Writely"
+    } else {
+        "Pause Writely"
+    }
+}
+
 fn handle_permission_granted(
     proxy: &EventLoopProxy<UserEvent>,
     caret_watcher: &mut Option<watcher::Watcher>,
     tray_icon: &Option<TrayIcon>,
+    paused: bool,
 ) {
     settings::set_permission_message(None);
-    if caret_watcher.is_none() {
+    // While paused the watcher stays off; resuming starts it (if permission
+    // allows) so monitoring never restarts behind the user's back.
+    if !paused && caret_watcher.is_none() {
         *caret_watcher = start_watcher(proxy);
     }
     if let Some(tray) = tray_icon {
@@ -1120,6 +1132,8 @@ fn main() {
     #[cfg(target_os = "macos")]
     let mut _hotkey_manager: Option<global_hotkey::GlobalHotKeyManager> = None;
     let mut settings_id = tray_icon::menu::MenuId::new("settings");
+    let mut pause_id = tray_icon::menu::MenuId::new("pause");
+    let mut pause_item: Option<MenuItem> = None;
     let mut quit_id = tray_icon::menu::MenuId::new("quit");
     #[cfg(target_os = "linux")]
     let mut check_text_id = tray_icon::menu::MenuId::new("check-text");
@@ -1127,6 +1141,7 @@ fn main() {
     let mut last_caret_error: Option<String> = None;
     // Popup flow state: bumped on every click and on hide so late Gemini
     // replies are dropped.
+    let mut paused = false;
     let mut generation: u64 = 0;
     let mut checking: Option<Checking> = None;
     let mut pending: Option<Pending> = None;
@@ -1153,18 +1168,47 @@ fn main() {
                 #[cfg(target_os = "linux")]
                 let check_text_item =
                     MenuItem::with_id("check-text", "Check text…", true, None);
+                // No monitoring on Wayland, so no pause item there either.
+                let new_pause_item: Option<MenuItem> = if watcher::is_wayland_session() {
+                    None
+                } else {
+                    Some(MenuItem::with_id(
+                        "pause",
+                        pause_item_text(false),
+                        true,
+                        None,
+                    ))
+                };
                 settings_id = settings_item.id().clone();
                 quit_id = quit_item.id().clone();
+                if let Some(item) = &new_pause_item {
+                    pause_id = item.id().clone();
+                }
                 #[cfg(target_os = "linux")]
                 {
                     check_text_id = check_text_item.id().clone();
                 }
 
+                let separator = PredefinedMenuItem::separator();
                 #[cfg(target_os = "linux")]
-                let menu_result =
-                    Menu::with_items(&[&check_text_item, &settings_item, &quit_item]);
+                let menu_result = match &new_pause_item {
+                    Some(pause) => Menu::with_items(&[
+                        pause,
+                        &separator,
+                        &check_text_item,
+                        &settings_item,
+                        &quit_item,
+                    ]),
+                    None => Menu::with_items(&[&check_text_item, &settings_item, &quit_item]),
+                };
                 #[cfg(not(target_os = "linux"))]
-                let menu_result = Menu::with_items(&[&settings_item, &quit_item]);
+                let menu_result = match &new_pause_item {
+                    Some(pause) => {
+                        Menu::with_items(&[pause, &separator, &settings_item, &quit_item])
+                    }
+                    None => Menu::with_items(&[&settings_item, &quit_item]),
+                };
+                pause_item = new_pause_item;
                 let menu = match menu_result {
                     Ok(menu) => menu,
                     Err(error) => {
@@ -1237,12 +1281,47 @@ fn main() {
                         eprintln!("Writely: {error}");
                     }
                 }
+                if pause_item.is_some() && event.id == pause_id {
+                    paused = !paused;
+                    if let Some(item) = pause_item.as_ref() {
+                        item.set_text(pause_item_text(paused));
+                    }
+                    if paused {
+                        popup::hide();
+                        overlay::hide();
+                        generation = generation.wrapping_add(1);
+                        checking = None;
+                        pending = None;
+                        // Linux: the AT-SPI watcher thread has no way to stop
+                        // (no Drop on WatcherInner), so it is kept and its
+                        // events are ignored while paused; never start a
+                        // second one on resume.
+                        #[cfg(any(target_os = "macos", target_os = "windows"))]
+                        {
+                            caret_watcher = None;
+                        }
+                        eprintln!("Writely: paused.");
+                    } else {
+                        // On Linux the watcher was kept, so this only
+                        // restarts it on macOS/Windows — and only with
+                        // permission; otherwise the permission flow starts
+                        // it later.
+                        if caret_watcher.is_none()
+                            && text_access::check_permission(false).is_ok()
+                        {
+                            caret_watcher = start_watcher(&watcher_proxy);
+                        }
+                        eprintln!("Writely: resumed.");
+                    }
+                }
                 if event.id == settings_id {
                     popup::hide();
                     // A stale permission message (e.g. granted after startup)
                     // is cleared here so Settings opens fresh. Skipped on
                     // Wayland: the watcher stays off and the Wayland message stays.
-                    if !watcher::is_wayland_session()
+                    // Skipped while paused: the watcher must not restart.
+                    if !paused
+                        && !watcher::is_wayland_session()
                         && text_access::check_permission(false).is_ok()
                         && caret_watcher.is_none()
                     {
@@ -1250,6 +1329,7 @@ fn main() {
                             &watcher_proxy,
                             &mut caret_watcher,
                             &tray_icon,
+                            paused,
                         );
                     }
                     if let Err(error) = settings::show_settings() {
@@ -1262,6 +1342,14 @@ fn main() {
                 }
             }
             Event::UserEvent(UserEvent::CaretChanged) => {
+                // While paused the icon stays hidden: ignore the event
+                // (including one queued before the pause). The coalesced
+                // flag is still drained so the next caret move after
+                // resuming wakes the app again.
+                if paused {
+                    watcher::clear_pending();
+                    return;
+                }
                 // Typing or moving focus hides the popup and drops any
                 // in-flight suggestion.
                 if popup::is_visible() {
@@ -1292,6 +1380,11 @@ fn main() {
                 }
             }
             Event::UserEvent(UserEvent::IconClicked) => {
+                // While paused the icon is hidden; a queued click from
+                // before the pause must not re-show anything.
+                if paused {
+                    return;
+                }
                 handle_icon_clicked(
                     &watcher_proxy,
                     &mut generation,
@@ -1324,7 +1417,7 @@ fn main() {
                 );
             }
             Event::UserEvent(UserEvent::PermissionGranted) => {
-                handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon);
+                handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon, paused);
             }
             #[cfg(target_os = "macos")]
             Event::UserEvent(UserEvent::CopiedText {
@@ -1385,7 +1478,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{selected_text, style_index, Pending};
+    use super::{pause_item_text, selected_text, style_index, Pending};
     use crate::popup::PopupTab;
     use crate::providers::RewriteStyle;
 
@@ -1401,6 +1494,12 @@ mod tests {
             pid: 0,
             via_clipboard: false,
         }
+    }
+
+    #[test]
+    fn pause_item_text_toggles() {
+        assert_eq!(pause_item_text(false), "Pause Writely");
+        assert_eq!(pause_item_text(true), "Resume Writely");
     }
 
     #[test]

@@ -62,6 +62,18 @@ impl Watcher {
     }
 }
 
+/// Drop the coalesced caret-change flag without acting on it. Used to
+/// ignore queued caret events while paused without wedging the watcher:
+/// without this the next real caret move after resuming would be swallowed.
+pub fn clear_pending() {
+    #[cfg(target_os = "macos")]
+    macos::clear_pending();
+    #[cfg(target_os = "windows")]
+    windows::clear_pending();
+    #[cfg(target_os = "linux")]
+    linux::clear_pending();
+}
+
 #[cfg(target_os = "linux")]
 pub fn is_wayland_session() -> bool {
     linux::is_wayland_session()
