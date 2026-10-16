@@ -389,9 +389,31 @@ fn registered_format(name: &str) -> Result<u32, String> {
     }
 }
 
+/// Maps a terminal UIA selection read to the copy outcome: non-blank
+/// text is checked, blank/nothing-selected asks the user to select text,
+/// and a terminal with no readable selection gets the manual-copy
+/// message. Pure for testing.
+pub fn terminal_copy_outcome(sel: Result<Option<String>, String>) -> Result<CopyResult, String> {
+    match sel {
+        Ok(Some(text)) if !text.trim().is_empty() => Ok(CopyResult::Text(text)),
+        Ok(Some(_)) => Ok(CopyResult::NothingNew),
+        Ok(None) => Err("Writely can't read the selected text in this terminal. Copy the text yourself and paste it into an app like Notepad to check it.".to_string()),
+        Err(error) => Err(format!(
+            "Could not read the selected text in this terminal: {error}"
+        )),
+    }
+}
+
 /// Copies the selected text in the app `pid` via Ctrl+C, restoring the
 /// user's clipboard afterwards unless another app changed it meanwhile.
+/// Terminals never get keystrokes (Ctrl+C would interrupt the app in
+/// front): their selection is read through UIA instead, without
+/// touching the clipboard.
 pub fn layered_copy_text(pid: u32) -> Result<CopyResult, String> {
+    if crate::text_access::is_terminal_app(pid) {
+        check_foreground(pid, "copy")?;
+        return terminal_copy_outcome(crate::text_access::terminal_selection_text());
+    }
     check_foreground(pid, "copy")?;
     let saved = take_snapshot()?;
     // SAFETY: reading the clipboard sequence number takes no state.
@@ -528,7 +550,8 @@ pub fn paste_suggestion(pid: u32, suggestion: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_skipped_format, paste_write_error, should_restore};
+    use super::{is_skipped_format, paste_write_error, should_restore, terminal_copy_outcome};
+    use crate::clipboard::CopyResult;
 
     #[test]
     fn gdi_handle_formats_are_skipped() {
@@ -562,6 +585,50 @@ mod tests {
                 Some("Could not restore the clipboard: nope")
             ),
             "Could not write the suggestion to the clipboard: boom Writely also couldn't put your clipboard back: Could not restore the clipboard: nope"
+        );
+    }
+
+    #[test]
+    fn terminal_outcome_returns_selected_text() {
+        match terminal_copy_outcome(Ok(Some("hello".to_string()))) {
+            Ok(CopyResult::Text(text)) => assert_eq!(text, "hello"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        // A real terminal selection may end in a newline; it is kept.
+        match terminal_copy_outcome(Ok(Some("hello\n".to_string()))) {
+            Ok(CopyResult::Text(text)) => assert_eq!(text, "hello\n"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_outcome_blank_selection_is_nothing_new() {
+        assert!(matches!(
+            terminal_copy_outcome(Ok(Some(String::new()))),
+            Ok(CopyResult::NothingNew)
+        ));
+        assert!(matches!(
+            terminal_copy_outcome(Ok(Some("  \n ".to_string()))),
+            Ok(CopyResult::NothingNew)
+        ));
+    }
+
+    #[test]
+    fn terminal_outcome_without_text_pattern_is_manual_copy_error() {
+        assert_eq!(
+            terminal_copy_outcome(Ok(None)).err(),
+            Some(
+                "Writely can't read the selected text in this terminal. Copy the text yourself and paste it into an app like Notepad to check it."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn terminal_outcome_wraps_uia_errors() {
+        assert_eq!(
+            terminal_copy_outcome(Err("boom".to_string())).err(),
+            Some("Could not read the selected text in this terminal: boom".to_string())
         );
     }
 

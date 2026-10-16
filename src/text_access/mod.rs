@@ -317,6 +317,13 @@ pub(crate) fn select_range(snap: &FieldSnapshot, range: Range<usize>) -> Result<
     windows::select_range(snap, range)
 }
 
+/// The selected text in the focused terminal, read through UIA with no
+/// keystrokes. Windows only; other platforms have no caller.
+#[cfg(target_os = "windows")]
+pub(crate) fn terminal_selection_text() -> Result<Option<String>, String> {
+    windows::terminal_selection_text()
+}
+
 pub fn replace_range(
     snap: &FieldSnapshot,
     range: Range<usize>,

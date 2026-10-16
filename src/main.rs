@@ -41,6 +41,7 @@ pub enum UserEvent {
         result: Result<clipboard::CopyResult, String>,
         pid: u32,
         from_hotkey: bool,
+        from_terminal: bool,
     },
     Suggestion {
         generation: u64,
@@ -389,12 +390,14 @@ fn handle_icon_clipboard(
     if let Err(error) = std::thread::Builder::new()
         .name("writely-copy".to_string())
         .spawn(move || {
+            let from_terminal = text_access::is_terminal_app(pid);
             let result = clipboard::layered_copy_text(pid);
             if let Err(send_error) = worker_proxy.send_event(UserEvent::CopiedText {
                 generation: my_generation,
                 result,
                 pid,
                 from_hotkey,
+                from_terminal,
             }) {
                 eprintln!("Writely: could not deliver the copied text: {send_error}");
             }
@@ -422,6 +425,7 @@ fn handle_copied_text(
     result: Result<clipboard::CopyResult, String>,
     pid: u32,
     from_hotkey: bool,
+    from_terminal: bool,
     checking: &mut Option<Checking>,
     pending: &mut Option<Pending>,
     last_anchor: &mut Option<CaretRect>,
@@ -458,7 +462,9 @@ fn handle_copied_text(
         show_popup(empty_message, false, false, anchor, None, last_anchor);
         return;
     }
-    if clipboard::looks_like_line_copy(&text) {
+    // A terminal selection that ends in a newline is a real selection,
+    // not an editor's whole-line copy: skip the guard for terminal text.
+    if !from_terminal && clipboard::looks_like_line_copy(&text) {
         #[cfg(target_os = "windows")]
         let line_copy_message = if from_hotkey {
             "Writely copied a whole line, which usually means nothing was selected. Select the text you want to check, then press Ctrl+Alt+G."
@@ -1620,6 +1626,7 @@ fn main() {
                 result,
                 pid,
                 from_hotkey,
+                from_terminal,
             }) => {
                 handle_copied_text(
                     &watcher_proxy,
@@ -1628,6 +1635,7 @@ fn main() {
                     result,
                     pid,
                     from_hotkey,
+                    from_terminal,
                     &mut checking,
                     &mut pending,
                     &mut last_anchor,

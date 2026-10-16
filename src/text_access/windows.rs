@@ -575,6 +575,27 @@ pub(crate) fn focused_is_secure() -> bool {
     }
 }
 
+/// The selected text in the focused terminal, read through UIA with no
+/// keystrokes: the ranges of the focused element's `TextPattern`
+/// selection joined with `\n`. `Ok(None)` when the element has no
+/// TextPattern (e.g. Warp); `Ok(Some(""))` when nothing is selected.
+pub(crate) fn terminal_selection_text() -> Result<Option<String>, String> {
+    let automation = UIAutomation::new().map_err(|error| error.to_string())?;
+    let element = automation
+        .get_focused_element()
+        .map_err(|error| error.to_string())?;
+    let pattern = match element.get_pattern::<UITextPattern>() {
+        Ok(pattern) => pattern,
+        Err(_) => return Ok(None),
+    };
+    let selections = pattern.get_selection().map_err(|error| error.to_string())?;
+    let mut parts = Vec::new();
+    for range in selections {
+        parts.push(range.get_text(-1).map_err(|error| error.to_string())?);
+    }
+    Ok(Some(parts.join("\n")))
+}
+
 pub(crate) fn read_text(handle: &PlatformHandle) -> Result<String, String> {
     document_text(&handle.element)
 }
