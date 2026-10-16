@@ -96,6 +96,7 @@ struct PopupState {
 thread_local! {
     static STATE: RefCell<Option<PopupState>> = const { RefCell::new(None) };
     static FOCUS_HANDOFF: RefCell<Option<(Instant, bool)>> = const { RefCell::new(None) };
+    static PRIMARY_LABEL: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 // Pure 500 ms window check for a focus handoff at `handoff` seen at `now`.
@@ -126,6 +127,33 @@ pub fn focus_handoff_recent() -> bool {
         }
         true
     })
+}
+
+pub fn set_primary_label(label: &str) {
+    PRIMARY_LABEL.with(|stored| {
+        *stored.borrow_mut() = label.to_string();
+    });
+    let replace = STATE.with(|state| state.borrow().as_ref().map(|popup| popup.replace));
+    if let Some(replace) = replace {
+        apply_primary_label(replace);
+    }
+}
+
+// Applies the stored primary label to the Replace button, logging a failure.
+fn apply_primary_label(replace: HWND) {
+    let label = PRIMARY_LABEL.with(|stored| {
+        let stored = stored.borrow();
+        if stored.is_empty() {
+            "Replace".to_string()
+        } else {
+            stored.clone()
+        }
+    });
+    let value = wide(&label);
+    // SAFETY: replace is a live child window on this thread.
+    if let Err(error) = unsafe { SetWindowTextW(replace, PCWSTR(value.as_ptr())) } {
+        eprintln!("Writely: could not update the suggestion popup: {error}");
+    }
 }
 
 pub fn init(proxy: EventLoopProxy<UserEvent>) {
@@ -1210,6 +1238,7 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
     let dpi = dpi_for_anchor(caret);
     refresh_fonts(dpi);
     stop_spinner(window);
+    apply_primary_label(replace);
     show_child(style, false);
     if !set_plain_text(body, text, is_error) {
         return;
@@ -1290,6 +1319,7 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     let dpi = dpi_for_anchor(caret);
     refresh_fonts(dpi);
     stop_spinner(window);
+    apply_primary_label(replace);
     let caption = wide(&format!("{} \u{25be}", tab_label(selected)));
     // SAFETY: style is a live child window on this thread.
     if let Err(error) = unsafe { SetWindowTextW(style, PCWSTR(caption.as_ptr())) } {

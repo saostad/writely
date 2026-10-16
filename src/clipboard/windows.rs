@@ -432,6 +432,22 @@ pub fn layered_copy_text(pid: u32) -> Result<CopyResult, String> {
     }
 }
 
+/// Writes `text` to the clipboard as `CF_UNICODETEXT` and keeps it
+/// there (no snapshot, no restore, no history-exclusion formats), for
+/// terminal apps where the suggestion can only be copied, not pasted
+/// over a selection. The caller adds its own message prefix to errors.
+pub fn copy_suggestion(text: &str) -> Result<(), String> {
+    let _guard = open_clipboard()?;
+    // SAFETY: the clipboard is open (this guard holds it).
+    unsafe { EmptyClipboard() }.map_err(|error| error.to_string())?;
+    let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut bytes = Vec::with_capacity(units.len() * 2);
+    for unit in &units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    set_format(CF_UNICODETEXT_FORMAT, &bytes)
+}
+
 /// Pastes `suggestion` into the app `pid` via Ctrl+V, then restores the
 /// saved clipboard only when nothing else changed it. The suggestion is
 /// marked so Windows clipboard history and cloud sync skip it.

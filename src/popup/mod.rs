@@ -134,6 +134,20 @@ pub fn hide() {
     {}
 }
 
+/// Sets the primary (Replace) button's label: `"Copy"` for terminal
+/// apps, `"Replace"` otherwise. Windows sets the button text; a no-op
+/// on macOS and Linux.
+pub fn set_primary_label(label: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        windows::set_primary_label(label);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = label;
+    }
+}
+
 pub fn focus_handoff_recent() -> bool {
     #[cfg(target_os = "windows")]
     {

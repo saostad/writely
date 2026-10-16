@@ -195,6 +195,18 @@ pub(crate) fn process_exe_name(pid: u32) -> Result<String, String> {
     }
 }
 
+/// Whether process `pid` is a terminal app. A failed exe lookup is
+/// logged and treated as not a terminal.
+pub(crate) fn is_terminal_app(pid: u32) -> bool {
+    match process_exe_name(pid) {
+        Ok(exe) => is_terminal_exe(&exe),
+        Err(error) => {
+            eprintln!("Writely: {error}");
+            false
+        }
+    }
+}
+
 /// Caret rectangle from MSAA `OBJID_CARET` (screen physical pixels), or
 /// `Ok(None)` when the accessible object reports no usable caret.
 /// Callers treat an `Err` as "try the next step", not as fatal.

@@ -6,7 +6,7 @@ mod windows;
 #[cfg(target_os = "macos")]
 pub use macos::{layered_copy_text, paste_suggestion};
 #[cfg(target_os = "windows")]
-pub use windows::{layered_copy_text, paste_suggestion};
+pub use windows::{copy_suggestion, layered_copy_text, paste_suggestion};
 
 /// True when `text` looks like a whole-line copy editors make when
 /// nothing is selected: a single non-blank line plus its line break.

@@ -295,6 +295,21 @@ pub fn focused_field() -> Result<Option<FieldSnapshot>, String> {
     }
 }
 
+/// Whether process `pid` is a terminal app, where Replace cannot work.
+/// Windows looks the exe up (a failed lookup is logged and treated as
+/// not a terminal); other platforms are never terminals.
+pub(crate) fn is_terminal_app(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::is_terminal_app(pid)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Selects `range` in the field so a paste replaces exactly that text.
 /// Windows only; other platforms have no caller.
 #[cfg(target_os = "windows")]

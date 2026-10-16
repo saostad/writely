@@ -86,6 +86,7 @@ struct Pending {
     pid: u32,
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     via_clipboard: bool,
+    copy_only: bool,
 }
 
 /// Index into `Pending::rewrites` for a style (its position in
@@ -766,6 +767,7 @@ fn handle_suggestion(
             let Some(active) = checking.take() else {
                 return;
             };
+            let copy_only = active.via_clipboard && text_access::is_terminal_app(active.pid);
             match providers::classify_suggestion(&suggestion, &active.sentence) {
                 providers::SuggestionOutcome::Unclear => {
                     show_popup(
@@ -782,6 +784,7 @@ fn handle_suggestion(
                         (*last_anchor).or(active.snap.as_ref().map(|snap| snap.caret_rect))
                     {
                         *last_anchor = Some(rect);
+                        popup::set_primary_label(if copy_only { "Copy" } else { "Replace" });
                         popup::show_tabbed(
                             popup::PopupTab::Correct,
                             popup::TabContent::Message {
@@ -806,6 +809,7 @@ fn handle_suggestion(
                         rewrite_in_flight: [false; 5],
                         pid: active.pid,
                         via_clipboard: active.via_clipboard,
+                        copy_only,
                     });
                 }
                 providers::SuggestionOutcome::Suggestion => {
@@ -813,6 +817,7 @@ fn handle_suggestion(
                         (*last_anchor).or(active.snap.as_ref().map(|snap| snap.caret_rect))
                     {
                         *last_anchor = Some(rect);
+                        popup::set_primary_label(if copy_only { "Copy" } else { "Replace" });
                         popup::show_tabbed(
                             popup::PopupTab::Correct,
                             popup::TabContent::Diff {
@@ -836,6 +841,7 @@ fn handle_suggestion(
                         rewrite_in_flight: [false; 5],
                         pid: active.pid,
                         via_clipboard: active.via_clipboard,
+                        copy_only,
                     });
                 }
             }
@@ -900,6 +906,7 @@ fn handle_tab_clicked(
         return;
     };
     active.selected = tab;
+    popup::set_primary_label(if active.copy_only { "Copy" } else { "Replace" });
     match tab {
         popup::PopupTab::Correct => match active.correction.as_deref() {
             Some(correction) => {
@@ -1006,6 +1013,7 @@ fn handle_rewrite(
     let index = style_index(style);
     active.rewrite_in_flight[index] = false;
     let tab = popup::PopupTab::Rewrite(style);
+    popup::set_primary_label(if active.copy_only { "Copy" } else { "Replace" });
     let still_selected = active.selected == tab;
     match result {
         Ok(rewrite) => {
@@ -1061,6 +1069,34 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
         *pending = Some(active);
         return;
     };
+    // Terminals: copy the suggestion to the clipboard instead of pasting
+    // it over a selection (a terminal selection is a screen selection).
+    #[cfg(target_os = "windows")]
+    if active.copy_only {
+        match clipboard::copy_suggestion(&text) {
+            Ok(()) => {
+                show_popup(
+                    "Copied. Paste it where you need it.",
+                    false,
+                    false,
+                    *last_anchor,
+                    None,
+                    last_anchor,
+                );
+            }
+            Err(error) => {
+                show_popup(
+                    &format!("Could not copy the suggestion: {error}"),
+                    true,
+                    false,
+                    *last_anchor,
+                    None,
+                    last_anchor,
+                );
+            }
+        }
+        return;
+    }
     // The copy-and-paste path pastes the suggestion over the selection.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     if active.via_clipboard {
@@ -1652,6 +1688,7 @@ mod tests {
             rewrite_in_flight: [false; 5],
             pid: 0,
             via_clipboard: false,
+            copy_only: false,
         }
     }
 
