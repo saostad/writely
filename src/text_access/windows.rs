@@ -4,8 +4,8 @@ use std::sync::Once;
 use uiautomation::core::{UIAutomation, UIElement};
 use uiautomation::patterns::{UITextPattern, UIValuePattern};
 use uiautomation::types::{TextPatternRangeEndpoint, TextUnit};
-use windows::core::{Interface, BOOL};
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::core::{Interface, BOOL, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, HWND, POINT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, SAFEARRAY,
@@ -13,6 +13,9 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Ole::{
     SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
     SafeArrayUnaccessData,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::System::Variant::{VARIANT, VT_I4};
 use windows::Win32::UI::Accessibility::{
@@ -95,6 +98,101 @@ impl Drop for SafeArrayGuard {
 /// on a monitor left of the primary one has a negative x and is usable.
 fn usable_msaa_caret(x: i32, y: i32, width: i32, height: i32) -> bool {
     width + height > 0 && !(x == 0 && y == 0)
+}
+
+/// Whether `exe` is a terminal emulator, where a mouse selection is a
+/// screen selection and Replace cannot work. Case-insensitive on the
+/// exe file name. Pure for testing.
+pub(crate) fn is_terminal_exe(exe: &str) -> bool {
+    let name = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
+    [
+        "windowsterminal.exe",
+        "openconsole.exe",
+        "conhost.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "warp.exe",
+        "wezterm-gui.exe",
+        "alacritty.exe",
+        "mintty.exe",
+        "hyper.exe",
+        "tabby.exe",
+        "rio.exe",
+        "ghostty.exe",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+/// Whether UIA text/selection for this app is unreliable, so the caller
+/// should skip accessibility and go straight to copy-and-paste: the
+/// listed editors/office apps, every terminal, or any Chromium
+/// EditContext editor (`native-edit-context`). Case-insensitive on the
+/// exe file name. Pure for testing.
+fn is_unreliable_uia(exe: &str, class_name: &str) -> bool {
+    if class_name.eq_ignore_ascii_case("native-edit-context") {
+        return true;
+    }
+    if is_terminal_exe(exe) {
+        return true;
+    }
+    let name = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
+    [
+        "code.exe",
+        "code - insiders.exe",
+        "cursor.exe",
+        "windsurf.exe",
+        "sublime_text.exe",
+        "firefox.exe",
+        "winword.exe",
+        "powerpnt.exe",
+        "idea64.exe",
+        "pycharm64.exe",
+        "webstorm64.exe",
+        "rider64.exe",
+        "clion64.exe",
+        "goland64.exe",
+        "phpstorm64.exe",
+        "rubymine64.exe",
+        "datagrip64.exe",
+        "studio64.exe",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+/// The exe file name (not the full path) of process `pid`.
+pub(crate) fn process_exe_name(pid: u32) -> Result<String, String> {
+    // SAFETY: opening the process with query-only access takes a plain pid.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(|error| format!("Could not read the app name for process {pid}: {error}"))?;
+    let mut buffer = vec![0u16; 1024];
+    let mut size = buffer.len() as u32;
+    // SAFETY: handle is live, buffer is writable, and size is in/out.
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        )
+    };
+    // SAFETY: handle was opened above and is closed exactly once here.
+    if let Err(error) = unsafe { CloseHandle(handle) } {
+        eprintln!("Writely: could not close a process handle: {error}");
+    }
+    result.map_err(|error| format!("Could not read the app name for process {pid}: {error}"))?;
+    buffer.truncate(size as usize);
+    let path = String::from_utf16_lossy(&buffer);
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+    if name.is_empty() {
+        Err(format!(
+            "Could not read the app name for process {pid}: the name was empty"
+        ))
+    } else {
+        Ok(name)
+    }
 }
 
 /// Caret rectangle from MSAA `OBJID_CARET` (screen physical pixels), or
@@ -282,6 +380,21 @@ pub(crate) fn focused_field() -> Result<Option<FieldSnapshot>, String> {
         Ok(true) => return Ok(None),
         Ok(false) => {}
         Err(error) => return Err(read_error(error)),
+    }
+
+    // Apps whose UIA text/selection isn't the real editor content go
+    // straight to the copy-and-paste fallback (`Ok(None)` here).
+    let class_name = match element.get_classname() {
+        Ok(class_name) => class_name,
+        Err(error) => {
+            eprintln!("Writely: {}", read_error(error));
+            String::new()
+        }
+    };
+    match process_exe_name(pid) {
+        Ok(exe) if is_unreliable_uia(&exe, &class_name) => return Ok(None),
+        Ok(_) => {}
+        Err(error) => eprintln!("Writely: {error}"),
     }
 
     let pattern = match element.get_pattern::<UITextPattern>() {
@@ -557,7 +670,7 @@ fn selected_text_for_range(text: &str, range: &Range<usize>) -> Result<String, S
 
 #[cfg(test)]
 mod tests {
-    use super::{selected_text_for_range, usable_msaa_caret};
+    use super::{is_terminal_exe, is_unreliable_uia, selected_text_for_range, usable_msaa_caret};
 
     #[test]
     fn msaa_caret_accepts_only_rects_with_extent_off_the_origin() {
@@ -568,6 +681,23 @@ mod tests {
         assert!(!usable_msaa_caret(0, 0, 1, 20));
         // A caret on a monitor left of the primary one.
         assert!(usable_msaa_caret(-1200, 300, 1, 20));
+    }
+
+    #[test]
+    fn unreliable_uia_matches_listed_exes_class_and_terminals() {
+        assert!(is_unreliable_uia("Code.exe", ""));
+        assert!(is_unreliable_uia("CODE.EXE", ""));
+        assert!(!is_unreliable_uia("notepad.exe", "RichEditD2DPT"));
+        assert!(is_unreliable_uia("chrome.exe", "native-edit-context"));
+        assert!(!is_unreliable_uia("chrome.exe", ""));
+        assert!(is_unreliable_uia("warp.exe", ""));
+    }
+
+    #[test]
+    fn terminal_exes_are_case_insensitive() {
+        assert!(is_terminal_exe("Warp.exe"));
+        assert!(is_terminal_exe("WindowsTerminal.exe"));
+        assert!(!is_terminal_exe("Code.exe"));
     }
 
     #[test]
