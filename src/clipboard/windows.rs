@@ -2,12 +2,15 @@
 //! doesn't expose. It never runs for a secure (password) field — the caller
 //! checks that first.
 //!
-//! Copy snapshots the clipboard, sends Ctrl+C, waits 50 ms then polls the
+//! Copy first tries the UIA selection (no clipboard at all). Otherwise it
+//! snapshots the clipboard, sends Ctrl+C, waits 50 ms then polls the
 //! clipboard sequence number every 5 ms for up to 2 s, reads
 //! `CF_UNICODETEXT`, and restores the snapshot only when nothing else
-//! changed the clipboard. Paste writes the suggestion (marked so clipboard
-//! history skips it), sends Ctrl+V, waits 300 ms, then restores the same
-//! way. The user's text is never written to logs.
+//! changed the clipboard. Paste writes the suggestion, sends Ctrl+V, waits
+//! 300 ms, then restores the same way. Everything Writely writes (the
+//! suggestion and the restored snapshot) is marked so clipboard history,
+//! cloud sync and clipboard monitors skip it. The user's text is never
+//! written to logs.
 
 use std::time::Duration;
 
@@ -29,6 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThre
 
 use super::CopyResult;
 
+const CF_TEXT_FORMAT: u32 = 1;
+const CF_OEMTEXT_FORMAT: u32 = 7;
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 const CF_BITMAP_FORMAT: u32 = 2;
 const CF_METAFILEPICT_FORMAT: u32 = 3;
@@ -64,6 +69,24 @@ pub fn is_skipped_format(format: u32) -> bool {
             | CF_DSPMETAFILEPICT_FORMAT
             | CF_DSPENHMETAFILE_FORMAT
     )
+}
+
+/// Whether `format` is one of the three text formats Windows converts
+/// between on demand (`CF_TEXT`, `CF_OEMTEXT`, `CF_UNICODETEXT`).
+fn is_text_format(format: u32) -> bool {
+    matches!(
+        format,
+        CF_TEXT_FORMAT | CF_OEMTEXT_FORMAT | CF_UNICODETEXT_FORMAT
+    )
+}
+
+/// Whether `format` is a text format Windows synthesizes from the one the
+/// app actually wrote. Enumeration lists real formats before synthesized
+/// ones, so only the first text format seen is real; the others are
+/// recreated by Windows after a restore and needn't be saved. Pure for
+/// testing.
+pub fn is_synthesized_text(format: u32, first_text_format: Option<u32>) -> bool {
+    is_text_format(format) && first_text_format.is_some_and(|first| first != format)
 }
 
 /// Whether the clipboard may be restored: only when its sequence number is
@@ -213,16 +236,27 @@ fn send_ctrl_key(key: VIRTUAL_KEY) -> Result<(), String> {
 type SavedFormat = (u32, Vec<u8>);
 
 /// Snapshots every `HGLOBAL` format on the open clipboard. GDI-handle
-/// formats are skipped and logged once per snapshot.
+/// formats are skipped and logged once per snapshot. Text formats Windows
+/// synthesizes and history markers are skipped silently without being
+/// read, so the clipboard owner isn't asked to render them; the restore
+/// writes its own markers.
 fn snapshot_clipboard() -> Vec<SavedFormat> {
+    let markers = history_marker_formats();
     let mut saved = Vec::new();
     let mut skipped: Vec<u32> = Vec::new();
+    let mut first_text_format: Option<u32> = None;
     let mut format: u32 = 0;
     loop {
         // SAFETY: the clipboard is open (the caller holds the guard).
         format = unsafe { EnumClipboardFormats(format) };
         if format == 0 {
             break;
+        }
+        if markers.contains(&format) || is_synthesized_text(format, first_text_format) {
+            continue;
+        }
+        if is_text_format(format) {
+            first_text_format = Some(format);
         }
         if is_skipped_format(format) {
             skipped.push(format);
@@ -325,7 +359,8 @@ pub fn paste_write_error(original: &str, restore_error: Option<&str>) -> String 
     }
 }
 
-/// Restores a snapshot onto the clipboard (opened and closed here).
+/// Restores a snapshot onto the clipboard (opened and closed here),
+/// marked so clipboard history and monitors don't treat it as a new copy.
 fn restore_clipboard(saved: &[SavedFormat]) -> Result<(), String> {
     let _guard = open_clipboard()?;
     // SAFETY: the clipboard is open (this guard holds it).
@@ -335,6 +370,7 @@ fn restore_clipboard(saved: &[SavedFormat]) -> Result<(), String> {
         set_format(*format, bytes)
             .map_err(|error| format!("Could not restore the clipboard: {error}"))?;
     }
+    set_history_markers();
     Ok(())
 }
 
@@ -377,6 +413,47 @@ fn read_unicode_text() -> Option<String> {
     Some(text.trim_end_matches('\0').to_string())
 }
 
+/// Registered formats that tell clipboard history, cloud sync and
+/// clipboard monitors to ignore the content.
+const MONITOR_EXCLUDE_FORMAT: &str = "ExcludeClipboardContentFromMonitorProcessing";
+const HISTORY_FORMATS: [&str; 2] = ["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"];
+
+/// The ids of the history/monitor marker formats that could be registered.
+fn history_marker_formats() -> Vec<u32> {
+    std::iter::once(MONITOR_EXCLUDE_FORMAT)
+        .chain(HISTORY_FORMATS)
+        .filter_map(|name| registered_format(name).ok())
+        .collect()
+}
+
+/// Marks the content on the open clipboard so clipboard history, cloud
+/// sync and clipboard monitors skip it. Best-effort: a failure is logged
+/// and must not lose the write (or the saved clipboard).
+fn set_history_markers() {
+    match registered_format(MONITOR_EXCLUDE_FORMAT) {
+        Ok(exclude) => {
+            if let Err(error) = set_format(exclude, &[]) {
+                eprintln!("Writely: could not hide clipboard content from monitors: {error}");
+            }
+        }
+        Err(error) => {
+            eprintln!("Writely: could not hide clipboard content from monitors: {error}");
+        }
+    }
+    for name in HISTORY_FORMATS {
+        match registered_format(name) {
+            Ok(format_id) => {
+                if let Err(error) = set_format(format_id, &0u32.to_le_bytes()) {
+                    eprintln!("Writely: could not hide clipboard content from history: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("Writely: could not hide clipboard content from history: {error}");
+            }
+        }
+    }
+}
+
 fn registered_format(name: &str) -> Result<u32, String> {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: wide is a NUL-terminated UTF-16 string for the call.
@@ -404,17 +481,23 @@ pub fn terminal_copy_outcome(sel: Result<Option<String>, String>) -> Result<Copy
     }
 }
 
-/// Copies the selected text in the app `pid` via Ctrl+C, restoring the
-/// user's clipboard afterwards unless another app changed it meanwhile.
-/// Terminals never get keystrokes (Ctrl+C would interrupt the app in
-/// front): their selection is read through UIA instead, without
-/// touching the clipboard.
+/// Copies the selected text in the app `pid`. A selection UIA can read
+/// reliably is used as is, without touching the clipboard; otherwise
+/// Ctrl+C, restoring the user's clipboard afterwards unless another app
+/// changed it meanwhile. Terminals never get keystrokes (Ctrl+C would
+/// interrupt the app in front): their selection is read through UIA
+/// instead, without touching the clipboard.
 pub fn layered_copy_text(pid: u32) -> Result<CopyResult, String> {
     if crate::text_access::is_terminal_app(pid) {
         check_foreground(pid, "copy")?;
         return terminal_copy_outcome(crate::text_access::terminal_selection_text());
     }
     check_foreground(pid, "copy")?;
+    match crate::text_access::uia_selection_text(pid) {
+        Ok(Some(text)) => return Ok(CopyResult::Text(text)),
+        Ok(None) => {}
+        Err(error) => eprintln!("Writely: {error}"),
+    }
     let saved = take_snapshot()?;
     // SAFETY: reading the clipboard sequence number takes no state.
     let before = unsafe { GetClipboardSequenceNumber() };
@@ -493,36 +576,7 @@ pub fn paste_suggestion(pid: u32, suggestion: &str) -> Result<(), String> {
             set_format(CF_UNICODETEXT_FORMAT, &bytes).map_err(|error| {
                 format!("Could not write the suggestion to the clipboard: {error}")
             })?;
-            // History/cloud exclusion markers are best-effort: a failure
-            // must not lose the paste (or the saved clipboard).
-            match registered_format("ExcludeClipboardContentFromMonitorProcessing") {
-                Ok(exclude) => {
-                    if let Err(error) = set_format(exclude, &[]) {
-                        eprintln!(
-                            "Writely: could not hide the suggestion from clipboard history: {error}"
-                        );
-                    }
-                }
-                Err(error) => {
-                    eprintln!(
-                        "Writely: could not hide the suggestion from clipboard history: {error}"
-                    );
-                }
-            }
-            for name in ["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"] {
-                match registered_format(name) {
-                    Ok(format_id) => {
-                        if let Err(error) = set_format(format_id, &0u32.to_le_bytes()) {
-                            eprintln!("Writely: could not hide the suggestion from clipboard history: {error}");
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "Writely: could not hide the suggestion from clipboard history: {error}"
-                        );
-                    }
-                }
-            }
+            set_history_markers();
             // SAFETY: reading the clipboard sequence number takes no state.
             Ok(unsafe { GetClipboardSequenceNumber() })
         })();
@@ -550,8 +604,25 @@ pub fn paste_suggestion(pid: u32, suggestion: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_skipped_format, paste_write_error, should_restore, terminal_copy_outcome};
+    use super::{
+        is_skipped_format, is_synthesized_text, paste_write_error, should_restore,
+        terminal_copy_outcome,
+    };
     use crate::clipboard::CopyResult;
+
+    #[test]
+    fn only_the_first_text_format_is_saved() {
+        // Nothing seen yet: the first text format is the real one.
+        assert!(!is_synthesized_text(13, None));
+        // After CF_UNICODETEXT, CF_TEXT and CF_OEMTEXT are synthesized.
+        assert!(is_synthesized_text(1, Some(13)));
+        assert!(is_synthesized_text(7, Some(13)));
+        // An app that wrote CF_TEXT gets CF_UNICODETEXT synthesized.
+        assert!(is_synthesized_text(13, Some(1)));
+        // Non-text formats are never synthesized text.
+        assert!(!is_synthesized_text(15, Some(13)));
+        assert!(!is_synthesized_text(0xC000, Some(13)));
+    }
 
     #[test]
     fn gdi_handle_formats_are_skipped() {

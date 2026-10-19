@@ -42,6 +42,7 @@ const ID_MODEL: i32 = 1006;
 const ID_EFFORT: i32 = 1007;
 const ID_URL: i32 = 1008;
 const ID_AUTOSTART: i32 = 1009;
+const ID_CLIPBOARD: i32 = 1010;
 const TAB_SUBCLASS_ID: usize = 1;
 
 const PROVIDER_NAMES: [&str; 3] = [
@@ -97,6 +98,8 @@ struct Layout {
     url_help: Rect,
     autostart: Rect,
     autostart_help: Rect,
+    clipboard: Rect,
+    clipboard_help: Rect,
     save: Rect,
     remove: Rect,
     tip: Rect,
@@ -134,6 +137,8 @@ fn layout(show_url: bool) -> Layout {
     let url_help = key_help;
     let autostart = row(22, 2);
     let autostart_help = row(16, 10);
+    let clipboard = row(22, 2);
+    let clipboard_help = row(34, 10);
     let buttons = row(26, 12);
     let save = Rect {
         x: 20,
@@ -171,6 +176,8 @@ fn layout(show_url: bool) -> Layout {
         url_help,
         autostart,
         autostart_help,
+        clipboard,
+        clipboard_help,
         save,
         remove,
         tip,
@@ -209,6 +216,8 @@ mod layout_tests {
             lay.link,
             lay.autostart,
             lay.autostart_help,
+            lay.clipboard,
+            lay.clipboard_help,
             lay.save,
             lay.tip,
             lay.status,
@@ -334,6 +343,8 @@ struct Handles {
     url_help: HWND,
     autostart_checkbox: HWND,
     autostart_help: HWND,
+    clipboard_checkbox: HWND,
+    clipboard_help: HWND,
     save: HWND,
     remove: HWND,
     tip: HWND,
@@ -442,6 +453,8 @@ fn child_rects(handles: &Handles) -> Vec<(HWND, Rect)> {
         (handles.url_help, lay.url_help),
         (handles.autostart_checkbox, lay.autostart),
         (handles.autostart_help, lay.autostart_help),
+        (handles.clipboard_checkbox, lay.clipboard),
+        (handles.clipboard_help, lay.clipboard_help),
         (handles.save, lay.save),
         (handles.remove, lay.remove),
         (handles.tip, lay.tip),
@@ -545,16 +558,21 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 fn set_status(text: &str, is_error: bool) {
-    STATE.with(|state| {
-        if let Some(handles) = state.borrow_mut().as_mut() {
+    // The borrow ends before SetWindowTextW: it can repaint the label
+    // synchronously, and WM_CTLCOLORSTATIC reads STATE again.
+    let status = STATE.with(|state| {
+        state.borrow_mut().as_mut().map(|handles| {
             handles.error = is_error;
-            let value = wide(text);
-            // SAFETY: handles.status is a live STATIC while the window is open.
-            if let Err(error) = unsafe { SetWindowTextW(handles.status, PCWSTR(value.as_ptr())) } {
-                eprintln!("Writely: could not update the Settings status: {error}");
-            }
-        }
+            handles.status
+        })
     });
+    if let Some(status) = status {
+        let value = wide(text);
+        // SAFETY: status is a live STATIC while the window is open.
+        if let Err(error) = unsafe { SetWindowTextW(status, PCWSTR(value.as_ptr())) } {
+            eprintln!("Writely: could not update the Settings status: {error}");
+        }
+    }
 }
 
 fn combo_selection(combo: HWND) -> i32 {
@@ -713,6 +731,7 @@ fn stash_draft() {
             handles.settings.set_model(provider, model.trim());
             handles.settings.effort = effort;
             handles.settings.launch_at_login = checkbox_checked(handles.autostart_checkbox);
+            handles.settings.clipboard_fallback = checkbox_checked(handles.clipboard_checkbox);
             if !url.trim().is_empty() {
                 handles.settings.ollama_url = url.trim().to_string();
             }
@@ -771,7 +790,7 @@ fn open_key_page(provider: Provider) {
     }
 }
 
-fn focusable_children(handles: &Handles) -> [HWND; 9] {
+fn focusable_children(handles: &Handles) -> [HWND; 10] {
     [
         handles.provider_combo,
         handles.model_edit,
@@ -780,6 +799,7 @@ fn focusable_children(handles: &Handles) -> [HWND; 9] {
         handles.url_edit,
         handles.link,
         handles.autostart_checkbox,
+        handles.clipboard_checkbox,
         handles.save,
         handles.remove,
     ]
@@ -857,6 +877,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                             handles.effort_combo,
                             handles.url_edit,
                             handles.autostart_checkbox,
+                            handles.clipboard_checkbox,
                             provider_at(combo_selection(handles.provider_combo)),
                         )
                     })
@@ -867,6 +888,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     effort_combo,
                     url_edit,
                     autostart_checkbox,
+                    clipboard_checkbox,
                     provider,
                 )) = snapshot
                 {
@@ -878,12 +900,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     let effort = effort_at(combo_selection(effort_combo));
                     let url = read_edit_text(url_edit);
                     let launch_at_login = checkbox_checked(autostart_checkbox);
+                    let clipboard_fallback = checkbox_checked(clipboard_checkbox);
                     STATE.with(|state| {
                         if let Some(handles) = state.borrow_mut().as_mut() {
                             handles.settings.provider = provider;
                             handles.settings.set_model(provider, model.trim());
                             handles.settings.effort = effort;
                             handles.settings.launch_at_login = launch_at_login;
+                            handles.settings.clipboard_fallback = clipboard_fallback;
                             if !url.trim().is_empty() {
                                 handles.settings.ollama_url = url.trim().to_string();
                             }
@@ -968,6 +992,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                             handles.key_help,
                             handles.url_help,
                             handles.autostart_help,
+                            handles.clipboard_help,
                         ];
                         (
                             helps.contains(&target),
@@ -1286,6 +1311,20 @@ pub fn show_settings() -> Result<(), String> {
         lay.autostart_help,
         0,
     )?;
+    let clipboard_checkbox = make_child(
+        "BUTTON",
+        "Use the clipboard when an app doesn't share its text",
+        WINDOW_STYLE((BS_AUTOCHECKBOX as u32) | WS_TABSTOP.0),
+        lay.clipboard,
+        ID_CLIPBOARD,
+    )?;
+    let clipboard_help = make_child(
+        "STATIC",
+        "Writely copies your selection and then puts your clipboard back. Turn off to never touch the clipboard.",
+        WINDOW_STYLE(0),
+        lay.clipboard_help,
+        0,
+    )?;
     let save = make_child(
         "BUTTON",
         "Save",
@@ -1341,6 +1380,8 @@ pub fn show_settings() -> Result<(), String> {
             url_help,
             autostart_checkbox,
             autostart_help,
+            clipboard_checkbox,
+            clipboard_help,
             save,
             remove,
             tip,
@@ -1378,6 +1419,14 @@ pub fn show_settings() -> Result<(), String> {
             .unwrap_or(true)
     });
     set_checkbox(autostart_checkbox, launch_at_login);
+    let clipboard_fallback = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|handles| handles.settings.clipboard_fallback)
+            .unwrap_or(true)
+    });
+    set_checkbox(clipboard_checkbox, clipboard_fallback);
     STATE.with(|state| {
         if let Some(handles) = state.borrow().as_ref() {
             apply_font(handles);

@@ -128,6 +128,10 @@ fn default_launch_at_login() -> bool {
     true
 }
 
+fn default_clipboard_fallback() -> bool {
+    true
+}
+
 fn default_models() -> HashMap<String, String> {
     let mut models = HashMap::new();
     models.insert("gemini".to_string(), DEFAULT_GEMINI_MODEL.to_string());
@@ -153,6 +157,11 @@ pub struct AppSettings {
     /// before this setting existed also get `true`).
     #[serde(default = "default_launch_at_login")]
     pub launch_at_login: bool,
+    /// Copy the selection with the clipboard (and put the clipboard back)
+    /// when an app doesn't share its text. On by default; when off, Writely
+    /// never touches the clipboard to read or replace text.
+    #[serde(default = "default_clipboard_fallback")]
+    pub clipboard_fallback: bool,
 }
 
 impl Default for AppSettings {
@@ -163,6 +172,7 @@ impl Default for AppSettings {
             effort: Effort::Default,
             ollama_url: DEFAULT_OLLAMA_URL.to_string(),
             launch_at_login: true,
+            clipboard_fallback: true,
         }
     }
 }
@@ -254,6 +264,17 @@ mod tests {
         let off: AppSettings =
             serde_json::from_str(r#"{"launch_at_login":false}"#).expect("should parse");
         assert!(!off.launch_at_login);
+    }
+
+    #[test]
+    fn clipboard_fallback_defaults_on_for_old_files() {
+        let old =
+            r#"{"provider":"gemini","effort":"default","ollama_url":"http://localhost:11434"}"#;
+        let settings: AppSettings = serde_json::from_str(old).expect("old file should parse");
+        assert!(settings.clipboard_fallback);
+        let off: AppSettings =
+            serde_json::from_str(r#"{"clipboard_fallback":false}"#).expect("should parse");
+        assert!(!off.clipboard_fallback);
     }
 
     #[test]

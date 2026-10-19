@@ -596,6 +596,43 @@ pub(crate) fn terminal_selection_text() -> Result<Option<String>, String> {
     Ok(Some(parts.join("\n")))
 }
 
+/// The selected text in the focused field of app `pid`, read through UIA
+/// so the copy fallback can skip the clipboard. `Ok(None)` when the field
+/// belongs to another app, is a password field, is in an app whose UIA
+/// selection isn't trusted, has no TextPattern, or has nothing selected.
+pub(crate) fn uia_selection_text(pid: u32) -> Result<Option<String>, String> {
+    let automation = UIAutomation::new().map_err(read_error)?;
+    let element = automation.get_focused_element().map_err(read_error)?;
+    if element.get_process_id().map_err(read_error)? != pid {
+        return Ok(None);
+    }
+    if element.is_password().map_err(read_error)? {
+        return Ok(None);
+    }
+    let class_name = element.get_classname().unwrap_or_default();
+    if is_unreliable_uia(&process_exe_name(pid)?, &class_name) {
+        return Ok(None);
+    }
+    let pattern = match element.get_pattern::<UITextPattern>() {
+        Ok(pattern) => pattern,
+        Err(_) => return Ok(None),
+    };
+    let selections = pattern.get_selection().map_err(read_error)?;
+    let mut parts = Vec::new();
+    for range in selections {
+        parts.push(range.get_text(-1).map_err(read_error)?);
+    }
+    let text = parts.join(
+        "
+",
+    );
+    if text.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(text))
+    }
+}
+
 pub(crate) fn read_text(handle: &PlatformHandle) -> Result<String, String> {
     document_text(&handle.element)
 }

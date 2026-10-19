@@ -324,6 +324,13 @@ pub(crate) fn terminal_selection_text() -> Result<Option<String>, String> {
     windows::terminal_selection_text()
 }
 
+/// The selected text in app `pid`, read through UIA without touching the
+/// clipboard; `Ok(None)` when it can't be read reliably. Windows only.
+#[cfg(target_os = "windows")]
+pub(crate) fn uia_selection_text(pid: u32) -> Result<Option<String>, String> {
+    windows::uia_selection_text(pid)
+}
+
 pub fn replace_range(
     snap: &FieldSnapshot,
     range: Range<usize>,

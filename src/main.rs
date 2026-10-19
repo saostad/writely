@@ -601,7 +601,7 @@ fn handle_icon_clicked(
         // No AX text for the focused element (e.g. Warp): on macOS fall back
         // to copy-and-paste, but never for a secure field.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if !text_access::focused_is_secure() {
+        if app_settings.clipboard_fallback && !text_access::focused_is_secure() {
             if let Some(pid) = live_pid {
                 handle_icon_clipboard(
                     proxy,
@@ -684,7 +684,10 @@ fn handle_icon_clicked(
                 // The whole field doesn't fit: on macOS try the clipboard
                 // (which re-applies the limit to the copied text).
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
-                if let Some(pid) = live_pid.or(Some(snap.pid)) {
+                if let Some(pid) = live_pid
+                    .or(Some(snap.pid))
+                    .filter(|_| app_settings.clipboard_fallback)
+                {
                     handle_icon_clipboard(proxy, pid, anchor, generation, last_anchor, from_hotkey);
                     return;
                 }
@@ -1126,7 +1129,7 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
             // UI Automation, verify it, and paste over it. The original
             // replace error is never dropped.
             #[cfg(target_os = "windows")]
-            {
+            if clipboard_fallback_enabled() {
                 let paste_result = text_access::select_range(&snap, active.range.clone())
                     .and_then(|()| clipboard::paste_suggestion(active.pid, &text));
                 match paste_result {
@@ -1150,7 +1153,10 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
             // selected from step 1 of the AX path, so re-select the snapshot
             // range first and paste over it instead of showing an error.
             #[cfg(target_os = "macos")]
-            if !active.via_clipboard && !text_access::covers_whole_field(&snap) {
+            if !active.via_clipboard
+                && !text_access::covers_whole_field(&snap)
+                && clipboard_fallback_enabled()
+            {
                 match text_access::macos_helpers::reselect_range(&snap, active.range.clone()) {
                     Ok(()) => {
                         match clipboard::paste_suggestion(active.pid, &text) {
@@ -1185,6 +1191,15 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
             );
         }
     }
+}
+
+/// Whether the clipboard fallback is on. Unreadable settings keep the
+/// default (on), matching how the rest of the app treats them.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn clipboard_fallback_enabled() -> bool {
+    config::load_settings()
+        .map(|settings| settings.clipboard_fallback)
+        .unwrap_or(true)
 }
 
 /// Copies the suggestion to the clipboard for the copy button and the
