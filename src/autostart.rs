@@ -150,51 +150,61 @@ fn set_enabled_at(path: &std::path::Path, enabled: bool, contents: &str) -> Resu
     }
 }
 
+/// Writes or deletes the per-user `Run` value through the registry API
+/// (launching `reg.exe` instead took about half a second per Save).
 #[cfg(target_os = "windows")]
 fn set_enabled_windows(enabled: bool) -> Result<(), String> {
-    use std::process::Command;
-    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-    let output = if enabled {
-        let exe = current_executable()?;
-        Command::new("reg")
-            .args([
-                "add",
-                key,
-                "/v",
-                "Writely",
-                "/t",
-                "REG_SZ",
-                "/d",
-                &format!("\"{}\"", exe.to_string_lossy()),
-                "/f",
-            ])
-            .output()
-    } else {
-        Command::new("reg")
-            .args(["delete", key, "/v", "Writely", "/f"])
-            .output()
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{
+        RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
     };
-    let output = output.map_err(|e| format!("Could not update the start-at-login setting: {e}"))?;
-    // `reg delete` on a missing value exits non-zero; that is already the
-    // desired state when disabling.
-    if !enabled && !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("unable to find") || stderr.contains("not find") {
-            return Ok(());
-        }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
     }
-    if output.status.success() {
+
+    let key = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let name = wide("Writely");
+    let status = if enabled {
+        let exe = current_executable()?;
+        let value = wide(&format!("\"{}\"", exe.to_string_lossy()));
+        // SAFETY: key, name and value are NUL-terminated UTF-16 buffers that
+        // outlive the call, and the size covers value including its NUL.
+        unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(key.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                REG_SZ.0,
+                Some(value.as_ptr().cast()),
+                (value.len() * std::mem::size_of::<u16>()) as u32,
+            )
+        }
+    } else {
+        // SAFETY: key and name are NUL-terminated UTF-16 buffers that
+        // outlive the call.
+        let status = unsafe {
+            RegDeleteKeyValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(key.as_ptr()),
+                PCWSTR(name.as_ptr()),
+            )
+        };
+        // A missing value is already the desired state when disabling.
+        if status == ERROR_FILE_NOT_FOUND {
+            ERROR_SUCCESS
+        } else {
+            status
+        }
+    };
+    if status == ERROR_SUCCESS {
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        if detail.is_empty() {
-            Err("Could not update the start-at-login setting: reg.exe failed.".to_string())
-        } else {
-            Err(format!(
-                "Could not update the start-at-login setting: {detail}"
-            ))
-        }
+        Err(format!(
+            "Could not update the start-at-login setting: {}",
+            windows::core::Error::from(status.to_hresult()).message()
+        ))
     }
 }
 
