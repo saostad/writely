@@ -451,6 +451,21 @@ fn post_command_key(keycode: CGKeyCode) -> Result<(), String> {
     Ok(())
 }
 
+/// Copies `text` to the clipboard for the copy button: a plain string the
+/// user keeps. No transient/concealed markers, no restore.
+pub fn copy_suggestion(text: &str) -> Result<(), String> {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    // SAFETY: NSPasteboardTypeString is a framework-provided constant.
+    let string_type: &NSPasteboardType = unsafe { NSPasteboardTypeString };
+    let string = NSString::from_str(text);
+    if pasteboard.setString_forType(&string, string_type) {
+        Ok(())
+    } else {
+        Err("the clipboard did not accept the text".to_string())
+    }
+}
+
 /// Pastes `suggestion` into the frontmost app via ⌘V, then restores the
 /// saved pasteboard only when nothing else changed it (WritingTools
 /// `restoreIfUnchanged`). The suggestion is marked transient + concealed so

@@ -34,6 +34,10 @@ pub enum UserEvent {
     // rewrite wiring, so elsewhere (no menu) this is never constructed.
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     TabClicked(popup::PopupTab),
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    CopyClicked,
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    CopyFeedbackEnded(u64),
     PermissionGranted,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     CopiedText {
@@ -1079,7 +1083,7 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
     // it over a selection (a terminal selection is a screen selection).
     #[cfg(target_os = "windows")]
     if active.copy_only {
-        match clipboard::copy_suggestion(&text) {
+        match copy_suggestion_message(&text) {
             Ok(()) => {
                 show_popup(
                     "Copied. Paste it where you need it.",
@@ -1090,15 +1094,8 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
                     last_anchor,
                 );
             }
-            Err(error) => {
-                show_popup(
-                    &format!("Could not copy the suggestion: {error}"),
-                    true,
-                    false,
-                    *last_anchor,
-                    None,
-                    last_anchor,
-                );
+            Err(message) => {
+                show_popup(&message, true, false, *last_anchor, None, last_anchor);
             }
         }
         return;
@@ -1186,6 +1183,49 @@ fn handle_replace_clicked(pending: &mut Option<Pending>, last_anchor: &mut Optio
                 Some(snap.caret_rect),
                 last_anchor,
             );
+        }
+    }
+}
+
+/// Copies the suggestion to the clipboard for the copy button and the
+/// terminal branch of `handle_replace_clicked`, so the error string lives in
+/// one place.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn copy_suggestion_message(text: &str) -> Result<(), String> {
+    clipboard::copy_suggestion(text)
+        .map_err(|error| format!("Could not copy the suggestion: {error}"))
+}
+
+/// Copies the shown suggestion without taking `pending`: the popup stays open
+/// and Replace still works afterwards. No text means nothing to copy.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn handle_copy_clicked(
+    pending: &Option<Pending>,
+    proxy: &EventLoopProxy<UserEvent>,
+    copy_feedback_id: &mut u64,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    let Some(active) = pending.as_ref() else {
+        return;
+    };
+    let Some(text) = selected_text(active).map(str::to_string) else {
+        return;
+    };
+    match copy_suggestion_message(&text) {
+        Ok(()) => {
+            popup::set_copy_feedback(true);
+            *copy_feedback_id = copy_feedback_id.wrapping_add(1);
+            let id = *copy_feedback_id;
+            let proxy = proxy.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                if let Err(error) = proxy.send_event(UserEvent::CopyFeedbackEnded(id)) {
+                    eprintln!("Writely: could not deliver the copy feedback event: {error}");
+                }
+            });
+        }
+        Err(message) => {
+            show_popup(&message, true, false, *last_anchor, None, last_anchor);
         }
     }
 }
@@ -1344,6 +1384,8 @@ fn main() {
     let mut checking: Option<Checking> = None;
     let mut pending: Option<Pending> = None;
     let mut last_anchor: Option<CaretRect> = None;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let mut copy_feedback_id: u64 = 0;
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -1607,6 +1649,22 @@ fn main() {
             }
             Event::UserEvent(UserEvent::ReplaceClicked) => {
                 handle_replace_clicked(&mut pending, &mut last_anchor);
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Event::UserEvent(UserEvent::CopyClicked) => {
+                handle_copy_clicked(
+                    &pending,
+                    &watcher_proxy,
+                    &mut copy_feedback_id,
+                    &mut last_anchor,
+                );
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Event::UserEvent(UserEvent::CopyFeedbackEnded(id)) => {
+                // A stale timer must not reset a newer checkmark.
+                if id == copy_feedback_id {
+                    popup::set_copy_feedback(false);
+                }
             }
             Event::UserEvent(UserEvent::TabClicked(tab)) => {
                 handle_tab_clicked(

@@ -148,6 +148,32 @@ pub fn set_primary_label(label: &str) {
     }
 }
 
+/// Swaps the copy icon button to a checkmark (`copied`) and back. macOS and
+/// Windows only; a no-op elsewhere.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub fn set_copy_feedback(copied: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_copy_feedback(copied);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::set_copy_feedback(copied);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = copied;
+    }
+}
+
+/// Whether the copy icon button is visible: exactly when Replace is visible,
+/// except when the primary button is already labelled "Copy".
+/// Only the macOS/Windows popups call it; Linux keeps the Check text window.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub fn shows_copy_button(replace_visible: bool, primary_label: &str) -> bool {
+    replace_visible && primary_label != "Copy"
+}
+
 pub fn focus_handoff_recent() -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -175,5 +201,17 @@ pub fn is_visible() -> bool {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shows_copy_button;
+
+    #[test]
+    fn copy_button_shows_with_replace_unless_primary_is_copy() {
+        assert!(shows_copy_button(true, "Replace"));
+        assert!(!shows_copy_button(true, "Copy"));
+        assert!(!shows_copy_button(false, "Replace"));
     }
 }

@@ -4,7 +4,7 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "macos")]
-pub use macos::{layered_copy_text, paste_suggestion};
+pub use macos::{copy_suggestion, layered_copy_text, paste_suggestion};
 #[cfg(target_os = "windows")]
 pub use windows::{copy_suggestion, layered_copy_text, paste_suggestion};
 
