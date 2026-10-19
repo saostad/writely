@@ -20,7 +20,7 @@ use objc2_foundation::{
 };
 use tao::event_loop::EventLoopProxy;
 
-use super::{PopupTab, TabContent};
+use super::{shows_copy_button, PopupTab, TabContent};
 use crate::providers::RewriteStyle;
 use crate::text_access::CaretRect;
 use crate::UserEvent;
@@ -33,6 +33,7 @@ const FOOTER_HEIGHT: f64 = 40.0;
 /// Width of the style pop-up button in the footer: fits "Professional" plus
 /// its icon and the arrows.
 const STYLE_BUTTON_WIDTH: f64 = 160.0;
+const COPY_BUTTON_WIDTH: f64 = 28.0;
 const BODY_MIN: f64 = 40.0;
 const BODY_MAX: f64 = 340.0;
 /// Height of the icon panel, used to place the popup below the icon.
@@ -63,6 +64,17 @@ define_class!(
             if let Some(proxy) = PROXY.get() {
                 if let Err(error) = proxy.send_event(UserEvent::ReplaceClicked) {
                     eprintln!("Writely: could not deliver the replace event: {error}");
+                }
+            }
+        }
+
+        #[unsafe(method(copyClicked:))]
+        fn copy_clicked(&self, _sender: Option<&AnyObject>) {
+            // Like Replace, but the popup stays open; the main thread copies
+            // the shown suggestion.
+            if let Some(proxy) = PROXY.get() {
+                if let Err(error) = proxy.send_event(UserEvent::CopyClicked) {
+                    eprintln!("Writely: could not deliver the copy event: {error}");
                 }
             }
         }
@@ -203,6 +215,30 @@ fn menu_icon(symbol: &str, label: &str) -> Option<Retained<NSImage>> {
             None
         }
     }
+}
+
+/// Loads an SF Symbol for the copy button. A symbol missing on this macOS
+/// version logs and the button shows a text label instead.
+fn copy_icon(symbol: &str, label: &str) -> Option<Retained<NSImage>> {
+    let name = NSString::from_str(symbol);
+    let description = NSString::from_str(label);
+    match NSImage::imageWithSystemSymbolName_accessibilityDescription(&name, Some(&description)) {
+        Some(image) => {
+            image.setTemplate(true);
+            image.setSize(NSSize::new(14.0, 14.0));
+            Some(image)
+        }
+        None => {
+            eprintln!("Writely: the copy icon is unavailable on this macOS version");
+            None
+        }
+    }
+}
+
+/// Whether the copy button is visible: exactly when Replace is. macOS has no
+/// copy-only mode, so the primary button always says "Replace".
+fn copy_visible(replace_visible: bool) -> bool {
+    shows_copy_button(replace_visible, "Replace")
 }
 
 /// Small semibold secondary-label title for a disabled section-header item.
@@ -350,6 +386,7 @@ struct PopupState {
     separator: Retained<SeparatorView>,
     cancel_button: Retained<NSButton>,
     replace_button: Retained<NSButton>,
+    copy_button: Retained<NSButton>,
     spinner: Retained<NSProgressIndicator>,
     style_button: Retained<NSPopUpButton>,
     #[allow(dead_code)]
@@ -493,6 +530,26 @@ fn ensure_popup(mtm: MainThreadMarker) {
         replace_button.setKeyEquivalent(&NSString::from_str(""));
         card.addSubview(&replace_button);
 
+        // Image-only copy button left of Cancel; a text label when the SF
+        // Symbol is missing on this macOS version.
+        // SAFETY: replace target implements copyClicked: and lives in STATE while the panel is alive.
+        let copy_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(""),
+                Some(replace_object),
+                Some(sel!(copyClicked:)),
+                mtm,
+            )
+        };
+        copy_button.setKeyEquivalent(&NSString::from_str(""));
+        if let Some(icon) = copy_icon("doc.on.doc", "Copy suggestion") {
+            copy_button.setImage(Some(&icon));
+        } else {
+            copy_button.setTitle(&NSString::from_str("Copy"));
+        }
+        copy_button.setToolTip(Some(&NSString::from_str("Copy suggestion")));
+        card.addSubview(&copy_button);
+
         // Loading spinner for "Checking…": 14 pt, hidden until needed.
         // SAFETY: initWithFrame: is the designated initializer and mtm is the main thread.
         let spinner = NSProgressIndicator::initWithFrame(
@@ -543,6 +600,7 @@ fn ensure_popup(mtm: MainThreadMarker) {
             separator,
             cancel_button,
             replace_button,
+            copy_button,
             spinner,
             style_button,
             replace_target,
@@ -602,7 +660,7 @@ fn remove_key_monitor() {
 /// Lays out the card for plain `text` (messages and, until the diff lands,
 /// suggestions). Returns the panel height.
 fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
-    STATE.with(|state| {
+    let panel_height = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(popup) = state.as_mut() else {
             return 0.0;
@@ -694,6 +752,7 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
         }
         popup.cancel_button.setHidden(!show_footer);
         popup.replace_button.setHidden(!show_footer);
+        popup.copy_button.setHidden(!copy_visible(show_footer));
         if show_footer {
             popup.replace_button.setFrame(NSRect::new(
                 NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
@@ -703,9 +762,20 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
                 NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
                 NSSize::new(90.0, 24.0),
             ));
+            popup.copy_button.setFrame(NSRect::new(
+                NSPoint::new(
+                    CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0 - 8.0 - COPY_BUTTON_WIDTH,
+                    8.0,
+                ),
+                NSSize::new(COPY_BUTTON_WIDTH, 24.0),
+            ));
         }
         panel_height
-    })
+    });
+    if show_footer {
+        set_copy_feedback(false);
+    }
+    panel_height
 }
 
 /// Builds one inline attributed text for the suggestion: unchanged tokens in
@@ -774,7 +844,7 @@ fn build_diff_attributed(
 /// menu button in the footer). Cancel + Replace are visible. Returns the
 /// panel height.
 fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
-    STATE.with(|state| {
+    let panel_height = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(popup) = state.as_mut() else {
             return 0.0;
@@ -855,6 +925,7 @@ fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
         ));
         popup.cancel_button.setHidden(false);
         popup.replace_button.setHidden(false);
+        popup.copy_button.setHidden(!copy_visible(true));
         popup.replace_button.setFrame(NSRect::new(
             NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
             NSSize::new(90.0, 24.0),
@@ -863,15 +934,24 @@ fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
             NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
             NSSize::new(90.0, 24.0),
         ));
+        popup.copy_button.setFrame(NSRect::new(
+            NSPoint::new(
+                CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0 - 8.0 - COPY_BUTTON_WIDTH,
+                8.0,
+            ),
+            NSSize::new(COPY_BUTTON_WIDTH, 24.0),
+        ));
         panel_height
-    })
+    });
+    set_copy_feedback(false);
+    panel_height
 }
 
 /// Lays out the card for a tabbed plain-text body (a rewrite state: loading,
 /// error, or an informational note). The footer shows the style menu button
 /// and Cancel only. Returns the panel height.
 fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: PopupTab) -> f64 {
-    STATE.with(|state| {
+    let panel_height = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(popup) = state.as_mut() else {
             return 0.0;
@@ -960,12 +1040,15 @@ fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: Po
         ));
         popup.cancel_button.setHidden(false);
         popup.replace_button.setHidden(true);
+        popup.copy_button.setHidden(!copy_visible(false));
         popup.cancel_button.setFrame(NSRect::new(
             NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
             NSSize::new(90.0, 24.0),
         ));
         panel_height
-    })
+    });
+    set_copy_feedback(false);
+    panel_height
 }
 
 /// Shows the popup with the style menu button showing `selected`: a word diff
@@ -1089,6 +1172,34 @@ fn show_body(panel_height: f64, caret: &CaretRect, mtm: MainThreadMarker) {
     });
 }
 
+/// Swaps the copy button between the copy icon and the checkmark, updating
+/// its tooltip too. Without the icon it keeps text labels so the button stays
+/// readable.
+pub fn set_copy_feedback(copied: bool) {
+    STATE.with(|state| {
+        let popup = state.borrow();
+        let Some(popup) = popup.as_ref() else {
+            return;
+        };
+        let (symbol, tip) = if copied {
+            ("checkmark", "Copied")
+        } else {
+            ("doc.on.doc", "Copy suggestion")
+        };
+        if let Some(icon) = copy_icon(symbol, tip) {
+            popup.copy_button.setTitle(&NSString::from_str(""));
+            popup.copy_button.setImage(Some(&icon));
+        } else if copied {
+            popup.copy_button.setTitle(&NSString::from_str("Copied"));
+            popup.copy_button.setImage(None);
+        } else {
+            popup.copy_button.setTitle(&NSString::from_str("Copy"));
+            popup.copy_button.setImage(None);
+        }
+        popup.copy_button.setToolTip(Some(&NSString::from_str(tip)));
+    });
+}
+
 pub fn hide() {
     remove_key_monitor();
     STATE.with(|state| {
@@ -1101,6 +1212,7 @@ pub fn hide() {
             popup.panel.orderOut(None);
             popup.replace_button.setHidden(true);
             popup.cancel_button.setHidden(true);
+            popup.copy_button.setHidden(true);
             popup.separator.setHidden(true);
             popup.visible = false;
         }
