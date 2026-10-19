@@ -3,22 +3,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use super::{PopupTab, TabContent};
+use super::{shows_copy_button, PopupTab, TabContent};
 use crate::diff::DiffOp;
 use tao::event_loop::EventLoopProxy;
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    Arc, BeginPaint, CreateFontIndirectW, CreatePen, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetDC, GetMonitorInfoW, GetStockObject, GetSysColor, GetSysColorBrush, InvalidateRect, LineTo,
-    MonitorFromPoint, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    COLOR_3DSHADOW, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT,
-    DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD, HDC, HFONT, HGDIOBJ, HOLLOW_BRUSH, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    Arc, BeginPaint, CreateFontIndirectW, CreateFontW, CreatePen, DeleteObject, DrawTextW,
+    EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject, GetSysColor, GetSysColorBrush,
+    InvalidateRect, LineTo, MonitorFromPoint, MoveToEx, Rectangle, ReleaseDC, SelectObject,
+    SetBkMode, SetTextColor, CLIP_DEFAULT_PRECIS, COLOR_3DSHADOW, COLOR_BTNFACE, COLOR_GRAYTEXT,
+    COLOR_HIGHLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_CHARSET, DEFAULT_QUALITY, DT_CENTER,
+    DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HDC, HFONT, HGDIOBJ, HOLLOW_BRUSH, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::Win32::System::WindowsProgramming::MulDiv;
@@ -27,19 +28,22 @@ use windows::Win32::UI::Controls::RichEdit::{
     ECOOP_SET, ECO_READONLY, EM_EXSETSEL, EM_FORMATRANGE, EM_SETCHARFORMAT, EM_SETEVENTMASK,
     EM_SETOPTIONS, ENM_REQUESTRESIZE, FORMATRANGE, SCF_SELECTION,
 };
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
+use windows::Win32::UI::Controls::{
+    DRAWITEMSTRUCT, ODS_SELECTED, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW,
+    TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTTOOLINFOW,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetClientRect,
     GetForegroundWindow, GetWindowRect, IsWindow, KillTimer, RegisterClassW, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenuEx,
-    BN_CLICKED, BS_DEFPUSHBUTTON, BS_OWNERDRAW, BS_PUSHBUTTON, CS_DROPSHADOW, HMENU, HWND_TOPMOST,
-    MA_NOACTIVATE, MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_SEPARATOR, NONCLIENTMETRICSW,
-    SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, TPM_LEFTALIGN,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_MOUSEACTIVATE, WM_NOTIFY, WM_PAINT, WM_SETFONT,
-    WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    BN_CLICKED, BS_DEFPUSHBUTTON, BS_OWNERDRAW, BS_PUSHBUTTON, CS_DROPSHADOW, CW_USEDEFAULT, HMENU,
+    HWND_TOPMOST, MA_NOACTIVATE, MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_SEPARATOR,
+    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE,
+    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_MOUSEACTIVATE, WM_NOTIFY, WM_PAINT,
+    WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE,
 };
 
 use crate::providers::RewriteStyle;
@@ -55,6 +59,7 @@ const BODY_MIN: i32 = 40;
 const BODY_MAX: i32 = 340;
 const BUTTON_WIDTH: i32 = 90;
 const BUTTON_HEIGHT: i32 = 24;
+const COPY_BUTTON_WIDTH: i32 = 28;
 const STYLE_BUTTON_WIDTH: i32 = 160;
 const ICON_SIZE: i32 = 20;
 
@@ -62,6 +67,7 @@ const ID_CLOSE: i32 = 2001;
 const ID_CANCEL: i32 = 2002;
 const ID_REPLACE: i32 = 2003;
 const ID_STYLE: i32 = 2004;
+const ID_COPY: i32 = 2005;
 const SPINNER_TIMER_ID: usize = 1;
 const SPINNER_SIZE: i32 = 16;
 
@@ -83,9 +89,12 @@ struct PopupState {
     style: HWND,
     cancel: HWND,
     replace: HWND,
+    copy: HWND,
+    tooltip: HWND,
     selected: PopupTab,
     font: HFONT,
     bold_font: HFONT,
+    copy_font: HFONT,
     dpi: u32,
     error: bool,
     visible: bool,
@@ -139,21 +148,75 @@ pub fn set_primary_label(label: &str) {
     }
 }
 
-// Applies the stored primary label to the Replace button, logging a failure.
-fn apply_primary_label(replace: HWND) {
-    let label = PRIMARY_LABEL.with(|stored| {
+// The stored primary label ("Copy" in terminals, "Replace" elsewhere),
+// defaulting to "Replace" like the button's initial text.
+fn current_primary_label() -> String {
+    PRIMARY_LABEL.with(|stored| {
         let stored = stored.borrow();
         if stored.is_empty() {
             "Replace".to_string()
         } else {
             stored.clone()
         }
-    });
+    })
+}
+
+// Applies the stored primary label to the Replace button, logging a failure.
+fn apply_primary_label(replace: HWND) {
+    let label = current_primary_label();
     let value = wide(&label);
     // SAFETY: replace is a live child window on this thread.
     if let Err(error) = unsafe { SetWindowTextW(replace, PCWSTR(value.as_ptr())) } {
         eprintln!("Writely: could not update the suggestion popup: {error}");
     }
+}
+
+/// Swaps the copy button between the copy icon and the checkmark, updating
+/// its tooltip too. Without the icon font it keeps text labels so the button
+/// stays readable.
+pub fn set_copy_feedback(copied: bool) {
+    STATE.with(|state| {
+        let popup = state.borrow();
+        let Some(popup) = popup.as_ref() else {
+            return;
+        };
+        let icon = if copied { "\u{E73E}" } else { "\u{E8C8}" };
+        let label = if popup.copy_font.0.is_null() {
+            if copied {
+                "Copied"
+            } else {
+                "Copy"
+            }
+        } else {
+            icon
+        };
+        let value = wide(label);
+        // SAFETY: copy is a live child window on this thread.
+        if let Err(error) = unsafe { SetWindowTextW(popup.copy, PCWSTR(value.as_ptr())) } {
+            eprintln!("Writely: could not update the suggestion popup: {error}");
+        }
+        if popup.tooltip.0.is_null() {
+            return;
+        }
+        let tip = wide(if copied { "Copied" } else { "Copy suggestion" });
+        let tool = TTTOOLINFOW {
+            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+            hwnd: popup.window,
+            uId: popup.copy.0 as usize,
+            lpszText: PWSTR(tip.as_ptr() as *mut u16),
+            ..Default::default()
+        };
+        // SAFETY: tooltip is a live tooltip window and tool outlives the call.
+        unsafe {
+            SendMessageW(
+                popup.tooltip,
+                TTM_UPDATETIPTEXTW,
+                Some(WPARAM(0)),
+                Some(LPARAM(&tool as *const TTTOOLINFOW as isize)),
+            );
+        }
+    });
 }
 
 pub fn init(proxy: EventLoopProxy<UserEvent>) {
@@ -184,6 +247,14 @@ fn send_replace() {
     if let Some(proxy) = PROXY.get() {
         if let Err(error) = proxy.send_event(UserEvent::ReplaceClicked) {
             eprintln!("Writely: could not deliver the replace event: {error}");
+        }
+    }
+}
+
+fn send_copy() {
+    if let Some(proxy) = PROXY.get() {
+        if let Err(error) = proxy.send_event(UserEvent::CopyClicked) {
+            eprintln!("Writely: could not deliver the copy event: {error}");
         }
     }
 }
@@ -369,6 +440,7 @@ extern "system" fn popup_proc(
                 match id {
                     ID_CLOSE | ID_CANCEL => send_dismiss(),
                     ID_REPLACE => send_replace(),
+                    ID_COPY => send_copy(),
                     ID_STYLE => show_style_menu(window),
                     _ => {}
                 }
@@ -557,11 +629,12 @@ extern "system" fn popup_proc(
                 state
                     .borrow_mut()
                     .take()
-                    .map(|popup| (popup.font, popup.bold_font))
+                    .map(|popup| (popup.font, popup.bold_font, popup.copy_font))
             });
-            if let Some((font, bold_font)) = fonts {
+            if let Some((font, bold_font, copy_font)) = fonts {
                 delete_font(font);
                 delete_font(bold_font);
+                delete_font(copy_font);
             }
             // SAFETY: default handling for window teardown.
             unsafe { DefWindowProcW(window, message, wparam, lparam) }
@@ -619,6 +692,48 @@ fn popup_font(dpi: u32, bold: bool) -> HFONT {
     }
 }
 
+// Loads the Segoe MDL2 Assets icon font at `dpi`, sized like the popup font.
+fn load_copy_font(dpi: u32) -> Result<HFONT, windows::core::Error> {
+    let mut metrics = NONCLIENTMETRICSW {
+        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: metrics is a live NONCLIENTMETRICSW sized by cbSize.
+    unsafe {
+        SystemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS.0,
+            metrics.cbSize,
+            Some(&mut metrics as *mut NONCLIENTMETRICSW as *mut core::ffi::c_void),
+            0,
+            dpi,
+        )?;
+    }
+    let face = wide("Segoe MDL2 Assets");
+    // SAFETY: the face name outlives the call; the rest are plain values.
+    let font = unsafe {
+        CreateFontW(
+            metrics.lfMessageFont.lfHeight,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY,
+            0,
+            PCWSTR(face.as_ptr()),
+        )
+    };
+    if font.0.is_null() {
+        return Err(windows::core::Error::from_thread());
+    }
+    Ok(font)
+}
+
 // Recreates the fonts when the DPI changes, freeing the old ones, and
 // sends WM_SETFONT to every child.
 fn refresh_fonts(dpi: u32) {
@@ -626,7 +741,7 @@ fn refresh_fonts(dpi: u32) {
         state
             .borrow()
             .as_ref()
-            .map(|popup| popup.dpi != dpi || popup.font.0.is_null())
+            .map(|popup| popup.dpi != dpi || popup.font.0.is_null() || popup.copy_font.0.is_null())
             .unwrap_or(false)
     });
     if !needs {
@@ -634,12 +749,20 @@ fn refresh_fonts(dpi: u32) {
     }
     let font = popup_font(dpi, false);
     let bold_font = popup_font(dpi, true);
+    let copy_font = match load_copy_font(dpi) {
+        Ok(font) => font,
+        Err(error) => {
+            eprintln!("Writely: could not load the copy icon font: {error}");
+            HFONT::default()
+        }
+    };
     let old = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let popup = state.as_mut()?;
-        let old = (popup.font, popup.bold_font);
+        let old = (popup.font, popup.bold_font, popup.copy_font);
         popup.font = font;
         popup.bold_font = bold_font;
+        popup.copy_font = copy_font;
         popup.dpi = dpi;
         let children = [
             (popup.header, bold_font),
@@ -648,6 +771,7 @@ fn refresh_fonts(dpi: u32) {
             (popup.style, font),
             (popup.cancel, font),
             (popup.replace, font),
+            (popup.copy, copy_font),
         ];
         for (child, child_font) in children {
             if !child_font.0.is_null() {
@@ -664,12 +788,15 @@ fn refresh_fonts(dpi: u32) {
         }
         Some(old)
     });
-    if let Some((old_font, old_bold)) = old {
+    if let Some((old_font, old_bold, old_copy)) = old {
         if old_font != font {
             delete_font(old_font);
         }
         if old_bold != bold_font {
             delete_font(old_bold);
+        }
+        if old_copy != copy_font {
+            delete_font(old_copy);
         }
     }
 }
@@ -865,6 +992,13 @@ fn ensure_window() -> Option<HWND> {
         WINDOW_STYLE(BS_PUSHBUTTON as u32),
         ID_CANCEL,
     )?;
+    let copy = make_child(
+        "BUTTON",
+        "\u{E8C8}",
+        WINDOW_EX_STYLE(0),
+        WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        ID_COPY,
+    )?;
     let replace = make_child(
         "BUTTON",
         "Replace",
@@ -872,6 +1006,53 @@ fn ensure_window() -> Option<HWND> {
         WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
         ID_REPLACE,
     )?;
+    // Owned tooltip window for the copy button ("Copy suggestion" / "Copied").
+    // It is destroyed with the popup, so there is nothing to free.
+    let tooltip = match unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST,
+            TOOLTIPS_CLASSW,
+            PCWSTR::null(),
+            WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            Some(window),
+            None,
+            Some(instance),
+            None,
+        )
+    } {
+        Ok(tooltip) => tooltip,
+        Err(error) => {
+            eprintln!("Writely: could not create the copy tooltip: {error}");
+            HWND::default()
+        }
+    };
+    if !tooltip.0.is_null() {
+        let text = wide("Copy suggestion");
+        let tool = TTTOOLINFOW {
+            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+            hwnd: window,
+            uId: copy.0 as usize,
+            lpszText: PWSTR(text.as_ptr() as *mut u16),
+            ..Default::default()
+        };
+        // SAFETY: tooltip is a live tooltip window and tool outlives the call.
+        let added = unsafe {
+            SendMessageW(
+                tooltip,
+                TTM_ADDTOOLW,
+                Some(WPARAM(0)),
+                Some(LPARAM(&tool as *const TTTOOLINFOW as isize)),
+            )
+        };
+        if added.0 == 0 {
+            eprintln!("Writely: could not add the copy tooltip.");
+        }
+    }
     STATE.with(|state| {
         *state.borrow_mut() = Some(PopupState {
             window,
@@ -884,9 +1065,12 @@ fn ensure_window() -> Option<HWND> {
             style,
             cancel,
             replace,
+            copy,
+            tooltip,
             selected: PopupTab::Correct,
             font: HFONT::default(),
             bold_font: HFONT::default(),
+            copy_font: HFONT::default(),
             dpi: 0,
             error: false,
             visible: false,
@@ -1093,6 +1277,7 @@ struct ChildHandles {
     style: HWND,
     cancel: HWND,
     replace: HWND,
+    copy: HWND,
 }
 
 // Copies the child handles out of STATE for one show.
@@ -1105,6 +1290,7 @@ fn handles() -> Option<ChildHandles> {
             style: popup.style,
             cancel: popup.cancel,
             replace: popup.replace,
+            copy: popup.copy,
         })
     })
 }
@@ -1231,6 +1417,7 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         style,
         cancel,
         replace,
+        copy,
     }) = handles()
     else {
         return;
@@ -1258,6 +1445,7 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
     );
     show_child(cancel, footer);
     show_child(replace, footer);
+    show_child(copy, shows_copy_button(footer, &current_primary_label()));
     if footer {
         let footer_y = HEADER_HEIGHT + body_height;
         set_child_pos(
@@ -1276,6 +1464,15 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
             BUTTON_HEIGHT,
             dpi,
         );
+        set_child_pos(
+            copy,
+            CARD_WIDTH - SIDE_PAD - BUTTON_WIDTH - 8 - BUTTON_WIDTH - 8 - COPY_BUTTON_WIDTH,
+            footer_y + 8,
+            COPY_BUTTON_WIDTH,
+            BUTTON_HEIGHT,
+            dpi,
+        );
+        set_copy_feedback(false);
         STATE.with(|state| {
             if let Some(popup) = state.borrow_mut().as_mut() {
                 popup.footer_y = scale(footer_y, dpi);
@@ -1312,6 +1509,7 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
         style,
         cancel,
         replace,
+        copy,
     }) = handles()
     else {
         return;
@@ -1374,6 +1572,10 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     set_child_pos(body, body_x, HEADER_HEIGHT, body_width, body_height, dpi);
     show_child(cancel, true);
     show_child(replace, show_replace);
+    show_child(
+        copy,
+        shows_copy_button(show_replace, &current_primary_label()),
+    );
     let footer_y = HEADER_HEIGHT + body_height;
     set_child_pos(
         style,
@@ -1399,6 +1601,15 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
         BUTTON_HEIGHT,
         dpi,
     );
+    set_child_pos(
+        copy,
+        CARD_WIDTH - SIDE_PAD - BUTTON_WIDTH - 8 - BUTTON_WIDTH - 8 - COPY_BUTTON_WIDTH,
+        footer_y + 8,
+        COPY_BUTTON_WIDTH,
+        BUTTON_HEIGHT,
+        dpi,
+    );
+    set_copy_feedback(false);
     STATE.with(|state| {
         if let Some(popup) = state.borrow_mut().as_mut() {
             popup.footer_y = scale(footer_y, dpi);
