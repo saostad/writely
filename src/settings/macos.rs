@@ -252,6 +252,9 @@ define_class!(
                 }
                 None => return,
             }
+            // settings.json is written: tell the tray once, even if a key save
+            // fails below.
+            super::notify_changed();
             if let Err(error) = crate::autostart::set_enabled(launch_at_login) {
                 set_status(status, &error, true);
                 return;
@@ -300,7 +303,6 @@ define_class!(
                 }
                 Err(error) => set_status(status, &error, true),
             }
-            super::notify_changed();
         }
 
         #[unsafe(method(removeClicked:))]

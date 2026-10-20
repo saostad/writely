@@ -422,6 +422,9 @@ pub fn show_settings() -> Result<(), String> {
                 set_status(&borrowed.status_label, &error, true);
                 return;
             }
+            // settings.json is written: tell the tray once, even if a key save
+            // fails below.
+            super::notify_changed();
             let launch_at_login = {
                 let borrowed = controls_for_save.borrow();
                 borrowed.settings.launch_at_login
@@ -474,7 +477,6 @@ pub fn show_settings() -> Result<(), String> {
                 Err(error) => set_status(&borrowed.status_label, &error, true),
             }
             drop(borrowed);
-            super::notify_changed();
         });
     }
     {

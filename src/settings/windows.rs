@@ -931,6 +931,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         }
                         None => return LRESULT(0),
                     }
+                    // settings.json is written: tell the tray once, even if a
+                    // key save fails below.
+                    super::notify_changed();
                     if let Err(error) = crate::autostart::set_enabled(launch_at_login) {
                         set_status(&error, true);
                         return LRESULT(0);
@@ -973,7 +976,6 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     set_status("Saved.", false);
                     set_edit_text(edit, "");
                     refresh_key_cue(edit, provider);
-                    super::notify_changed();
                 }
             } else if id == ID_REMOVE {
                 let edit = STATE.with(|state| state.borrow().as_ref().map(|handles| handles.edit));
