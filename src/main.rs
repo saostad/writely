@@ -37,6 +37,8 @@ pub enum UserEvent {
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     CopyClicked,
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    RetryClicked,
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     CopyFeedbackEnded(u64),
     PermissionGranted,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -119,6 +121,23 @@ fn selected_text(pending: &Pending) -> Option<&str> {
                 }
             }
         }
+    }
+}
+
+/// The selected rewrite style when Retry should re-request it: a rewrite tab
+/// that is neither cached nor in flight. The Correct tab never retries.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+fn rewrite_retry_style(pending: &Pending) -> Option<providers::RewriteStyle> {
+    match pending.selected {
+        popup::PopupTab::Rewrite(style) => {
+            let index = style_index(style);
+            if pending.rewrites[index].is_none() && !pending.rewrite_in_flight[index] {
+                Some(style)
+            } else {
+                None
+            }
+        }
+        popup::PopupTab::Correct => None,
     }
 }
 
@@ -537,6 +556,7 @@ fn handle_icon_clicked(
     generation: &mut u64,
     checking: &mut Option<Checking>,
     pending: &mut Option<Pending>,
+    failed_check: &mut Option<Checking>,
     last_anchor: &mut Option<CaretRect>,
     from_hotkey: bool,
 ) {
@@ -545,6 +565,7 @@ fn handle_icon_clicked(
     let my_generation = *generation;
     *pending = None;
     *checking = None;
+    *failed_check = None;
     // `live_pid` is only consumed by macOS-only paths below; keep the
     // binding on all targets and allow it to be unused elsewhere.
     #[cfg_attr(
@@ -764,6 +785,7 @@ fn handle_suggestion(
     result: Result<String, String>,
     checking: &mut Option<Checking>,
     pending: &mut Option<Pending>,
+    failed_check: &mut Option<Checking>,
     last_anchor: &mut Option<CaretRect>,
 ) {
     // Drop late replies: a newer click, or typing that hid the popup, wins.
@@ -772,9 +794,22 @@ fn handle_suggestion(
     }
     match result {
         Err(error) => {
-            *checking = None;
             *pending = None;
-            show_popup(&error, true, false, *last_anchor, None, last_anchor);
+            *failed_check = checking.take();
+            if let Some(failed) = failed_check.as_ref() {
+                if let Some(rect) =
+                    (*last_anchor).or(failed.snap.as_ref().map(|snap| snap.caret_rect))
+                {
+                    *last_anchor = Some(rect);
+                    popup::show_error_with_retry(&error, &rect);
+                } else {
+                    eprintln!(
+                        "Writely: could not show the suggestion: the caret position is unknown."
+                    );
+                }
+            } else {
+                show_popup(&error, true, false, *last_anchor, None, last_anchor);
+            }
         }
         Ok(suggestion) => {
             let Some(active) = checking.take() else {
@@ -804,6 +839,7 @@ fn handle_suggestion(
                                 text: looks_good_message(),
                                 is_error: false,
                                 loading: false,
+                                retry: false,
                             },
                             &rect,
                         );
@@ -883,6 +919,7 @@ fn show_rewrite_result(tab: popup::PopupTab, rewrite: &str, original: &str, anch
                     text: "This style doesn't change your text.",
                     is_error: false,
                     loading: false,
+                    retry: false,
                 },
                 anchor,
             );
@@ -894,6 +931,7 @@ fn show_rewrite_result(tab: popup::PopupTab, rewrite: &str, original: &str, anch
                     text: providers::UNCLEAR_MESSAGE,
                     is_error: false,
                     loading: false,
+                    retry: false,
                 },
                 anchor,
             );
@@ -939,6 +977,7 @@ fn handle_tab_clicked(
                         text: looks_good_message(),
                         is_error: false,
                         loading: false,
+                        retry: false,
                     },
                     &anchor,
                 );
@@ -957,6 +996,7 @@ fn handle_tab_clicked(
                         text: style.progress_text(),
                         is_error: false,
                         loading: true,
+                        retry: false,
                     },
                     &anchor,
                 );
@@ -967,6 +1007,7 @@ fn handle_tab_clicked(
                         text: style.progress_text(),
                         is_error: false,
                         loading: true,
+                        retry: false,
                     },
                     &anchor,
                 );
@@ -981,6 +1022,7 @@ fn handle_tab_clicked(
                                 text: &failure.message,
                                 is_error: failure.is_error,
                                 loading: false,
+                                retry: false,
                             },
                             &anchor,
                         );
@@ -998,6 +1040,7 @@ fn handle_tab_clicked(
                             text: &error,
                             is_error: true,
                             loading: false,
+                            retry: true,
                         },
                         &anchor,
                     );
@@ -1057,6 +1100,7 @@ fn handle_rewrite(
                                 text: &message,
                                 is_error: true,
                                 loading: false,
+                                retry: true,
                             },
                             &anchor,
                         );
@@ -1245,6 +1289,71 @@ fn handle_copy_clicked(
     }
 }
 
+/// Re-sends the failed request behind the Retry button: an uncached, idle
+/// rewrite on the selected tab, else the failed grammar check. Settings
+/// problems are shown without Retry; anything else does nothing.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn handle_retry_clicked(
+    proxy: &EventLoopProxy<UserEvent>,
+    generation: &mut u64,
+    checking: &mut Option<Checking>,
+    pending: &mut Option<Pending>,
+    failed_check: &mut Option<Checking>,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    if !popup::is_visible() {
+        return;
+    }
+    // Rewrite retry: the selected tab's style is still uncached and idle, so
+    // re-clicking the tab re-requests it and shows the loading state.
+    let retry_style = pending.as_ref().and_then(rewrite_retry_style);
+    if let Some(style) = retry_style {
+        handle_tab_clicked(
+            proxy,
+            popup::PopupTab::Rewrite(style),
+            *generation,
+            pending,
+            last_anchor,
+        );
+        return;
+    }
+    // Check retry: re-send the failed sentence with a new generation, so a
+    // stale reply from the failed request can't land.
+    let Some(active) = failed_check.take() else {
+        return;
+    };
+    *generation = generation.wrapping_add(1);
+    let my_generation = *generation;
+    show_popup("Checking…", false, false, *last_anchor, None, last_anchor);
+    let (app_settings, key) = match resolve_settings() {
+        Ok(loaded) => loaded,
+        Err(failure) => {
+            show_popup(
+                &failure.message,
+                failure.is_error,
+                false,
+                *last_anchor,
+                None,
+                last_anchor,
+            );
+            return;
+        }
+    };
+    let sentence = active.sentence.clone();
+    let anchor = *last_anchor;
+    *checking = Some(active);
+    spawn_check_thread(
+        proxy,
+        app_settings,
+        key,
+        sentence,
+        my_generation,
+        checking,
+        anchor,
+        last_anchor,
+    );
+}
+
 /// Start the caret watcher, logging failures the same way as startup.
 fn start_watcher(proxy: &EventLoopProxy<UserEvent>) -> Option<watcher::Watcher> {
     match watcher::Watcher::start(proxy.clone()) {
@@ -1401,6 +1510,7 @@ fn main() {
     let mut last_anchor: Option<CaretRect> = None;
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let mut copy_feedback_id: u64 = 0;
+    let mut failed_check: Option<Checking> = None;
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -1615,6 +1725,7 @@ fn main() {
                     generation = generation.wrapping_add(1);
                     checking = None;
                     pending = None;
+                    failed_check = None;
                 }
                 if let Some(watcher) = caret_watcher.as_mut() {
                     watcher.handle_caret_changed();
@@ -1648,6 +1759,7 @@ fn main() {
                     &mut generation,
                     &mut checking,
                     &mut pending,
+                    &mut failed_check,
                     &mut last_anchor,
                     false,
                 );
@@ -1658,6 +1770,7 @@ fn main() {
                     &mut generation,
                     &mut checking,
                     &mut pending,
+                    &mut failed_check,
                     &mut last_anchor,
                     true,
                 );
@@ -1680,6 +1793,17 @@ fn main() {
                 if id == copy_feedback_id {
                     popup::set_copy_feedback(false);
                 }
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Event::UserEvent(UserEvent::RetryClicked) => {
+                handle_retry_clicked(
+                    &watcher_proxy,
+                    &mut generation,
+                    &mut checking,
+                    &mut pending,
+                    &mut failed_check,
+                    &mut last_anchor,
+                );
             }
             Event::UserEvent(UserEvent::TabClicked(tab)) => {
                 handle_tab_clicked(
@@ -1724,6 +1848,7 @@ fn main() {
                     result,
                     &mut checking,
                     &mut pending,
+                    &mut failed_check,
                     &mut last_anchor,
                 );
             }
@@ -1754,7 +1879,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{dimmed_rgba, pause_item_text, selected_text, style_index, Pending};
+    use super::{
+        dimmed_rgba, pause_item_text, rewrite_retry_style, selected_text, style_index, Pending,
+    };
     use crate::popup::PopupTab;
     use crate::providers::RewriteStyle;
 
@@ -1840,5 +1967,28 @@ mod tests {
         pending.rewrites[style_index(RewriteStyle::Friendly)] =
             Some("She go to school.".to_string());
         assert_eq!(selected_text(&pending), None);
+    }
+
+    #[test]
+    fn rewrite_retry_style_correct_tab_never_retries() {
+        let pending = test_pending();
+        assert_eq!(pending.selected, PopupTab::Correct);
+        assert_eq!(rewrite_retry_style(&pending), None);
+    }
+
+    #[test]
+    fn rewrite_retry_style_rewrite_tab() {
+        // Uncached and not in flight: retry re-requests the style.
+        let mut pending = test_pending();
+        pending.selected = PopupTab::Rewrite(RewriteStyle::Friendly);
+        assert_eq!(rewrite_retry_style(&pending), Some(RewriteStyle::Friendly));
+        // Cached: nothing to re-request.
+        pending.rewrites[style_index(RewriteStyle::Friendly)] =
+            Some("She goes to school, you know!".to_string());
+        assert_eq!(rewrite_retry_style(&pending), None);
+        // In flight: the running request wins.
+        pending.rewrites[style_index(RewriteStyle::Friendly)] = None;
+        pending.rewrite_in_flight[style_index(RewriteStyle::Friendly)] = true;
+        assert_eq!(rewrite_retry_style(&pending), None);
     }
 }

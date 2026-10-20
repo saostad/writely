@@ -53,6 +53,22 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
     }
 }
 
+/// Red error text with a Cancel + Retry footer (no style menu, no copy button).
+pub fn show_error_with_retry(text: &str, caret: &CaretRect) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::show_error_with_retry(text, caret);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::show_error_with_retry(text, caret);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        show_message(text, true, false, caret);
+    }
+}
+
 /// Shows the suggestion with the Cancel/Replace footer. Only used on Linux:
 /// macOS and Windows show every suggestion through `show_tabbed`, while Linux
 /// has no diff view and falls back to the plain suggestion text.
@@ -82,6 +98,7 @@ pub enum TabContent<'a> {
         text: &'a str,
         is_error: bool,
         loading: bool,
+        retry: bool,
     },
 }
 
@@ -108,8 +125,10 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
                 text,
                 is_error,
                 loading,
+                retry,
             } => {
                 let _ = loading;
+                let _ = retry;
                 show_message(text, is_error, false, caret);
             }
         }
