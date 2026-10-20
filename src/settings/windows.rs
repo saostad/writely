@@ -353,6 +353,7 @@ struct Handles {
     dpi: u32,
     error: bool,
     settings: AppSettings,
+    draft_keys: [String; 3],
 }
 
 thread_local! {
@@ -935,18 +936,41 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                         return LRESULT(0);
                     }
                     super::set_autostart_message(None);
+                    // File the box text under the current provider, then save
+                    // every non-empty draft under its own provider. On the
+                    // first failure the remaining drafts are kept, so nothing
+                    // is lost.
                     let value = read_edit_text(edit);
-                    if value.trim().is_empty() {
-                        set_status("Saved.", false);
-                    } else {
-                        match super::save_api_key_for(provider, &value) {
-                            Ok(()) => set_status("Saved.", false),
-                            Err(error) => {
-                                set_status(&error, true);
-                                return LRESULT(0);
-                            }
+                    STATE.with(|state| {
+                        if let Some(handles) = state.borrow_mut().as_mut() {
+                            super::file_key_draft(&mut handles.draft_keys, provider, &value);
                         }
+                    });
+                    let pending = STATE.with(|state| {
+                        state
+                            .borrow()
+                            .as_ref()
+                            .map(|handles| super::pending_key_drafts(&handles.draft_keys))
+                            .unwrap_or_default()
+                    });
+                    for (draft_provider, draft_key) in &pending {
+                        if let Err(error) = super::save_api_key_for(*draft_provider, draft_key) {
+                            set_status(
+                                &format!(
+                                    "Could not save the {} key: {error}",
+                                    draft_provider.display_name()
+                                ),
+                                true,
+                            );
+                            return LRESULT(0);
+                        }
+                        STATE.with(|state| {
+                            if let Some(handles) = state.borrow_mut().as_mut() {
+                                super::clear_key_draft(&mut handles.draft_keys, *draft_provider);
+                            }
+                        });
                     }
+                    set_status("Saved.", false);
                     set_edit_text(edit, "");
                     refresh_key_cue(edit, provider);
                 }
@@ -956,6 +980,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     let provider = current_provider();
                     match super::remove_api_key_for(provider) {
                         Ok(()) => {
+                            STATE.with(|state| {
+                                if let Some(handles) = state.borrow_mut().as_mut() {
+                                    super::clear_key_draft(&mut handles.draft_keys, provider);
+                                }
+                            });
                             set_edit_text(edit, "");
                             refresh_key_cue(edit, provider);
                             set_status("Key removed.", false);
@@ -964,9 +993,34 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     }
                 }
             } else if id as u32 == ID_PROVIDER as u32 && notification == CBN_SELCHANGE {
-                // Stash the model text for the previous provider first, so
+                // File the key box text under the shown provider first (before
+                // stash_draft moves settings.provider), so a typed key stays
+                // with its provider instead of being saved under the new one.
+                STATE.with(|state| {
+                    if let Some(handles) = state.borrow_mut().as_mut() {
+                        let shown = handles.settings.provider;
+                        let text = read_edit_text(handles.edit);
+                        super::file_key_draft(&mut handles.draft_keys, shown, &text);
+                    }
+                });
+                // Stash the model text for the previous provider, so
                 // switching providers keeps each one's model.
                 stash_draft();
+                // Show the new provider's draft (empty when none). The text is
+                // set after the borrow ends: SetWindowTextW can repaint
+                // synchronously, and WM_CTLCOLORSTATIC reads STATE again.
+                let pending_text = STATE.with(|state| {
+                    state.borrow().as_ref().map(|handles| {
+                        let provider = provider_at(combo_selection(handles.provider_combo));
+                        (
+                            handles.edit,
+                            super::restore_key_draft(&handles.draft_keys, provider).to_string(),
+                        )
+                    })
+                });
+                if let Some((edit, draft)) = pending_text {
+                    set_edit_text(edit, &draft);
+                }
                 refresh_provider_rows();
             }
             LRESULT(0)
@@ -1393,6 +1447,7 @@ pub fn show_settings() -> Result<(), String> {
             dpi,
             error: false,
             settings,
+            draft_keys: [String::new(), String::new(), String::new()],
         });
     });
     let provider = current_provider();

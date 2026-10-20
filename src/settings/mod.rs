@@ -162,6 +162,65 @@ pub fn has_api_key_for(provider: crate::config::Provider) -> Result<bool, String
     load_api_key_for(provider).map(|key| key.is_some())
 }
 
+/// Slot in a `[String; 3]` key-draft store, in provider order (Gemini,
+/// Together, Ollama). Ollama needs no key, so it has no slot: a typed key is
+/// never filed or restored for it.
+pub(crate) fn draft_slot(provider: crate::config::Provider) -> Option<usize> {
+    match provider {
+        crate::config::Provider::Gemini => Some(0),
+        crate::config::Provider::Together => Some(1),
+        crate::config::Provider::Ollama => None,
+    }
+}
+
+/// Files the key box's current text under the shown provider. Empty (or
+/// whitespace-only) text clears that provider's draft. Ollama is never filed.
+pub(crate) fn file_key_draft(drafts: &mut [String; 3], shown: crate::config::Provider, text: &str) {
+    if let Some(slot) = draft_slot(shown) {
+        if text.trim().is_empty() {
+            drafts[slot].clear();
+        } else {
+            drafts[slot] = text.to_string();
+        }
+    }
+}
+
+/// The draft to show in the key box for `provider` (empty when none).
+/// Always empty for Ollama.
+pub(crate) fn restore_key_draft(drafts: &[String; 3], provider: crate::config::Provider) -> &str {
+    match draft_slot(provider) {
+        Some(slot) => &drafts[slot],
+        None => "",
+    }
+}
+
+/// Every non-empty draft in provider order, each with its own provider, for
+/// Save. Keys are trimmed; Ollama never has one.
+pub(crate) fn pending_key_drafts(drafts: &[String; 3]) -> Vec<(crate::config::Provider, String)> {
+    [
+        crate::config::Provider::Gemini,
+        crate::config::Provider::Together,
+    ]
+    .into_iter()
+    .filter_map(|provider| {
+        let slot = draft_slot(provider)?;
+        let key = drafts[slot].trim();
+        if key.is_empty() {
+            None
+        } else {
+            Some((provider, key.to_string()))
+        }
+    })
+    .collect()
+}
+
+/// Drops one provider's draft (Remove key, or after its key is saved).
+pub(crate) fn clear_key_draft(drafts: &mut [String; 3], provider: crate::config::Provider) {
+    if let Some(slot) = draft_slot(provider) {
+        drafts[slot].clear();
+    }
+}
+
 pub fn load_api_key() -> Result<Option<String>, String> {
     let entry = keyring_entry()
         .map_err(|e| format!("Could not read the key from the system keychain: {e}"))?;
@@ -238,7 +297,10 @@ pub fn show_settings() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_api_key;
+    use super::{
+        clear_key_draft, file_key_draft, pending_key_drafts, restore_key_draft, validate_api_key,
+    };
+    use crate::config::Provider;
 
     #[test]
     fn trims_surrounding_whitespace() {
@@ -277,6 +339,62 @@ mod tests {
         assert_eq!(
             validate_api_key("ab cd").expect("key should be valid"),
             "ab cd"
+        );
+    }
+
+    #[test]
+    fn draft_round_trip_gemini_together_gemini() {
+        let mut drafts = [String::new(), String::new(), String::new()];
+        // Type a Gemini key, then switch to Together: the Together box is empty.
+        file_key_draft(&mut drafts, Provider::Gemini, "gemini-key");
+        assert_eq!(restore_key_draft(&drafts, Provider::Together), "");
+        // Type a Together key, then switch back: the Gemini text is restored.
+        file_key_draft(&mut drafts, Provider::Together, "together-key");
+        assert_eq!(restore_key_draft(&drafts, Provider::Gemini), "gemini-key");
+        // Each draft saves under its own provider.
+        assert_eq!(
+            pending_key_drafts(&drafts),
+            vec![
+                (Provider::Gemini, "gemini-key".to_string()),
+                (Provider::Together, "together-key".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ollama_is_never_filed() {
+        let mut drafts = [String::new(), String::new(), String::new()];
+        file_key_draft(&mut drafts, Provider::Gemini, "gemini-key");
+        file_key_draft(&mut drafts, Provider::Ollama, "should-not-store");
+        assert_eq!(restore_key_draft(&drafts, Provider::Ollama), "");
+        assert!(drafts.iter().all(|draft| draft != "should-not-store"));
+        // The Ollama filing left the other drafts alone.
+        assert_eq!(restore_key_draft(&drafts, Provider::Gemini), "gemini-key");
+        assert_eq!(pending_key_drafts(&drafts).len(), 1);
+    }
+
+    #[test]
+    fn empty_text_clears_the_draft() {
+        let mut drafts = [String::new(), String::new(), String::new()];
+        file_key_draft(&mut drafts, Provider::Gemini, "gemini-key");
+        file_key_draft(&mut drafts, Provider::Gemini, "");
+        assert_eq!(restore_key_draft(&drafts, Provider::Gemini), "");
+        file_key_draft(&mut drafts, Provider::Together, "together-key");
+        file_key_draft(&mut drafts, Provider::Together, "   \t\n ");
+        assert_eq!(restore_key_draft(&drafts, Provider::Together), "");
+        assert!(pending_key_drafts(&drafts).is_empty());
+    }
+
+    #[test]
+    fn clearing_drops_one_draft() {
+        let mut drafts = [String::new(), String::new(), String::new()];
+        file_key_draft(&mut drafts, Provider::Gemini, "gemini-key");
+        file_key_draft(&mut drafts, Provider::Together, "together-key");
+        clear_key_draft(&mut drafts, Provider::Gemini);
+        assert_eq!(restore_key_draft(&drafts, Provider::Gemini), "");
+        assert_eq!(
+            restore_key_draft(&drafts, Provider::Together),
+            "together-key"
         );
     }
 }

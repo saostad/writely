@@ -257,18 +257,41 @@ define_class!(
                 return;
             }
             super::set_autostart_message(None);
+            // File the box text under the current provider, then save every
+            // non-empty draft under its own provider. On the first failure the
+            // remaining drafts are kept, so nothing is lost.
             let value = field.stringValue().to_string();
-            if value.trim().is_empty() {
-                set_status(status, "Saved.", false);
-            } else {
-                match super::save_api_key_for(provider, &value) {
-                    Ok(()) => set_status(status, "Saved.", false),
-                    Err(error) => {
-                        set_status(status, &error, true);
-                        return;
-                    }
+            STATE.with(|state| {
+                if let Some(window_state) = state.borrow_mut().as_mut() {
+                    super::file_key_draft(&mut window_state.draft_keys, provider, &value);
                 }
+            });
+            let pending = STATE.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .map(|window_state| super::pending_key_drafts(&window_state.draft_keys))
+                    .unwrap_or_default()
+            });
+            for (draft_provider, draft_key) in &pending {
+                if let Err(error) = super::save_api_key_for(*draft_provider, draft_key) {
+                    set_status(
+                        status,
+                        &format!(
+                            "Could not save the {} key: {error}",
+                            draft_provider.display_name()
+                        ),
+                        true,
+                    );
+                    return;
+                }
+                STATE.with(|state| {
+                    if let Some(window_state) = state.borrow_mut().as_mut() {
+                        super::clear_key_draft(&mut window_state.draft_keys, *draft_provider);
+                    }
+                });
             }
+            set_status(status, "Saved.", false);
             field.setStringValue(&NSString::from_str(""));
             match super::has_api_key_for(provider) {
                 Ok(true) => field.setPlaceholderString(Some(&NSString::from_str("••••••••"))),
@@ -290,6 +313,11 @@ define_class!(
             let provider = read_draft().map(|draft| draft.0).unwrap_or(Provider::Gemini);
             match super::remove_api_key_for(provider) {
                 Ok(()) => {
+                    STATE.with(|state| {
+                        if let Some(window_state) = state.borrow_mut().as_mut() {
+                            super::clear_key_draft(&mut window_state.draft_keys, provider);
+                        }
+                    });
                     field.setStringValue(&NSString::from_str(""));
                     field.setPlaceholderString(Some(&NSString::from_str("Paste your key here")));
                     set_status(status, "Key removed.", false);
@@ -328,9 +356,37 @@ define_class!(
 
         #[unsafe(method(providerChanged:))]
         fn provider_changed(&self, _sender: Option<&AnyObject>) {
-            // Stash the model text into the draft for the previous provider
-            // first, so switching providers keeps each one's model.
+            // File the key box text under the shown provider first (before
+            // stash_draft moves settings.provider), so a typed key stays with
+            // its provider instead of being saved under the new one.
+            if let Some(field) = self.ivars().field.get() {
+                let text = field.stringValue().to_string();
+                STATE.with(|state| {
+                    if let Some(window_state) = state.borrow_mut().as_mut() {
+                        let shown = window_state.settings.provider;
+                        super::file_key_draft(&mut window_state.draft_keys, shown, &text);
+                    }
+                });
+            }
+            // Stash the model text into the draft for the previous provider,
+            // so switching providers keeps each one's model.
             stash_draft();
+            // Show the new provider's draft (empty when none).
+            if let Some(field) = self.ivars().field.get() {
+                let draft = STATE.with(|state| {
+                    state
+                        .borrow()
+                        .as_ref()
+                        .map(|window_state| {
+                            let provider = provider_at(
+                                window_state.provider_popup.indexOfSelectedItem(),
+                            );
+                            super::restore_key_draft(&window_state.draft_keys, provider).to_string()
+                        })
+                        .unwrap_or_default()
+                });
+                field.setStringValue(&NSString::from_str(&draft));
+            }
             refresh_provider_rows();
         }
 
@@ -407,6 +463,7 @@ struct WindowState {
     autostart_checkbox: Retained<NSButton>,
     clipboard_checkbox: Retained<NSButton>,
     settings: AppSettings,
+    draft_keys: [String; 3],
 }
 
 thread_local! {
@@ -843,6 +900,7 @@ pub fn show_settings() -> Result<(), String> {
             autostart_checkbox: autostart_checkbox.clone(),
             clipboard_checkbox: clipboard_checkbox.clone(),
             settings,
+            draft_keys: [String::new(), String::new(), String::new()],
         });
     });
 

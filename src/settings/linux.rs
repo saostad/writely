@@ -111,6 +111,7 @@ struct Controls {
     autostart_check: CheckButton,
     status_label: Label,
     settings: AppSettings,
+    draft_keys: [String; 3],
 }
 
 /// Refreshes the provider-dependent rows for the selected provider: the model
@@ -358,15 +359,34 @@ pub fn show_settings() -> Result<(), String> {
         autostart_check: autostart_check.clone(),
         status_label: status_label.clone(),
         settings,
+        draft_keys: [String::new(), String::new(), String::new()],
     }));
     refresh_provider_rows(&controls);
 
     {
         let controls_for_provider = controls.clone();
         provider_combo.connect_changed(move |_| {
-            // Stash the model text for the previous provider first, so
-            // switching providers keeps each one's model.
+            // File the key box text under the shown provider first (before
+            // stash_draft moves settings.provider), so a typed key stays with
+            // its provider instead of being saved under the new one.
+            {
+                let borrowed = controls_for_provider.borrow();
+                let shown = borrowed.settings.provider;
+                let text = borrowed.key_entry.text().to_string();
+                drop(borrowed);
+                let mut borrowed = controls_for_provider.borrow_mut();
+                super::file_key_draft(&mut borrowed.draft_keys, shown, &text);
+            }
+            // Stash the model text for the previous provider, so switching
+            // providers keeps each one's model.
             stash_draft(&controls_for_provider);
+            // Show the new provider's draft (empty when none).
+            {
+                let borrowed = controls_for_provider.borrow();
+                let provider = provider_at(borrowed.provider_combo.active().unwrap_or(0));
+                let draft = super::restore_key_draft(&borrowed.draft_keys, provider).to_string();
+                borrowed.key_entry.set_text(&draft);
+            }
             refresh_provider_rows(&controls_for_provider);
         });
     }
@@ -410,19 +430,37 @@ pub fn show_settings() -> Result<(), String> {
             }
             super::set_autostart_message(None);
             let _ = (effort, url);
-            let borrowed = controls_for_save.borrow();
-            if key.trim().is_empty() {
-                set_status(&borrowed.status_label, "Saved.", false);
-            } else {
-                match super::save_api_key_for(provider, &key) {
-                    Ok(()) => set_status(&borrowed.status_label, "Saved.", false),
-                    Err(error) => {
-                        set_status(&borrowed.status_label, &error, true);
-                        return;
-                    }
-                }
+            // File the box text under the current provider, then save every
+            // non-empty draft under its own provider. On the first failure the
+            // remaining drafts are kept, so nothing is lost.
+            {
+                let mut borrowed = controls_for_save.borrow_mut();
+                super::file_key_draft(&mut borrowed.draft_keys, provider, &key);
             }
-            drop(borrowed);
+            let pending = {
+                let borrowed = controls_for_save.borrow();
+                super::pending_key_drafts(&borrowed.draft_keys)
+            };
+            for (draft_provider, draft_key) in &pending {
+                if let Err(error) = super::save_api_key_for(*draft_provider, draft_key) {
+                    let borrowed = controls_for_save.borrow();
+                    set_status(
+                        &borrowed.status_label,
+                        &format!(
+                            "Could not save the {} key: {error}",
+                            draft_provider.display_name()
+                        ),
+                        true,
+                    );
+                    return;
+                }
+                let mut borrowed = controls_for_save.borrow_mut();
+                super::clear_key_draft(&mut borrowed.draft_keys, *draft_provider);
+            }
+            {
+                let borrowed = controls_for_save.borrow();
+                set_status(&borrowed.status_label, "Saved.", false);
+            }
             let borrowed = controls_for_save.borrow();
             borrowed.key_entry.set_text("");
             match super::has_api_key_for(provider) {
@@ -441,9 +479,10 @@ pub fn show_settings() -> Result<(), String> {
                 let borrowed = controls_for_remove.borrow();
                 provider_at(borrowed.provider_combo.active().unwrap_or(0))
             };
-            let borrowed = controls_for_remove.borrow();
+            let mut borrowed = controls_for_remove.borrow_mut();
             match super::remove_api_key_for(provider) {
                 Ok(()) => {
+                    super::clear_key_draft(&mut borrowed.draft_keys, provider);
                     borrowed.key_entry.set_text("");
                     borrowed
                         .key_entry
