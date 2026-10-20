@@ -42,6 +42,11 @@ pub enum UserEvent {
     CopyFeedbackEnded(u64),
     PermissionGranted,
     SettingsChanged,
+    ProviderMenuState {
+        id: u64,
+        current: config::Provider,
+        ready: [bool; 3],
+    },
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     CopiedText {
         generation: u64,
@@ -1447,36 +1452,74 @@ fn update_tray_paused(tray: &TrayIcon, paused: bool) {
     }
 }
 
-/// Refreshes the Provider submenu: each item is checked iff it is the saved
-/// provider, and shows "(not set up)" when it has no model or (except Ollama)
-/// no saved key. A settings load error leaves the items unchanged.
-fn refresh_provider_menu(items: &[(config::Provider, CheckMenuItem)]) {
-    let settings = match config::load_settings() {
-        Ok(settings) => settings,
-        Err(error) => {
-            eprintln!("Writely: {error}");
-            return;
-        }
-    };
-    for (provider, item) in items {
-        let has_key = if *provider == config::Provider::Ollama {
-            false
-        } else {
-            match settings::has_api_key_for(*provider) {
-                Ok(has_key) => has_key,
+/// Index into a `ProviderMenuState` readiness array (Gemini, Together, Ollama).
+fn ready_index(provider: config::Provider) -> usize {
+    match provider {
+        config::Provider::Gemini => 0,
+        config::Provider::Together => 1,
+        config::Provider::Ollama => 2,
+    }
+}
+
+/// The Provider submenu label: the display name when ready, otherwise
+/// "{name} (not set up)".
+fn provider_item_text(provider: config::Provider, ready: bool) -> String {
+    if ready {
+        provider.display_name().to_string()
+    } else {
+        format!("{} (not set up)", provider.display_name())
+    }
+}
+
+/// Requests a Provider submenu refresh off the main thread: bumps the id and
+/// spawns a `writely-provider-menu` thread that loads the settings and keys,
+/// then sends `UserEvent::ProviderMenuState`. A load error sends nothing so
+/// the items stay unchanged.
+fn request_provider_menu_refresh(proxy: &EventLoopProxy<UserEvent>, menu_refresh_id: &mut u64) {
+    *menu_refresh_id = menu_refresh_id.wrapping_add(1);
+    let id = *menu_refresh_id;
+    let proxy = proxy.clone();
+    let spawn = std::thread::Builder::new()
+        .name("writely-provider-menu".to_string())
+        .spawn(move || {
+            let settings = match config::load_settings() {
+                Ok(settings) => settings,
                 Err(error) => {
                     eprintln!("Writely: {error}");
-                    false
+                    return;
                 }
+            };
+            let providers = [
+                config::Provider::Gemini,
+                config::Provider::Together,
+                config::Provider::Ollama,
+            ];
+            let mut ready = [false; 3];
+            for (index, provider) in providers.iter().enumerate() {
+                let has_key = if *provider == config::Provider::Ollama {
+                    false
+                } else {
+                    match settings::has_api_key_for(*provider) {
+                        Ok(has_key) => has_key,
+                        Err(error) => {
+                            eprintln!("Writely: {error}");
+                            false
+                        }
+                    }
+                };
+                ready[index] =
+                    config::provider_ready(*provider, &settings.model_for(*provider), has_key);
             }
-        };
-        let ready = config::provider_ready(*provider, &settings.model_for(*provider), has_key);
-        item.set_checked(settings.provider == *provider);
-        if ready {
-            item.set_text(provider.display_name());
-        } else {
-            item.set_text(format!("{} (not set up)", provider.display_name()));
-        }
+            if let Err(error) = proxy.send_event(UserEvent::ProviderMenuState {
+                id,
+                current: settings.provider,
+                ready,
+            }) {
+                eprintln!("Writely: could not refresh the Provider menu: {error}");
+            }
+        });
+    if let Err(error) = spawn {
+        eprintln!("Writely: could not refresh the Provider menu: {error}");
     }
 }
 
@@ -1532,6 +1575,8 @@ fn main() {
     let mut pause_id = tray_icon::menu::MenuId::new("pause");
     let mut pause_item: Option<MenuItem> = None;
     let mut provider_items: Vec<(config::Provider, CheckMenuItem)> = Vec::new();
+    let mut menu_refresh_id: u64 = 0;
+    let mut provider_menu_state: Option<(config::Provider, [bool; 3])> = None;
     let mut quit_id = tray_icon::menu::MenuId::new("quit");
     #[cfg(target_os = "linux")]
     let mut check_text_id = tray_icon::menu::MenuId::new("check-text");
@@ -1677,7 +1722,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-                refresh_provider_menu(&provider_items);
+                request_provider_menu_refresh(&watcher_proxy, &mut menu_refresh_id);
 
                 if watcher::is_wayland_session() {
                     const WAITING: &str = "On Wayland, Writely can't see what you type in other apps. Open “Check text…” from the Writely menu and paste your text there.";
@@ -1762,6 +1807,11 @@ fn main() {
                     checking = None;
                     pending = None;
                     failed_check = None;
+                    // A CheckMenuItem toggles itself on click; undo that
+                    // instantly so the clicked item shows checked right away.
+                    for (listed, item) in &provider_items {
+                        item.set_checked(*listed == provider);
+                    }
                     match config::switch_provider(provider) {
                         Err(error) => {
                             let detail = format!(
@@ -1770,34 +1820,29 @@ fn main() {
                             );
                             eprintln!("Writely: {detail}");
                             settings::set_provider_message(Some(detail));
-                            refresh_provider_menu(&provider_items);
+                            request_provider_menu_refresh(
+                                &watcher_proxy,
+                                &mut menu_refresh_id,
+                            );
                             if let Err(error) = settings::show_settings() {
                                 eprintln!("Writely: {error}");
                             }
                         }
                         Ok(()) => {
-                            // A CheckMenuItem toggles itself on click; the
-                            // refresh resets the check to the saved provider.
-                            refresh_provider_menu(&provider_items);
-                            let ready = config::load_settings()
-                                .map(|settings| {
-                                    let has_key = if provider == config::Provider::Ollama {
-                                        false
-                                    } else {
-                                        settings::has_api_key_for(provider).unwrap_or(false)
-                                    };
-                                    config::provider_ready(
-                                        provider,
-                                        &settings.model_for(provider),
-                                        has_key,
-                                    )
-                                })
-                                .unwrap_or(false);
+                            // The cached readiness is what the menu label
+                            // showed; with no cache yet treat it as ready.
+                            let ready = provider_menu_state
+                                .map(|(_, ready)| ready[ready_index(provider)])
+                                .unwrap_or(true);
                             if ready {
                                 eprintln!("Writely: switched to {}.", provider.display_name());
                             } else if let Err(error) = settings::show_settings() {
                                 eprintln!("Writely: {error}");
                             }
+                            request_provider_menu_refresh(
+                                &watcher_proxy,
+                                &mut menu_refresh_id,
+                            );
                         }
                     }
                 }
@@ -1937,7 +1982,36 @@ fn main() {
                 handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon, paused);
             }
             Event::UserEvent(UserEvent::SettingsChanged) => {
-                refresh_provider_menu(&provider_items);
+                request_provider_menu_refresh(&watcher_proxy, &mut menu_refresh_id);
+            }
+            Event::UserEvent(UserEvent::ProviderMenuState { id, current, ready }) => {
+                // A stale reply must not overwrite a newer one. Memory updates
+                // only: no file or keychain access here.
+                if id == menu_refresh_id {
+                    for (provider, item) in &provider_items {
+                        let checked = current == *provider;
+                        let text = provider_item_text(*provider, ready[ready_index(*provider)]);
+                        match provider_menu_state {
+                            Some((previous, previous_ready)) => {
+                                if checked != (previous == *provider) {
+                                    item.set_checked(checked);
+                                }
+                                let was_text = provider_item_text(
+                                    *provider,
+                                    previous_ready[ready_index(*provider)],
+                                );
+                                if text != was_text {
+                                    item.set_text(text);
+                                }
+                            }
+                            None => {
+                                item.set_checked(checked);
+                                item.set_text(text);
+                            }
+                        }
+                    }
+                    provider_menu_state = Some((current, ready));
+                }
             }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             Event::UserEvent(UserEvent::CopiedText {
@@ -2002,8 +2076,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        dimmed_rgba, pause_item_text, rewrite_retry_style, selected_text, style_index, Pending,
+        dimmed_rgba, pause_item_text, provider_item_text, ready_index, rewrite_retry_style,
+        selected_text, style_index, Pending,
     };
+    use crate::config::Provider;
     use crate::popup::PopupTab;
     use crate::providers::RewriteStyle;
 
@@ -2112,5 +2188,31 @@ mod tests {
         pending.rewrites[style_index(RewriteStyle::Friendly)] = None;
         pending.rewrite_in_flight[style_index(RewriteStyle::Friendly)] = true;
         assert_eq!(rewrite_retry_style(&pending), None);
+    }
+
+    #[test]
+    fn ready_index_follows_provider_order() {
+        assert_eq!(ready_index(Provider::Gemini), 0);
+        assert_eq!(ready_index(Provider::Together), 1);
+        assert_eq!(ready_index(Provider::Ollama), 2);
+    }
+
+    #[test]
+    fn provider_item_text_marks_not_ready() {
+        assert_eq!(provider_item_text(Provider::Gemini, true), "Gemini");
+        assert_eq!(provider_item_text(Provider::Together, true), "Together AI");
+        assert_eq!(provider_item_text(Provider::Ollama, true), "Ollama");
+        assert_eq!(
+            provider_item_text(Provider::Gemini, false),
+            "Gemini (not set up)"
+        );
+        assert_eq!(
+            provider_item_text(Provider::Together, false),
+            "Together AI (not set up)"
+        );
+        assert_eq!(
+            provider_item_text(Provider::Ollama, false),
+            "Ollama (not set up)"
+        );
     }
 }
