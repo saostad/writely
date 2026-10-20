@@ -173,8 +173,11 @@ fn stash_draft(controls: &Rc<RefCell<Controls>>) {
     let url = borrowed.url_entry.text().to_string();
     drop(borrowed);
     let mut borrowed = controls.borrow_mut();
+    // The model entry still shows the draft provider's model: on a provider
+    // change the combo already has the new selection.
+    let shown = borrowed.settings.provider;
+    borrowed.settings.set_model(shown, model.trim());
     borrowed.settings.provider = provider;
-    borrowed.settings.set_model(provider, model.trim());
     borrowed.settings.effort = effort;
     borrowed.settings.launch_at_login = borrowed.autostart_check.is_active();
     if !url.trim().is_empty() {

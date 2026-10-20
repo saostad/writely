@@ -196,8 +196,11 @@ fn stash_draft() {
     {
         STATE.with(|state| {
             if let Some(window_state) = state.borrow_mut().as_mut() {
+                // The model field still shows the draft provider's model: on
+                // a provider change the popup already has the new selection.
+                let shown = window_state.settings.provider;
+                window_state.settings.set_model(shown, model.trim());
                 window_state.settings.provider = provider;
-                window_state.settings.set_model(provider, model.trim());
                 window_state.settings.effort = effort;
                 window_state.settings.launch_at_login = launch_at_login;
                 window_state.settings.clipboard_fallback = clipboard_fallback;

@@ -727,8 +727,11 @@ fn stash_draft() {
             let model = read_edit_text(handles.model_edit);
             let effort = effort_at(combo_selection(handles.effort_combo));
             let url = read_edit_text(handles.url_edit);
+            // The model box still shows the draft provider's model: on a
+            // provider change the combo already has the new selection.
+            let shown = handles.settings.provider;
+            handles.settings.set_model(shown, model.trim());
             handles.settings.provider = provider;
-            handles.settings.set_model(provider, model.trim());
             handles.settings.effort = effort;
             handles.settings.launch_at_login = checkbox_checked(handles.autostart_checkbox);
             handles.settings.clipboard_fallback = checkbox_checked(handles.clipboard_checkbox);
