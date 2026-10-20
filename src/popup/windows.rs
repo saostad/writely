@@ -68,6 +68,7 @@ const ID_CANCEL: i32 = 2002;
 const ID_REPLACE: i32 = 2003;
 const ID_STYLE: i32 = 2004;
 const ID_COPY: i32 = 2005;
+const ID_RETRY: i32 = 2006;
 const SPINNER_TIMER_ID: usize = 1;
 const SPINNER_SIZE: i32 = 16;
 
@@ -89,6 +90,7 @@ struct PopupState {
     style: HWND,
     cancel: HWND,
     replace: HWND,
+    retry: HWND,
     copy: HWND,
     tooltip: HWND,
     selected: PopupTab,
@@ -255,6 +257,14 @@ fn send_copy() {
     if let Some(proxy) = PROXY.get() {
         if let Err(error) = proxy.send_event(UserEvent::CopyClicked) {
             eprintln!("Writely: could not deliver the copy event: {error}");
+        }
+    }
+}
+
+fn send_retry() {
+    if let Some(proxy) = PROXY.get() {
+        if let Err(error) = proxy.send_event(UserEvent::RetryClicked) {
+            eprintln!("Writely: could not deliver the retry event: {error}");
         }
     }
 }
@@ -441,6 +451,7 @@ extern "system" fn popup_proc(
                     ID_CLOSE | ID_CANCEL => send_dismiss(),
                     ID_REPLACE => send_replace(),
                     ID_COPY => send_copy(),
+                    ID_RETRY => send_retry(),
                     ID_STYLE => show_style_menu(window),
                     _ => {}
                 }
@@ -771,6 +782,7 @@ fn refresh_fonts(dpi: u32) {
             (popup.style, font),
             (popup.cancel, font),
             (popup.replace, font),
+            (popup.retry, font),
             (popup.copy, copy_font),
         ];
         for (child, child_font) in children {
@@ -1006,6 +1018,13 @@ fn ensure_window() -> Option<HWND> {
         WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
         ID_REPLACE,
     )?;
+    let retry = make_child(
+        "BUTTON",
+        "Retry",
+        WINDOW_EX_STYLE(0),
+        WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        ID_RETRY,
+    )?;
     // Owned tooltip window for the copy button ("Copy suggestion" / "Copied").
     // It is destroyed with the popup, so there is nothing to free.
     let tooltip = match unsafe {
@@ -1065,6 +1084,7 @@ fn ensure_window() -> Option<HWND> {
             style,
             cancel,
             replace,
+            retry,
             copy,
             tooltip,
             selected: PopupTab::Correct,
@@ -1277,6 +1297,7 @@ struct ChildHandles {
     style: HWND,
     cancel: HWND,
     replace: HWND,
+    retry: HWND,
     copy: HWND,
 }
 
@@ -1290,6 +1311,7 @@ fn handles() -> Option<ChildHandles> {
             style: popup.style,
             cancel: popup.cancel,
             replace: popup.replace,
+            retry: popup.retry,
             copy: popup.copy,
         })
     })
@@ -1406,7 +1428,30 @@ fn set_diff_text(body: HWND, original: &str, suggestion: &str) -> bool {
     true
 }
 
+/// Which footer the plain message lays out: no footer, Cancel + Replace, or
+/// Cancel + Retry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Footer {
+    None,
+    Replace,
+    Retry,
+}
+
 pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &CaretRect) {
+    let footer = if show_button {
+        Footer::Replace
+    } else {
+        Footer::None
+    };
+    layout_message(text, is_error, footer, caret);
+}
+
+/// Red error text with a Cancel + Retry footer (no style menu, no copy button).
+pub fn show_error_with_retry(text: &str, caret: &CaretRect) {
+    layout_message(text, true, Footer::Retry, caret);
+}
+
+fn layout_message(text: &str, is_error: bool, footer: Footer, caret: &CaretRect) {
     let Some(window) = ensure_window() else {
         return;
     };
@@ -1417,6 +1462,7 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         style,
         cancel,
         replace,
+        retry,
         copy,
     }) = handles()
     else {
@@ -1431,8 +1477,10 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         return;
     }
     let body_height = measure_body_height(body, dpi);
-    let footer = show_button;
-    let card_height = HEADER_HEIGHT + body_height + if footer { FOOTER_HEIGHT } else { 0 };
+    let has_footer = footer != Footer::None;
+    let show_replace = footer == Footer::Replace;
+    let show_retry = footer == Footer::Retry;
+    let card_height = HEADER_HEIGHT + body_height + if has_footer { FOOTER_HEIGHT } else { 0 };
     set_child_pos(header, SIDE_PAD, 4, 300, 20, dpi);
     set_child_pos(close, CARD_WIDTH - 36, 2, BUTTON_HEIGHT, BUTTON_HEIGHT, dpi);
     set_child_pos(
@@ -1443,10 +1491,14 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         body_height,
         dpi,
     );
-    show_child(cancel, footer);
-    show_child(replace, footer);
-    show_child(copy, shows_copy_button(footer, &current_primary_label()));
-    if footer {
+    show_child(cancel, has_footer);
+    show_child(replace, show_replace);
+    show_child(retry, show_retry);
+    show_child(
+        copy,
+        shows_copy_button(show_replace, &current_primary_label()),
+    );
+    if has_footer {
         let footer_y = HEADER_HEIGHT + body_height;
         set_child_pos(
             cancel,
@@ -1458,6 +1510,14 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         );
         set_child_pos(
             replace,
+            CARD_WIDTH - SIDE_PAD - BUTTON_WIDTH,
+            footer_y + 8,
+            BUTTON_WIDTH,
+            BUTTON_HEIGHT,
+            dpi,
+        );
+        set_child_pos(
+            retry,
             CARD_WIDTH - SIDE_PAD - BUTTON_WIDTH,
             footer_y + 8,
             BUTTON_WIDTH,
@@ -1509,6 +1569,7 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
         style,
         cancel,
         replace,
+        retry,
         copy,
     }) = handles()
     else {
@@ -1530,7 +1591,7 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
             popup.selected = selected;
         }
     });
-    let (is_error, loading, show_replace, indent) = match content {
+    let (is_error, loading, show_replace, show_retry, indent) = match content {
         TabContent::Diff {
             original,
             suggestion,
@@ -1538,17 +1599,18 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
             if !set_diff_text(body, original, suggestion) {
                 return;
             }
-            (false, false, true, false)
+            (false, false, true, false, false)
         }
         TabContent::Message {
             text,
             is_error,
             loading,
+            retry,
         } => {
             if !set_plain_text(body, text, is_error) {
                 return;
             }
-            (is_error, loading, false, loading)
+            (is_error, loading, false, retry, loading)
         }
     };
     if loading {
@@ -1572,6 +1634,7 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     set_child_pos(body, body_x, HEADER_HEIGHT, body_width, body_height, dpi);
     show_child(cancel, true);
     show_child(replace, show_replace);
+    show_child(retry, show_retry);
     show_child(
         copy,
         shows_copy_button(show_replace, &current_primary_label()),
@@ -1595,6 +1658,14 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
     );
     set_child_pos(
         replace,
+        CARD_WIDTH - SIDE_PAD - BUTTON_WIDTH,
+        footer_y + 8,
+        BUTTON_WIDTH,
+        BUTTON_HEIGHT,
+        dpi,
+    );
+    set_child_pos(
+        retry,
         CARD_WIDTH - SIDE_PAD - BUTTON_WIDTH,
         footer_y + 8,
         BUTTON_WIDTH,
@@ -1634,6 +1705,9 @@ pub fn hide() {
     }
     STATE.with(|state| {
         if let Some(popup) = state.borrow_mut().as_mut() {
+            // Every show path sets Retry explicitly; hide it here so it can
+            // never linger visible.
+            show_child(popup.retry, false);
             if popup.visible {
                 // SAFETY: window is a live popup window on this thread.
                 // ShowWindow reports the previous visibility, not success.
