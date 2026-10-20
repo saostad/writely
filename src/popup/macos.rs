@@ -78,6 +78,16 @@ define_class!(
                 }
             }
         }
+
+        #[unsafe(method(retryClicked:))]
+        fn retry_clicked(&self, _sender: Option<&AnyObject>) {
+            // Like Replace, but the main thread re-sends the failed request.
+            if let Some(proxy) = PROXY.get() {
+                if let Err(error) = proxy.send_event(UserEvent::RetryClicked) {
+                    eprintln!("Writely: could not deliver the retry event: {error}");
+                }
+            }
+        }
     }
 );
 
@@ -386,6 +396,7 @@ struct PopupState {
     separator: Retained<SeparatorView>,
     cancel_button: Retained<NSButton>,
     replace_button: Retained<NSButton>,
+    retry_button: Retained<NSButton>,
     copy_button: Retained<NSButton>,
     spinner: Retained<NSProgressIndicator>,
     style_button: Retained<NSPopUpButton>,
@@ -530,6 +541,22 @@ fn ensure_popup(mtm: MainThreadMarker) {
         replace_button.setKeyEquivalent(&NSString::from_str(""));
         card.addSubview(&replace_button);
 
+        // Retry button for failed requests: built like Replace, hidden until
+        // an error-with-retry layout shows it.
+        // SAFETY: replace target implements retryClicked: and lives in STATE while the panel is alive.
+        let retry_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Retry"),
+                Some(replace_object),
+                Some(sel!(retryClicked:)),
+                mtm,
+            )
+        };
+        retry_button.setBezelColor(Some(&NSColor::controlAccentColor()));
+        retry_button.setKeyEquivalent(&NSString::from_str(""));
+        retry_button.setHidden(true);
+        card.addSubview(&retry_button);
+
         // Image-only copy button left of Cancel; a text label when the SF
         // Symbol is missing on this macOS version.
         // SAFETY: replace target implements copyClicked: and lives in STATE while the panel is alive.
@@ -600,6 +627,7 @@ fn ensure_popup(mtm: MainThreadMarker) {
             separator,
             cancel_button,
             replace_button,
+            retry_button,
             copy_button,
             spinner,
             style_button,
@@ -657,9 +685,18 @@ fn remove_key_monitor() {
     });
 }
 
+/// Which footer the plain message lays out: no footer, Cancel + Replace, or
+/// Cancel + Retry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Footer {
+    None,
+    Replace,
+    Retry,
+}
+
 /// Lays out the card for plain `text` (messages and, until the diff lands,
 /// suggestions). Returns the panel height.
-fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
+fn layout_plain(text: &str, is_error: bool, footer: Footer) -> f64 {
     let panel_height = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(popup) = state.as_mut() else {
@@ -673,7 +710,7 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
             popup.text.setTextColor(Some(&NSColor::labelColor()));
         }
         // Loading state: a small spinning indicator before "Checking…".
-        let checking = text == "Checking…" && !is_error && !show_footer;
+        let checking = text == "Checking…" && !is_error && footer == Footer::None;
         let text_indent = if checking { 18.0 } else { 0.0 };
         let text_width = CARD_WIDTH - 2.0 * SIDE_PAD - text_indent;
         // SAFETY: the text container exists for a freshly created NSTextView.
@@ -698,8 +735,11 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
             }
         }
         let body_height = needed.clamp(BODY_MIN, BODY_MAX);
-        let footer = if show_footer { FOOTER_HEIGHT } else { 0.0 };
-        let panel_height = HEADER_HEIGHT + body_height + footer;
+        let has_footer = footer != Footer::None;
+        let show_replace = footer == Footer::Replace;
+        let show_retry = footer == Footer::Retry;
+        let footer_height = if has_footer { FOOTER_HEIGHT } else { 0.0 };
+        let panel_height = HEADER_HEIGHT + body_height + footer_height;
 
         popup.card.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
@@ -722,7 +762,7 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
             ));
         }
         popup.scroll.setFrame(NSRect::new(
-            NSPoint::new(4.0 + text_indent, footer),
+            NSPoint::new(4.0 + text_indent, footer_height),
             NSSize::new(CARD_WIDTH - 8.0 - text_indent, body_height),
         ));
         popup.text.setFrame(NSRect::new(
@@ -732,7 +772,7 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
         if checking {
             popup.spinner.setHidden(false);
             popup.spinner.setFrame(NSRect::new(
-                NSPoint::new(SIDE_PAD, footer + body_height - 16.0),
+                NSPoint::new(SIDE_PAD, footer_height + body_height - 16.0),
                 NSSize::new(14.0, 14.0),
             ));
             // SAFETY: the spinner is alive in STATE for the life of the popup.
@@ -743,18 +783,23 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
             popup.spinner.setHidden(true);
         }
         popup.style_button.setHidden(true);
-        popup.separator.setHidden(!show_footer);
-        if show_footer {
+        popup.separator.setHidden(!has_footer);
+        if has_footer {
             popup.separator.setFrame(NSRect::new(
-                NSPoint::new(0.0, footer),
+                NSPoint::new(0.0, footer_height),
                 NSSize::new(CARD_WIDTH, 1.0),
             ));
         }
-        popup.cancel_button.setHidden(!show_footer);
-        popup.replace_button.setHidden(!show_footer);
-        popup.copy_button.setHidden(!copy_visible(show_footer));
-        if show_footer {
+        popup.cancel_button.setHidden(!has_footer);
+        popup.replace_button.setHidden(!show_replace);
+        popup.retry_button.setHidden(!show_retry);
+        popup.copy_button.setHidden(!copy_visible(show_replace));
+        if has_footer {
             popup.replace_button.setFrame(NSRect::new(
+                NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
+                NSSize::new(90.0, 24.0),
+            ));
+            popup.retry_button.setFrame(NSRect::new(
                 NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
                 NSSize::new(90.0, 24.0),
             ));
@@ -772,7 +817,7 @@ fn layout_plain(text: &str, is_error: bool, show_footer: bool) -> f64 {
         }
         panel_height
     });
-    if show_footer {
+    if footer != Footer::None {
         set_copy_feedback(false);
     }
     panel_height
@@ -925,6 +970,7 @@ fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
         ));
         popup.cancel_button.setHidden(false);
         popup.replace_button.setHidden(false);
+        popup.retry_button.setHidden(true);
         popup.copy_button.setHidden(!copy_visible(true));
         popup.replace_button.setFrame(NSRect::new(
             NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
@@ -949,8 +995,14 @@ fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
 
 /// Lays out the card for a tabbed plain-text body (a rewrite state: loading,
 /// error, or an informational note). The footer shows the style menu button
-/// and Cancel only. Returns the panel height.
-fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: PopupTab) -> f64 {
+/// and Cancel, plus Retry when `retry`. Returns the panel height.
+fn layout_tabbed_message(
+    text: &str,
+    is_error: bool,
+    loading: bool,
+    retry: bool,
+    selected: PopupTab,
+) -> f64 {
     let panel_height = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(popup) = state.as_mut() else {
@@ -1040,9 +1092,14 @@ fn layout_tabbed_message(text: &str, is_error: bool, loading: bool, selected: Po
         ));
         popup.cancel_button.setHidden(false);
         popup.replace_button.setHidden(true);
+        popup.retry_button.setHidden(!retry);
         popup.copy_button.setHidden(!copy_visible(false));
         popup.cancel_button.setFrame(NSRect::new(
             NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
+            NSSize::new(90.0, 24.0),
+        ));
+        popup.retry_button.setFrame(NSRect::new(
+            NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
             NSSize::new(90.0, 24.0),
         ));
         panel_height
@@ -1076,7 +1133,8 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
             text,
             is_error,
             loading,
-        } => layout_tabbed_message(text, is_error, loading, selected),
+            retry,
+        } => layout_tabbed_message(text, is_error, loading, retry, selected),
     };
     show_body(panel_height, caret, mtm);
 }
@@ -1093,7 +1151,25 @@ pub fn show_message(text: &str, is_error: bool, show_button: bool, caret: &Caret
         return;
     };
     ensure_popup(mtm);
-    let panel_height = layout_plain(text, is_error, show_button);
+    let footer = if show_button {
+        Footer::Replace
+    } else {
+        Footer::None
+    };
+    let panel_height = layout_plain(text, is_error, footer);
+    show_body(panel_height, caret, mtm);
+}
+
+/// Red error text with a Cancel + Retry footer (no style menu, no copy button).
+pub fn show_error_with_retry(text: &str, caret: &CaretRect) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        eprintln!(
+            "Writely: could not show the suggestion: Writely must update it on the main thread."
+        );
+        return;
+    };
+    ensure_popup(mtm);
+    let panel_height = layout_plain(text, true, Footer::Retry);
     show_body(panel_height, caret, mtm);
 }
 
@@ -1211,6 +1287,7 @@ pub fn hide() {
             popup.spinner.setHidden(true);
             popup.panel.orderOut(None);
             popup.replace_button.setHidden(true);
+            popup.retry_button.setHidden(true);
             popup.cancel_button.setHidden(true);
             popup.copy_button.setHidden(true);
             popup.separator.setHidden(true);
