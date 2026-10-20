@@ -41,6 +41,7 @@ pub enum UserEvent {
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     CopyFeedbackEnded(u64),
     PermissionGranted,
+    SettingsChanged,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     CopiedText {
         generation: u64,
@@ -1488,6 +1489,7 @@ fn main() {
     let watcher_proxy = event_loop.create_proxy();
     overlay::init(watcher_proxy.clone());
     popup::init(watcher_proxy.clone());
+    settings::init(watcher_proxy.clone());
     check_window::init(watcher_proxy.clone());
 
     let mut tray_icon: Option<TrayIcon> = None;

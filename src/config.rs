@@ -196,6 +196,31 @@ impl AppSettings {
     }
 }
 
+/// Whether `provider` is ready to use: it needs a non-blank model, and every
+/// provider except Ollama also needs a saved key.
+#[allow(dead_code)]
+pub fn provider_ready(provider: Provider, model: &str, has_key: bool) -> bool {
+    if model.trim().is_empty() {
+        return false;
+    }
+    provider == Provider::Ollama || has_key
+}
+
+/// A copy of `settings` switched to `provider`; every other field (all models,
+/// effort, URL, toggles) is unchanged.
+#[allow(dead_code)]
+fn with_provider(mut settings: AppSettings, provider: Provider) -> AppSettings {
+    settings.provider = provider;
+    settings
+}
+
+/// Switches the saved provider, keeping every other setting.
+#[allow(dead_code)]
+pub fn switch_provider(provider: Provider) -> Result<(), String> {
+    let settings = load_settings()?;
+    save_settings(&with_provider(settings, provider))
+}
+
 /// Validates the model field for saving: it must not be empty.
 pub fn validate_model_name(model: &str) -> Result<String, String> {
     let trimmed = model.trim();
@@ -331,6 +356,59 @@ mod tests {
             validate_model_name("  llama3.2 ").expect("model should be valid"),
             "llama3.2"
         );
+    }
+
+    #[test]
+    fn provider_ready_needs_a_model_and_a_key() {
+        // Blank model: never ready, even with a key.
+        assert!(!provider_ready(Provider::Gemini, "   ", true));
+        assert!(!provider_ready(Provider::Together, "", true));
+        assert!(!provider_ready(Provider::Ollama, "", false));
+        // Gemini and Together need a saved key.
+        assert!(!provider_ready(
+            Provider::Gemini,
+            "gemini-3.5-flash-lite",
+            false
+        ));
+        assert!(!provider_ready(
+            Provider::Together,
+            "deepseek-ai/DeepSeek-V4.1-Flash",
+            false
+        ));
+        assert!(provider_ready(
+            Provider::Gemini,
+            "gemini-3.5-flash-lite",
+            true
+        ));
+        assert!(provider_ready(
+            Provider::Together,
+            "deepseek-ai/DeepSeek-V4.1-Flash",
+            true
+        ));
+        // Ollama needs no key.
+        assert!(provider_ready(Provider::Ollama, "llama3.2", false));
+    }
+
+    #[test]
+    fn with_provider_keeps_every_other_field() {
+        let mut settings = AppSettings {
+            provider: Provider::Gemini,
+            effort: Effort::Low,
+            ollama_url: "http://example:11434".to_string(),
+            launch_at_login: false,
+            clipboard_fallback: false,
+            ..AppSettings::default()
+        };
+        settings.set_model(Provider::Gemini, "gemini-model");
+        settings.set_model(Provider::Together, "together-model");
+        settings.set_model(Provider::Ollama, "ollama-model");
+        let switched = with_provider(settings.clone(), Provider::Together);
+        assert_eq!(switched.provider, Provider::Together);
+        assert_eq!(switched.models, settings.models);
+        assert_eq!(switched.effort, settings.effort);
+        assert_eq!(switched.ollama_url, settings.ollama_url);
+        assert_eq!(switched.launch_at_login, settings.launch_at_login);
+        assert_eq!(switched.clipboard_fallback, settings.clipboard_fallback);
     }
 
     #[test]

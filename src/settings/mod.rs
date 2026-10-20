@@ -276,6 +276,26 @@ pub fn is_settings_key_window() -> bool {
     }
 }
 
+static PROXY: std::sync::OnceLock<tao::event_loop::EventLoopProxy<crate::UserEvent>> =
+    std::sync::OnceLock::new();
+
+/// Stores the event-loop proxy so Save and Remove key can send
+/// `UserEvent::SettingsChanged`. Call once at startup.
+pub fn init(proxy: tao::event_loop::EventLoopProxy<crate::UserEvent>) {
+    if PROXY.set(proxy).is_err() {
+        // Keep the first proxy installed for this process.
+    }
+}
+
+/// Tells the app the settings changed (the tray menu refreshes itself).
+pub(crate) fn notify_changed() {
+    if let Some(proxy) = PROXY.get() {
+        if let Err(error) = proxy.send_event(crate::UserEvent::SettingsChanged) {
+            eprintln!("Writely: could not deliver the settings change: {error}");
+        }
+    }
+}
+
 pub fn show_settings() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {

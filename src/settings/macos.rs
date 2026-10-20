@@ -300,6 +300,7 @@ define_class!(
                 }
                 Err(error) => set_status(status, &error, true),
             }
+            super::notify_changed();
         }
 
         #[unsafe(method(removeClicked:))]
@@ -321,6 +322,7 @@ define_class!(
                     field.setStringValue(&NSString::from_str(""));
                     field.setPlaceholderString(Some(&NSString::from_str("Paste your key here")));
                     set_status(status, "Key removed.", false);
+                    super::notify_changed();
                 }
                 Err(error) => set_status(status, &error, true),
             }

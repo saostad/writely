@@ -973,6 +973,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     set_status("Saved.", false);
                     set_edit_text(edit, "");
                     refresh_key_cue(edit, provider);
+                    super::notify_changed();
                 }
             } else if id == ID_REMOVE {
                 let edit = STATE.with(|state| state.borrow().as_ref().map(|handles| handles.edit));
@@ -988,6 +989,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                             set_edit_text(edit, "");
                             refresh_key_cue(edit, provider);
                             set_status("Key removed.", false);
+                            super::notify_changed();
                         }
                         Err(error) => set_status(&error, true),
                     }

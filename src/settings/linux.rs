@@ -470,6 +470,8 @@ pub fn show_settings() -> Result<(), String> {
                     .set_placeholder_text(Some("Paste your key here")),
                 Err(error) => set_status(&borrowed.status_label, &error, true),
             }
+            drop(borrowed);
+            super::notify_changed();
         });
     }
     {
@@ -488,6 +490,8 @@ pub fn show_settings() -> Result<(), String> {
                         .key_entry
                         .set_placeholder_text(Some("Paste your key here"));
                     set_status(&borrowed.status_label, "Key removed.", false);
+                    drop(borrowed);
+                    super::notify_changed();
                 }
                 Err(error) => set_status(&borrowed.status_label, &error, true),
             }
