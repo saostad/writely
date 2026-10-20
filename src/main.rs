@@ -1471,6 +1471,40 @@ fn provider_item_text(provider: config::Provider, ready: bool) -> String {
     }
 }
 
+/// The Provider submenu diff: for each provider (Gemini, Together, Ollama),
+/// the checked state and label to apply, each `None` when unchanged from
+/// `previous`. A missing cache means everything is applied.
+fn menu_updates(
+    previous: Option<(config::Provider, [bool; 3])>,
+    current: config::Provider,
+    ready: [bool; 3],
+) -> Vec<(config::Provider, Option<bool>, Option<String>)> {
+    [
+        config::Provider::Gemini,
+        config::Provider::Together,
+        config::Provider::Ollama,
+    ]
+    .iter()
+    .map(|provider| {
+        let checked = current == *provider;
+        let text = provider_item_text(*provider, ready[ready_index(*provider)]);
+        match previous {
+            Some((previous_current, previous_ready)) => {
+                let checked_changed = checked != (previous_current == *provider);
+                let was_text =
+                    provider_item_text(*provider, previous_ready[ready_index(*provider)]);
+                (
+                    *provider,
+                    checked_changed.then_some(checked),
+                    (text != was_text).then_some(text),
+                )
+            }
+            None => (*provider, Some(checked), Some(text)),
+        }
+    })
+    .collect()
+}
+
 /// Requests a Provider submenu refresh off the main thread: bumps the id and
 /// spawns a `writely-provider-menu` thread that loads the settings and keys,
 /// then sends `UserEvent::ProviderMenuState`. A load error sends nothing so
@@ -1812,6 +1846,11 @@ fn main() {
                     for (listed, item) in &provider_items {
                         item.set_checked(*listed == provider);
                     }
+                    // Keep the cache in step with the instant check: a failed
+                    // switch then differs from the refresh and gets reset.
+                    if let Some((current, _)) = provider_menu_state.as_mut() {
+                        *current = provider;
+                    }
                     match config::switch_provider(provider) {
                         Err(error) => {
                             let detail = format!(
@@ -1989,24 +2028,16 @@ fn main() {
                 // A stale reply must not overwrite a newer one. Memory updates
                 // only: no file or keychain access here.
                 if id == menu_refresh_id {
-                    for (provider, item) in &provider_items {
-                        let checked = current == *provider;
-                        let text = provider_item_text(*provider, ready[ready_index(*provider)]);
-                        match provider_menu_state {
-                            Some((previous, previous_ready)) => {
-                                if checked != (previous == *provider) {
-                                    item.set_checked(checked);
-                                }
-                                let was_text = provider_item_text(
-                                    *provider,
-                                    previous_ready[ready_index(*provider)],
-                                );
-                                if text != was_text {
-                                    item.set_text(text);
-                                }
-                            }
-                            None => {
+                    for (provider, checked, text) in
+                        menu_updates(provider_menu_state, current, ready)
+                    {
+                        if let Some((_, item)) =
+                            provider_items.iter().find(|(listed, _)| *listed == provider)
+                        {
+                            if let Some(checked) = checked {
                                 item.set_checked(checked);
+                            }
+                            if let Some(text) = text {
                                 item.set_text(text);
                             }
                         }
@@ -2077,8 +2108,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        dimmed_rgba, pause_item_text, provider_item_text, ready_index, rewrite_retry_style,
-        selected_text, style_index, Pending,
+        dimmed_rgba, menu_updates, pause_item_text, provider_item_text, ready_index,
+        rewrite_retry_style, selected_text, style_index, Pending,
     };
     use crate::config::Provider;
     use crate::popup::PopupTab;
@@ -2215,5 +2246,62 @@ mod tests {
             provider_item_text(Provider::Ollama, false),
             "Ollama (not set up)"
         );
+    }
+
+    #[test]
+    fn menu_updates_no_cache_applies_everything() {
+        let updates = menu_updates(None, Provider::Gemini, [true, false, true]);
+        assert_eq!(
+            updates,
+            vec![
+                (Provider::Gemini, Some(true), Some("Gemini".to_string())),
+                (
+                    Provider::Together,
+                    Some(false),
+                    Some("Together AI (not set up)".to_string())
+                ),
+                (Provider::Ollama, Some(false), Some("Ollama".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_updates_unchanged_applies_nothing() {
+        let updates = menu_updates(
+            Some((Provider::Gemini, [true, true, true])),
+            Provider::Gemini,
+            [true, true, true],
+        );
+        assert!(updates
+            .iter()
+            .all(|(_, checked, text)| checked.is_none() && text.is_none()));
+    }
+
+    #[test]
+    fn menu_updates_failed_switch_resets_checkmark() {
+        // The click set the cache to Together, then the switch failed, so
+        // the refresh still says Gemini: Gemini is re-checked and Together
+        // is unchecked, with labels untouched.
+        let updates = menu_updates(
+            Some((Provider::Together, [true, true, true])),
+            Provider::Gemini,
+            [true, true, true],
+        );
+        assert_eq!(updates[0].1, Some(true));
+        assert_eq!(updates[1].1, Some(false));
+        assert_eq!(updates[2].1, None);
+        assert!(updates.iter().all(|(_, _, text)| text.is_none()));
+    }
+
+    #[test]
+    fn menu_updates_readiness_change_updates_label_only() {
+        let updates = menu_updates(
+            Some((Provider::Gemini, [true, true, true])),
+            Provider::Gemini,
+            [true, false, true],
+        );
+        assert!(updates.iter().all(|(_, checked, _)| checked.is_none()));
+        assert_eq!(updates[1].2.as_deref(), Some("Together AI (not set up)"));
+        assert!(updates[0].2.is_none() && updates[2].2.is_none());
     }
 }

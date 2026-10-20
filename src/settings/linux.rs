@@ -207,13 +207,20 @@ fn apply_provider_change(controls: &Rc<RefCell<Controls>>, new_provider: Provide
         super::file_key_draft(&mut borrowed.draft_keys, shown, &text);
     }
     stash_draft(controls);
-    // Select without re-emitting `changed`.
+    // Select without re-emitting `changed`. GTK emits `changed`
+    // synchronously from `set_active` and the handler borrows `controls`,
+    // so no borrow may be held across the call.
     {
         let mut borrowed = controls.borrow_mut();
         borrowed.suppress_provider_changed = true;
-        borrowed
-            .provider_combo
-            .set_active(Some(provider_index(new_provider)));
+    }
+    let combo = {
+        let borrowed = controls.borrow();
+        borrowed.provider_combo.clone()
+    };
+    combo.set_active(Some(provider_index(new_provider)));
+    {
+        let mut borrowed = controls.borrow_mut();
         borrowed.settings.provider = new_provider;
         borrowed.suppress_provider_changed = false;
     }
