@@ -15,6 +15,7 @@ mod text_access;
 mod watcher;
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -1402,6 +1403,9 @@ fn pause_item_text(paused: bool) -> &'static str {
 /// Tooltip while Accessibility permission is missing.
 const ACCESSIBILITY_TOOLTIP: &str = "Writely needs Accessibility permission — see Settings";
 
+/// Idle time after the last caret move before the W icon reappears.
+const ICON_IDLE_DELAY: Duration = Duration::from_millis(1000);
+
 /// A copy of an RGBA buffer with every alpha byte scaled by 0.4 (rounded
 /// down); the RGB bytes are untouched.
 fn dimmed_rgba(rgba: &[u8]) -> Vec<u8> {
@@ -1578,6 +1582,33 @@ fn handle_permission_granted(
     eprintln!("Writely: Accessibility permission granted.");
 }
 
+/// Whether the icon idle timer has fired: no deadline means nothing is due.
+fn icon_ready(due: Option<Instant>, now: Instant) -> bool {
+    matches!(due, Some(deadline) if now >= deadline)
+}
+
+/// Shows the W icon at the current caret, hiding it when there is no caret.
+/// Errors are logged once per distinct message.
+fn show_icon_at_caret(last_caret_error: &mut Option<String>) {
+    match text_access::caret_info() {
+        Ok(Some(info)) => {
+            *last_caret_error = None;
+            overlay::show_at(&info.caret_rect);
+        }
+        Ok(None) => {
+            *last_caret_error = None;
+            overlay::hide();
+        }
+        Err(error) => {
+            overlay::hide();
+            if last_caret_error.as_deref() != Some(error.as_str()) {
+                eprintln!("Writely: {error}");
+                *last_caret_error = Some(error);
+            }
+        }
+    }
+}
+
 fn main() {
     // Only the macOS setup mutates the event loop before running it.
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
@@ -1616,6 +1647,7 @@ fn main() {
     let mut check_text_id = tray_icon::menu::MenuId::new("check-text");
     let mut caret_watcher: Option<watcher::Watcher> = None;
     let mut last_caret_error: Option<String> = None;
+    let mut icon_due: Option<Instant> = None;
     // Popup flow state: bumped on every click and on hide so late Gemini
     // replies are dropped.
     let mut paused = false;
@@ -1788,6 +1820,14 @@ fn main() {
                     _hotkey_manager = register_hotkey(&watcher_proxy);
                 }
             }
+            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+                if icon_ready(icon_due, Instant::now()) {
+                    icon_due = None;
+                    if !paused {
+                        show_icon_at_caret(&mut last_caret_error);
+                    }
+                }
+            }
             Event::UserEvent(UserEvent::MenuEvent(event)) => {
                 #[cfg(target_os = "linux")]
                 if event.id == check_text_id {
@@ -1803,6 +1843,7 @@ fn main() {
                     if paused {
                         popup::hide();
                         overlay::hide();
+                        icon_due = None;
                         generation = generation.wrapping_add(1);
                         checking = None;
                         pending = None;
@@ -1934,23 +1975,11 @@ fn main() {
                 if let Some(watcher) = caret_watcher.as_mut() {
                     watcher.handle_caret_changed();
                 }
-                match text_access::caret_info() {
-                    Ok(Some(info)) => {
-                        last_caret_error = None;
-                        overlay::show_at(&info.caret_rect);
-                    }
-                    Ok(None) => {
-                        last_caret_error = None;
-                        overlay::hide();
-                    }
-                    Err(error) => {
-                        overlay::hide();
-                        if last_caret_error.as_deref() != Some(error.as_str()) {
-                            eprintln!("Writely: {error}");
-                            last_caret_error = Some(error);
-                        }
-                    }
-                }
+                // The icon hides while typing and reappears after 1 s idle; a
+                // new caret event pushes the deadline later. No caret query
+                // here, so per-keystroke work shrinks.
+                overlay::hide();
+                icon_due = Some(Instant::now() + ICON_IDLE_DELAY);
             }
             Event::UserEvent(UserEvent::IconClicked) => {
                 // While paused the icon is hidden; a queued click from
@@ -2102,18 +2131,26 @@ fn main() {
             }
             _ => {}
         }
+        // Wake up when the icon idle timer fires. Exit wins: quitting must
+        // not schedule another wake-up.
+        if let Some(due) = icon_due {
+            if !matches!(*control_flow, ControlFlow::Exit) {
+                *control_flow = ControlFlow::WaitUntil(due);
+            }
+        }
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        dimmed_rgba, menu_updates, pause_item_text, provider_item_text, ready_index,
+        dimmed_rgba, icon_ready, menu_updates, pause_item_text, provider_item_text, ready_index,
         rewrite_retry_style, selected_text, style_index, Pending,
     };
     use crate::config::Provider;
     use crate::popup::PopupTab;
     use crate::providers::RewriteStyle;
+    use std::time::{Duration, Instant};
 
     fn test_pending() -> Pending {
         Pending {
@@ -2303,5 +2340,14 @@ mod tests {
         assert!(updates.iter().all(|(_, checked, _)| checked.is_none()));
         assert_eq!(updates[1].2.as_deref(), Some("Together AI (not set up)"));
         assert!(updates[0].2.is_none() && updates[2].2.is_none());
+    }
+
+    #[test]
+    fn icon_ready_fires_at_or_after_due() {
+        let now = Instant::now();
+        assert!(!icon_ready(None, now));
+        assert!(!icon_ready(Some(now + Duration::from_millis(100)), now));
+        assert!(icon_ready(Some(now), now));
+        assert!(icon_ready(Some(now - Duration::from_millis(1)), now));
     }
 }
