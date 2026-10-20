@@ -76,8 +76,13 @@ fn key_help_for(provider: Provider) -> &'static str {
     }
 }
 
+struct OpenWindow {
+    window: Window,
+    controls: Rc<RefCell<Controls>>,
+}
+
 thread_local! {
-    static STATE: RefCell<Option<Window>> = const { RefCell::new(None) };
+    static STATE: RefCell<Option<OpenWindow>> = const { RefCell::new(None) };
 }
 
 fn escape_markup(text: &str) -> String {
@@ -112,6 +117,7 @@ struct Controls {
     status_label: Label,
     settings: AppSettings,
     draft_keys: [String; 3],
+    suppress_provider_changed: bool,
 }
 
 /// Refreshes the provider-dependent rows for the selected provider: the model
@@ -186,6 +192,49 @@ fn stash_draft(controls: &Rc<RefCell<Controls>>) {
     }
 }
 
+/// Applies a provider change: files the shown key text, stashes the draft,
+/// selects `new_provider`, and shows its draft. The dropdown handler and a
+/// tray switch both call this.
+fn apply_provider_change(controls: &Rc<RefCell<Controls>>, new_provider: Provider) {
+    // File the key box text under the shown provider first (before stash_draft
+    // moves settings.provider), so a typed key stays with its provider.
+    {
+        let borrowed = controls.borrow();
+        let shown = borrowed.settings.provider;
+        let text = borrowed.key_entry.text().to_string();
+        drop(borrowed);
+        let mut borrowed = controls.borrow_mut();
+        super::file_key_draft(&mut borrowed.draft_keys, shown, &text);
+    }
+    stash_draft(controls);
+    // Select without re-emitting `changed`.
+    {
+        let mut borrowed = controls.borrow_mut();
+        borrowed.suppress_provider_changed = true;
+        borrowed
+            .provider_combo
+            .set_active(Some(provider_index(new_provider)));
+        borrowed.settings.provider = new_provider;
+        borrowed.suppress_provider_changed = false;
+    }
+    {
+        let borrowed = controls.borrow();
+        let draft = super::restore_key_draft(&borrowed.draft_keys, new_provider).to_string();
+        borrowed.key_entry.set_text(&draft);
+    }
+    refresh_provider_rows(controls);
+}
+
+/// Follows a tray switch in an open Settings window: the same steps as a
+/// manual dropdown change. Returns straight away when Settings is not open.
+pub fn provider_switched(provider: Provider) {
+    let controls = STATE.with(|state| state.borrow().as_ref().map(|open| open.controls.clone()));
+    let Some(controls) = controls else {
+        return;
+    };
+    apply_provider_change(&controls, provider);
+}
+
 pub fn show_settings() -> Result<(), String> {
     if let Err(error) = gtk::init() {
         // GTK may already be initialised by the tray/event-loop stack; only
@@ -199,8 +248,13 @@ pub fn show_settings() -> Result<(), String> {
     let already_open = STATE.with(|state| state.borrow().is_some());
     if already_open {
         STATE.with(|state| {
-            if let Some(window) = state.borrow().as_ref() {
-                window.present();
+            if let Some(open) = state.borrow().as_ref() {
+                if let Some(message) = super::provider_message() {
+                    let borrowed = open.controls.borrow();
+                    set_status(&borrowed.status_label, &message, true);
+                    super::set_provider_message(None);
+                }
+                open.window.present();
             }
         });
         return Ok(());
@@ -363,34 +417,21 @@ pub fn show_settings() -> Result<(), String> {
         status_label: status_label.clone(),
         settings,
         draft_keys: [String::new(), String::new(), String::new()],
+        suppress_provider_changed: false,
     }));
     refresh_provider_rows(&controls);
 
     {
         let controls_for_provider = controls.clone();
         provider_combo.connect_changed(move |_| {
-            // File the key box text under the shown provider first (before
-            // stash_draft moves settings.provider), so a typed key stays with
-            // its provider instead of being saved under the new one.
-            {
-                let borrowed = controls_for_provider.borrow();
-                let shown = borrowed.settings.provider;
-                let text = borrowed.key_entry.text().to_string();
-                drop(borrowed);
-                let mut borrowed = controls_for_provider.borrow_mut();
-                super::file_key_draft(&mut borrowed.draft_keys, shown, &text);
+            if controls_for_provider.borrow().suppress_provider_changed {
+                return;
             }
-            // Stash the model text for the previous provider, so switching
-            // providers keeps each one's model.
-            stash_draft(&controls_for_provider);
-            // Show the new provider's draft (empty when none).
-            {
+            let new_provider = {
                 let borrowed = controls_for_provider.borrow();
-                let provider = provider_at(borrowed.provider_combo.active().unwrap_or(0));
-                let draft = super::restore_key_draft(&borrowed.draft_keys, provider).to_string();
-                borrowed.key_entry.set_text(&draft);
-            }
-            refresh_provider_rows(&controls_for_provider);
+                provider_at(borrowed.provider_combo.active().unwrap_or(0))
+            };
+            apply_provider_change(&controls_for_provider, new_provider);
         });
     }
     {
@@ -511,7 +552,10 @@ pub fn show_settings() -> Result<(), String> {
 
     window.add(&container);
     STATE.with(|state| {
-        *state.borrow_mut() = Some(window.clone());
+        *state.borrow_mut() = Some(OpenWindow {
+            window: window.clone(),
+            controls: controls.clone(),
+        });
     });
     window.show_all();
     // refresh_provider_rows ran before show_all; re-apply visibility now that

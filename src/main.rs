@@ -1829,6 +1829,7 @@ fn main() {
                             }
                         }
                         Ok(()) => {
+                            settings::provider_switched(provider);
                             // The cached readiness is what the menu label
                             // showed; with no cache yet treat it as ready.
                             let ready = provider_menu_state

@@ -212,6 +212,63 @@ fn stash_draft() {
     }
 }
 
+/// Applies a provider change: files the shown key text, stashes the draft,
+/// selects `new_provider`, and shows its draft. The popup action and a tray
+/// switch both call this (a programmatic `selectItemAtIndex` emits no action).
+fn apply_provider_change(new_provider: Provider) {
+    // File the key box text under the shown provider first (before stash_draft
+    // moves settings.provider), so a typed key stays with its provider.
+    let field = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|window_state| (window_state.field.clone(), window_state.settings.provider))
+    });
+    if let Some((field, shown)) = field {
+        let text = field.stringValue().to_string();
+        STATE.with(|state| {
+            if let Some(window_state) = state.borrow_mut().as_mut() {
+                super::file_key_draft(&mut window_state.draft_keys, shown, &text);
+            }
+        });
+    }
+    stash_draft();
+    STATE.with(|state| {
+        if let Some(window_state) = state.borrow().as_ref() {
+            window_state
+                .provider_popup
+                .selectItemAtIndex(provider_index(new_provider));
+        }
+    });
+    STATE.with(|state| {
+        if let Some(window_state) = state.borrow_mut().as_mut() {
+            window_state.settings.provider = new_provider;
+        }
+    });
+    let restore = STATE.with(|state| {
+        state.borrow().as_ref().map(|window_state| {
+            (
+                window_state.field.clone(),
+                super::restore_key_draft(&window_state.draft_keys, new_provider).to_string(),
+            )
+        })
+    });
+    if let Some((field, draft)) = restore {
+        field.setStringValue(&NSString::from_str(&draft));
+    }
+    refresh_provider_rows();
+}
+
+/// Follows a tray switch in an open Settings window: the same steps as a
+/// manual dropdown change. Returns straight away when Settings is not open.
+pub fn provider_switched(provider: Provider) {
+    let is_open = STATE.with(|state| state.borrow().is_some());
+    if !is_open {
+        return;
+    }
+    apply_provider_change(provider);
+}
+
 define_class!(
     // SAFETY: NSObject has no subclassing requirements and SettingsDelegate does not implement Drop.
     #[unsafe(super = NSObject)]
@@ -360,38 +417,9 @@ define_class!(
 
         #[unsafe(method(providerChanged:))]
         fn provider_changed(&self, _sender: Option<&AnyObject>) {
-            // File the key box text under the shown provider first (before
-            // stash_draft moves settings.provider), so a typed key stays with
-            // its provider instead of being saved under the new one.
-            if let Some(field) = self.ivars().field.get() {
-                let text = field.stringValue().to_string();
-                STATE.with(|state| {
-                    if let Some(window_state) = state.borrow_mut().as_mut() {
-                        let shown = window_state.settings.provider;
-                        super::file_key_draft(&mut window_state.draft_keys, shown, &text);
-                    }
-                });
-            }
-            // Stash the model text into the draft for the previous provider,
-            // so switching providers keeps each one's model.
-            stash_draft();
-            // Show the new provider's draft (empty when none).
-            if let Some(field) = self.ivars().field.get() {
-                let draft = STATE.with(|state| {
-                    state
-                        .borrow()
-                        .as_ref()
-                        .map(|window_state| {
-                            let provider = provider_at(
-                                window_state.provider_popup.indexOfSelectedItem(),
-                            );
-                            super::restore_key_draft(&window_state.draft_keys, provider).to_string()
-                        })
-                        .unwrap_or_default()
-                });
-                field.setStringValue(&NSString::from_str(&draft));
-            }
-            refresh_provider_rows();
+            let new_provider =
+                read_draft().map(|draft| draft.0).unwrap_or(Provider::Gemini);
+            apply_provider_change(new_provider);
         }
 
         #[unsafe(method(openAccessibilitySettings:))]
@@ -575,6 +603,10 @@ pub fn show_settings() -> Result<(), String> {
                             Err(error) => set_status(&window_state.status, &error, true),
                         }
                     }
+                }
+                if let Some(message) = super::provider_message() {
+                    set_status(&window_state.status, &message, true);
+                    super::set_provider_message(None);
                 }
                 NSApplication::sharedApplication(mtm).activate();
                 window_state.window.makeKeyAndOrderFront(None);

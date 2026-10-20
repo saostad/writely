@@ -743,6 +743,58 @@ fn stash_draft() {
     });
 }
 
+/// Applies a provider change: files the shown key text, stashes the draft,
+/// selects `new_provider`, and shows its draft. `CBN_SELCHANGE` and a tray
+/// switch both call this (a programmatic `CB_SETCURSEL` emits no change event).
+fn apply_provider_change(new_provider: Provider) {
+    STATE.with(|state| {
+        if let Some(handles) = state.borrow_mut().as_mut() {
+            let shown = handles.settings.provider;
+            let text = read_edit_text(handles.edit);
+            super::file_key_draft(&mut handles.draft_keys, shown, &text);
+        }
+    });
+    stash_draft();
+    let combo = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|handles| handles.provider_combo)
+    });
+    if let Some(combo) = combo {
+        set_combo_selection(combo, provider_index(new_provider));
+    }
+    STATE.with(|state| {
+        if let Some(handles) = state.borrow_mut().as_mut() {
+            handles.settings.provider = new_provider;
+        }
+    });
+    // The text is set after the borrow ends: SetWindowTextW can repaint
+    // synchronously, and WM_CTLCOLORSTATIC reads STATE again.
+    let pending_text = STATE.with(|state| {
+        state.borrow().as_ref().map(|handles| {
+            (
+                handles.edit,
+                super::restore_key_draft(&handles.draft_keys, new_provider).to_string(),
+            )
+        })
+    });
+    if let Some((edit, draft)) = pending_text {
+        set_edit_text(edit, &draft);
+    }
+    refresh_provider_rows();
+}
+
+/// Follows a tray switch in an open Settings window: the same steps as a
+/// manual dropdown change. Returns straight away when Settings is not open.
+pub fn provider_switched(provider: Provider) {
+    let is_open = STATE.with(|state| state.borrow().is_some());
+    if !is_open {
+        return;
+    }
+    apply_provider_change(provider);
+}
+
 fn read_edit_text(edit: HWND) -> String {
     // SAFETY: edit is a live EDIT control while the window is open.
     let length = unsafe { GetWindowTextLengthW(edit) };
@@ -997,35 +1049,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     }
                 }
             } else if id as u32 == ID_PROVIDER as u32 && notification == CBN_SELCHANGE {
-                // File the key box text under the shown provider first (before
-                // stash_draft moves settings.provider), so a typed key stays
-                // with its provider instead of being saved under the new one.
-                STATE.with(|state| {
-                    if let Some(handles) = state.borrow_mut().as_mut() {
-                        let shown = handles.settings.provider;
-                        let text = read_edit_text(handles.edit);
-                        super::file_key_draft(&mut handles.draft_keys, shown, &text);
-                    }
-                });
-                // Stash the model text for the previous provider, so
-                // switching providers keeps each one's model.
-                stash_draft();
-                // Show the new provider's draft (empty when none). The text is
-                // set after the borrow ends: SetWindowTextW can repaint
-                // synchronously, and WM_CTLCOLORSTATIC reads STATE again.
-                let pending_text = STATE.with(|state| {
-                    state.borrow().as_ref().map(|handles| {
-                        let provider = provider_at(combo_selection(handles.provider_combo));
-                        (
-                            handles.edit,
-                            super::restore_key_draft(&handles.draft_keys, provider).to_string(),
-                        )
-                    })
-                });
-                if let Some((edit, draft)) = pending_text {
-                    set_edit_text(edit, &draft);
-                }
-                refresh_provider_rows();
+                apply_provider_change(current_provider());
             }
             LRESULT(0)
         }
@@ -1152,6 +1176,10 @@ pub fn show_settings() -> Result<(), String> {
         // SAFETY: window came from STATE and is checked with IsWindow.
         let alive = unsafe { IsWindow(Some(window)).as_bool() };
         if alive {
+            if let Some(message) = super::provider_message() {
+                set_status(&message, true);
+                super::set_provider_message(None);
+            }
             // SAFETY: window is a live top-level window on this thread.
             unsafe {
                 let _ = ShowWindow(window, SW_SHOW);

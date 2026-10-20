@@ -311,6 +311,19 @@ pub(crate) fn notify_changed() {
     }
 }
 
+/// Follows a tray switch in an open Settings window. Returns straight away
+/// when Settings is not open (an `Option` check, nothing else).
+pub fn provider_switched(provider: crate::config::Provider) {
+    #[cfg(target_os = "macos")]
+    macos::provider_switched(provider);
+    #[cfg(target_os = "windows")]
+    windows::provider_switched(provider);
+    #[cfg(target_os = "linux")]
+    linux::provider_switched(provider);
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    let _ = provider;
+}
+
 pub fn show_settings() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
