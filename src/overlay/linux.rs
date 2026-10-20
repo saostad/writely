@@ -99,7 +99,10 @@ pub fn show_at(rect: &CaretRect) {
 pub fn hide() {
     STATE.with(|state| {
         if let Some(icon) = state.borrow().as_ref() {
-            icon.window.hide();
+            // hide() runs on every keystroke; skip the call when already hidden.
+            if icon.window.is_visible() {
+                icon.window.hide();
+            }
         }
     });
 }

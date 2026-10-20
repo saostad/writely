@@ -235,7 +235,10 @@ pub fn hide() {
     STATE.with(|state| {
         if let Some(overlay) = state.borrow_mut().as_mut() {
             // The panel is kept alive and reused; it is never re-created.
-            overlay.panel.orderOut(None);
+            // hide() runs on every keystroke; skip the call when already hidden.
+            if overlay.panel.isVisible() {
+                overlay.panel.orderOut(None);
+            }
             overlay.last_origin = None;
         }
     });
