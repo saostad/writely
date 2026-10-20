@@ -341,6 +341,9 @@ pub fn show_settings() -> Result<(), String> {
     container.pack_start(&status_label, false, false, 0);
     if let Some(error) = &initial_error {
         set_status(&status_label, error, true);
+    } else if let Some(message) = super::provider_message() {
+        set_status(&status_label, &message, true);
+        super::set_provider_message(None);
     } else if let Some(error) = super::autostart_message() {
         set_status(&status_label, &error, true);
     }

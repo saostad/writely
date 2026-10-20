@@ -35,6 +35,7 @@ static PERMISSION_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 static HOTKEY_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static AUTOSTART_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static PROVIDER_MESSAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 pub fn set_autostart_message(message: Option<String>) {
     match AUTOSTART_MESSAGE.lock() {
@@ -45,6 +46,20 @@ pub fn set_autostart_message(message: Option<String>) {
 
 pub fn autostart_message() -> Option<String> {
     match AUTOSTART_MESSAGE.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+pub fn set_provider_message(message: Option<String>) {
+    match PROVIDER_MESSAGE.lock() {
+        Ok(mut guard) => *guard = message,
+        Err(poisoned) => *poisoned.into_inner() = message,
+    }
+}
+
+pub fn provider_message() -> Option<String> {
+    match PROVIDER_MESSAGE.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }

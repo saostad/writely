@@ -1519,6 +1519,9 @@ pub fn show_settings() -> Result<(), String> {
     refresh_provider_rows();
     if let Some(error) = initial_error {
         set_status(&error, true);
+    } else if let Some(message) = super::provider_message() {
+        set_status(&message, true);
+        super::set_provider_message(None);
     } else if let Some(error) = super::autostart_message() {
         set_status(&error, true);
     } else if let Some(error) = super::hotkey_message() {

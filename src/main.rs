@@ -18,7 +18,7 @@ use std::ops::Range;
 
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use text_access::{CaretRect, FieldSnapshot};
@@ -1447,6 +1447,39 @@ fn update_tray_paused(tray: &TrayIcon, paused: bool) {
     }
 }
 
+/// Refreshes the Provider submenu: each item is checked iff it is the saved
+/// provider, and shows "(not set up)" when it has no model or (except Ollama)
+/// no saved key. A settings load error leaves the items unchanged.
+fn refresh_provider_menu(items: &[(config::Provider, CheckMenuItem)]) {
+    let settings = match config::load_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("Writely: {error}");
+            return;
+        }
+    };
+    for (provider, item) in items {
+        let has_key = if *provider == config::Provider::Ollama {
+            false
+        } else {
+            match settings::has_api_key_for(*provider) {
+                Ok(has_key) => has_key,
+                Err(error) => {
+                    eprintln!("Writely: {error}");
+                    false
+                }
+            }
+        };
+        let ready = config::provider_ready(*provider, &settings.model_for(*provider), has_key);
+        item.set_checked(settings.provider == *provider);
+        if ready {
+            item.set_text(provider.display_name());
+        } else {
+            item.set_text(format!("{} (not set up)", provider.display_name()));
+        }
+    }
+}
+
 fn handle_permission_granted(
     proxy: &EventLoopProxy<UserEvent>,
     caret_watcher: &mut Option<watcher::Watcher>,
@@ -1498,6 +1531,7 @@ fn main() {
     let mut settings_id = tray_icon::menu::MenuId::new("settings");
     let mut pause_id = tray_icon::menu::MenuId::new("pause");
     let mut pause_item: Option<MenuItem> = None;
+    let mut provider_items: Vec<(config::Provider, CheckMenuItem)> = Vec::new();
     let mut quit_id = tray_icon::menu::MenuId::new("quit");
     #[cfg(target_os = "linux")]
     let mut check_text_id = tray_icon::menu::MenuId::new("check-text");
@@ -1532,6 +1566,24 @@ fn main() {
                 }
                 let settings_item = MenuItem::with_id("settings", "Settings…", true, None);
                 let quit_item = MenuItem::with_id("quit", "Quit Writely", true, None);
+                let provider_submenu = Submenu::new("Provider", true);
+                let gemini_item =
+                    CheckMenuItem::with_id("provider-gemini", "Gemini", true, false, None);
+                let together_item = CheckMenuItem::with_id(
+                    "provider-together",
+                    "Together AI",
+                    true,
+                    false,
+                    None,
+                );
+                let ollama_item =
+                    CheckMenuItem::with_id("provider-ollama", "Ollama", true, false, None);
+                if let Err(error) =
+                    provider_submenu.append_items(&[&gemini_item, &together_item, &ollama_item])
+                {
+                    eprintln!("Writely: could not create the tray icon: {error}");
+                    std::process::exit(1);
+                }
                 #[cfg(target_os = "linux")]
                 let check_text_item =
                     MenuItem::with_id("check-text", "Check text…", true, None);
@@ -1563,19 +1615,34 @@ fn main() {
                         pause,
                         &separator,
                         &check_text_item,
+                        &provider_submenu,
                         &settings_item,
                         &quit_item,
                     ]),
-                    None => Menu::with_items(&[&check_text_item, &settings_item, &quit_item]),
+                    None => Menu::with_items(&[
+                        &check_text_item,
+                        &provider_submenu,
+                        &settings_item,
+                        &quit_item,
+                    ]),
                 };
                 #[cfg(not(target_os = "linux"))]
                 let menu_result = match &new_pause_item {
-                    Some(pause) => {
-                        Menu::with_items(&[pause, &separator, &settings_item, &quit_item])
-                    }
-                    None => Menu::with_items(&[&settings_item, &quit_item]),
+                    Some(pause) => Menu::with_items(&[
+                        pause,
+                        &separator,
+                        &provider_submenu,
+                        &settings_item,
+                        &quit_item,
+                    ]),
+                    None => Menu::with_items(&[&provider_submenu, &settings_item, &quit_item]),
                 };
                 pause_item = new_pause_item;
+                provider_items = vec![
+                    (config::Provider::Gemini, gemini_item),
+                    (config::Provider::Together, together_item),
+                    (config::Provider::Ollama, ollama_item),
+                ];
                 let menu = match menu_result {
                     Ok(menu) => menu,
                     Err(error) => {
@@ -1610,6 +1677,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
+                refresh_provider_menu(&provider_items);
 
                 if watcher::is_wayland_session() {
                     const WAITING: &str = "On Wayland, Writely can't see what you type in other apps. Open “Check text…” from the Writely menu and paste your text there.";
@@ -1682,6 +1750,55 @@ fn main() {
                     }
                     if let Some(tray) = tray_icon.as_ref() {
                         update_tray_paused(tray, paused);
+                    }
+                }
+                if let Some(provider) = provider_items.iter().find_map(|(provider, item)| {
+                    (event.id == *item.id()).then_some(*provider)
+                }) {
+                    // A reply from the old provider must not land after the
+                    // switch: drop the shown popup state like the pause path.
+                    popup::hide();
+                    generation = generation.wrapping_add(1);
+                    checking = None;
+                    pending = None;
+                    failed_check = None;
+                    match config::switch_provider(provider) {
+                        Err(error) => {
+                            let detail = format!(
+                                "could not switch to {}: {error}",
+                                provider.display_name()
+                            );
+                            eprintln!("Writely: {detail}");
+                            settings::set_provider_message(Some(detail));
+                            refresh_provider_menu(&provider_items);
+                            if let Err(error) = settings::show_settings() {
+                                eprintln!("Writely: {error}");
+                            }
+                        }
+                        Ok(()) => {
+                            // A CheckMenuItem toggles itself on click; the
+                            // refresh resets the check to the saved provider.
+                            refresh_provider_menu(&provider_items);
+                            let ready = config::load_settings()
+                                .map(|settings| {
+                                    let has_key = if provider == config::Provider::Ollama {
+                                        false
+                                    } else {
+                                        settings::has_api_key_for(provider).unwrap_or(false)
+                                    };
+                                    config::provider_ready(
+                                        provider,
+                                        &settings.model_for(provider),
+                                        has_key,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if ready {
+                                eprintln!("Writely: switched to {}.", provider.display_name());
+                            } else if let Err(error) = settings::show_settings() {
+                                eprintln!("Writely: {error}");
+                            }
+                        }
                     }
                 }
                 if event.id == settings_id {
@@ -1818,6 +1935,9 @@ fn main() {
             }
             Event::UserEvent(UserEvent::PermissionGranted) => {
                 handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon, paused);
+            }
+            Event::UserEvent(UserEvent::SettingsChanged) => {
+                refresh_provider_menu(&provider_items);
             }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             Event::UserEvent(UserEvent::CopiedText {

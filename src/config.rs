@@ -198,7 +198,6 @@ impl AppSettings {
 
 /// Whether `provider` is ready to use: it needs a non-blank model, and every
 /// provider except Ollama also needs a saved key.
-#[allow(dead_code)]
 pub fn provider_ready(provider: Provider, model: &str, has_key: bool) -> bool {
     if model.trim().is_empty() {
         return false;
@@ -208,14 +207,12 @@ pub fn provider_ready(provider: Provider, model: &str, has_key: bool) -> bool {
 
 /// A copy of `settings` switched to `provider`; every other field (all models,
 /// effort, URL, toggles) is unchanged.
-#[allow(dead_code)]
 fn with_provider(mut settings: AppSettings, provider: Provider) -> AppSettings {
     settings.provider = provider;
     settings
 }
 
 /// Switches the saved provider, keeping every other setting.
-#[allow(dead_code)]
 pub fn switch_provider(provider: Provider) -> Result<(), String> {
     let settings = load_settings()?;
     save_settings(&with_provider(settings, provider))

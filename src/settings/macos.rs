@@ -845,6 +845,9 @@ pub fn show_settings() -> Result<(), String> {
         set_status(&status_label, message, true);
     } else if let Some(error) = &initial_error {
         set_status(&status_label, error, true);
+    } else if let Some(message) = super::provider_message() {
+        set_status(&status_label, &message, true);
+        super::set_provider_message(None);
     } else if let Some(hotkey_error) = super::hotkey_message() {
         set_status(&status_label, &hotkey_error, true);
     } else if let Some(autostart_error) = super::autostart_message() {
