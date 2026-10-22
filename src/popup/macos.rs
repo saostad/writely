@@ -964,6 +964,7 @@ fn layout_plain(text: &str, is_error: bool, footer: Footer) -> f64 {
             unsafe { popup.spinner.stopAnimation(None) };
             popup.spinner.setHidden(true);
         }
+        popup.scroll.setHidden(false);
         popup.style_button.setHidden(true);
         popup.note.setHidden(true);
         popup.field.setHidden(true);
@@ -1162,6 +1163,7 @@ fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
         popup.note.setHidden(true);
         popup.field.setHidden(true);
         popup.input_button.setHidden(true);
+        popup.scroll.setHidden(false);
         // Diff layouts never take typing: drop key status from an input box.
         popup.panel.resignKeyWindow();
         popup.replace_button.setFrame(NSRect::new(
@@ -1289,6 +1291,7 @@ fn layout_tabbed_message(
         popup.note.setHidden(true);
         popup.field.setHidden(true);
         popup.input_button.setHidden(true);
+        popup.scroll.setHidden(false);
         // Message layouts never take typing: drop key status from an input box.
         popup.panel.resignKeyWindow();
         popup.cancel_button.setFrame(NSRect::new(
