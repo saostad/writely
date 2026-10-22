@@ -50,6 +50,12 @@ pub enum UserEvent {
         generation: u64,
         result: Result<String, String>,
     },
+    // Fired only by the macOS describe-a-change worker.
+    #[cfg(target_os = "macos")]
+    Changed {
+        generation: u64,
+        result: Result<String, String>,
+    },
     PermissionGranted,
     SettingsChanged,
     ProviderMenuState {
@@ -112,7 +118,19 @@ struct Pending {
     copy_only: bool,
     /// A composed draft (macOS): the style menu's first item reads "Draft"
     /// and Replace reads "Insert".
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     draft: bool,
+    /// Latest describe-a-change result (macOS).
+    custom: Option<String>,
+    /// Text the describe-a-change request refines (macOS).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    custom_source: String,
+    /// Latest describe-a-change request, kept to re-show the box (macOS).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    custom_request: String,
+    /// A describe-a-change request is in flight (macOS).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    custom_in_flight: bool,
 }
 
 /// A compose box waiting for the user's description: the snapshot and the
@@ -162,9 +180,23 @@ fn selected_text(pending: &Pending) -> Option<&str> {
                 }
             }
         }
-        // The custom cache lands in item 4; nothing to insert until then.
-        popup::PopupTab::Custom => None,
+        popup::PopupTab::Custom => {
+            let cached = pending.custom.as_deref()?;
+            match providers::classify_suggestion(cached, &pending.original) {
+                providers::SuggestionOutcome::Suggestion => Some(cached),
+                providers::SuggestionOutcome::Unclear | providers::SuggestionOutcome::Unchanged => {
+                    None
+                }
+            }
+        }
     }
+}
+
+/// The text a describe-a-change request refines: what the selected tab shows,
+/// or the original text when the tab shows nothing (looks-good, loading or
+/// failed).
+fn custom_source_text(pending: &Pending) -> &str {
+    selected_text(pending).unwrap_or(&pending.original)
 }
 
 /// The selected rewrite style when Retry should re-request it: a rewrite tab
@@ -495,9 +527,41 @@ fn spawn_compose_thread(
     Ok(())
 }
 
-/// Handles a compose-box submit: stores the request, shows "Writing…" and
-/// spawns the compose worker. Only when a compose is open and no suggestion
-/// is showing; item 4 adds the describe-a-change submit.
+/// One describe-a-change worker (same pattern as the rewrite): calls
+/// `providers::change` off the main thread and sends `UserEvent::Changed`.
+/// Returns the spawn error for the caller to show.
+#[cfg(target_os = "macos")]
+fn spawn_change_thread(
+    proxy: &EventLoopProxy<UserEvent>,
+    app_settings: config::AppSettings,
+    key: Option<String>,
+    source: String,
+    request: String,
+    my_generation: u64,
+) -> Result<(), String> {
+    let worker_proxy = proxy.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("writely-change".to_string())
+        .spawn(move || {
+            // The key lives only in this thread's request; it is never
+            // logged or put in an error.
+            let result = providers::change(&app_settings, key.as_deref(), &source, &request);
+            if let Err(error) = worker_proxy.send_event(UserEvent::Changed {
+                generation: my_generation,
+                result,
+            }) {
+                eprintln!("Writely: could not deliver the changed text: {error}");
+            }
+        })
+    {
+        return Err(format!("Could not rewrite the text: {error}"));
+    }
+    Ok(())
+}
+
+/// Handles an input-box submit: a describe-a-change submit when a suggestion
+/// is pending on the Custom tab, else a compose-box submit (only when a
+/// compose is open and no suggestion is showing).
 #[cfg(target_os = "macos")]
 fn handle_input_submitted(
     proxy: &EventLoopProxy<UserEvent>,
@@ -507,6 +571,13 @@ fn handle_input_submitted(
     pending: &mut Option<Pending>,
     last_anchor: &mut Option<CaretRect>,
 ) {
+    if pending
+        .as_ref()
+        .is_some_and(|active| active.selected == popup::PopupTab::Custom)
+    {
+        handle_change_submitted(proxy, request, current_generation, pending, last_anchor);
+        return;
+    }
     let Some(active) = composing.as_mut() else {
         return;
     };
@@ -547,6 +618,80 @@ fn handle_input_submitted(
     {
         let request = &active.request;
         popup::show_input(popup::InputKind::Compose, request, Some(&error), &anchor);
+    }
+}
+
+/// Handles a describe-a-change submit: shows "Rewriting…" and spawns the
+/// change worker. Only when a suggestion is pending on the Custom tab.
+#[cfg(target_os = "macos")]
+fn handle_change_submitted(
+    proxy: &EventLoopProxy<UserEvent>,
+    request: String,
+    current_generation: u64,
+    pending: &mut Option<Pending>,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    let Some(active) = pending.as_mut() else {
+        return;
+    };
+    if active.selected != popup::PopupTab::Custom || !popup::is_visible() {
+        return;
+    }
+    let Some(anchor) = *last_anchor else {
+        eprintln!("Writely: could not show the rewrite: the caret position is unknown.");
+        return;
+    };
+    *last_anchor = Some(anchor);
+    if request.chars().count() > providers::MAX_REQUEST_CHARS {
+        popup::show_input(
+            popup::InputKind::Change,
+            &request,
+            Some("Keep the description under 1,000 characters."),
+            &anchor,
+        );
+        return;
+    }
+    popup::show_tabbed(
+        popup::PopupTab::Custom,
+        popup::TabContent::Message {
+            text: CUSTOM_PROGRESS_TEXT,
+            is_error: false,
+            loading: true,
+            retry: false,
+        },
+        &anchor,
+    );
+    active.custom_in_flight = true;
+    let (app_settings, key) = match resolve_settings() {
+        Ok(loaded) => loaded,
+        Err(failure) => {
+            active.custom_in_flight = false;
+            popup::show_tabbed(
+                popup::PopupTab::Custom,
+                popup::TabContent::Message {
+                    text: &failure.message,
+                    is_error: failure.is_error,
+                    loading: false,
+                    retry: false,
+                },
+                &anchor,
+            );
+            return;
+        }
+    };
+    active.custom_request = request.clone();
+    let source = active.custom_source.clone();
+    if let Err(error) = spawn_change_thread(
+        proxy,
+        app_settings,
+        key,
+        source,
+        request,
+        current_generation,
+    ) {
+        active.custom_in_flight = false;
+        let request = &active.custom_request;
+        popup::show_input(popup::InputKind::Change, request, Some(&error), &anchor);
     }
 }
 
@@ -621,7 +766,90 @@ fn handle_composed(
                 via_clipboard: false,
                 copy_only: false,
                 draft: true,
+                custom: None,
+                custom_source: String::new(),
+                custom_request: String::new(),
+                custom_in_flight: false,
             });
+        }
+    }
+}
+
+/// Handles the describe-a-change worker's reply: a result is cached and shown
+/// as a diff against the original when Custom is still selected; errors and
+/// UNCLEAR re-show the box with the typed request kept. Like `handle_rewrite`,
+/// the generation is never bumped and nothing shows on another tab.
+#[cfg(target_os = "macos")]
+fn handle_changed(
+    current_generation: u64,
+    event_generation: u64,
+    result: Result<String, String>,
+    pending: &mut Option<Pending>,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    // Drop late replies: a newer click, typing that hid the popup, or a move
+    // to another tab wins.
+    if event_generation != current_generation || !popup::is_visible() {
+        return;
+    }
+    let Some(active) = pending.as_mut() else {
+        return;
+    };
+    active.custom_in_flight = false;
+    let tab = popup::PopupTab::Custom;
+    let still_selected = active.selected == tab;
+    match result {
+        Ok(changed) => {
+            if providers::classify_suggestion(&changed, &active.original)
+                == providers::SuggestionOutcome::Unclear
+            {
+                // Not cached, so picking the tab again retries.
+                if still_selected {
+                    match *last_anchor {
+                        Some(anchor) => popup::show_input(
+                            popup::InputKind::Change,
+                            &active.custom_request,
+                            Some(
+                                "Writely couldn't understand the request. Try describing it differently.",
+                            ),
+                            &anchor,
+                        ),
+                        None => eprintln!(
+                            "Writely: could not show the rewrite: the caret position is unknown."
+                        ),
+                    }
+                }
+                return;
+            }
+            if still_selected {
+                match *last_anchor {
+                    Some(anchor) => {
+                        show_rewrite_result(tab, &changed, &active.original, &anchor);
+                    }
+                    None => eprintln!(
+                        "Writely: could not show the rewrite: the caret position is unknown."
+                    ),
+                }
+            }
+            active.custom = Some(changed);
+        }
+        Err(error) => {
+            // Not cached, so picking the tab again retries.
+            let message = format!("Could not rewrite the text: {error}");
+            eprintln!("Writely: {message}");
+            if still_selected {
+                match *last_anchor {
+                    Some(anchor) => popup::show_input(
+                        popup::InputKind::Change,
+                        &active.custom_request,
+                        Some(&message),
+                        &anchor,
+                    ),
+                    None => eprintln!(
+                        "Writely: could not show the rewrite: the caret position is unknown."
+                    ),
+                }
+            }
         }
     }
 }
@@ -783,6 +1011,7 @@ fn handle_copied_text(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_icon_clicked(
     proxy: &EventLoopProxy<UserEvent>,
     generation: &mut u64,
@@ -1121,6 +1350,10 @@ fn handle_suggestion(
                         via_clipboard: active.via_clipboard,
                         copy_only,
                         draft: false,
+                        custom: None,
+                        custom_source: String::new(),
+                        custom_request: String::new(),
+                        custom_in_flight: false,
                     });
                 }
                 providers::SuggestionOutcome::Suggestion => {
@@ -1157,6 +1390,10 @@ fn handle_suggestion(
                         via_clipboard: active.via_clipboard,
                         copy_only,
                         draft: false,
+                        custom: None,
+                        custom_source: String::new(),
+                        custom_request: String::new(),
+                        custom_in_flight: false,
                     });
                 }
             }
@@ -1205,6 +1442,10 @@ fn show_rewrite_result(tab: popup::PopupTab, rewrite: &str, original: &str, anch
     }
 }
 
+/// Progress text while a describe-a-change request loads. macOS only.
+#[cfg(target_os = "macos")]
+const CUSTOM_PROGRESS_TEXT: &str = "Rewriting…";
+
 fn handle_tab_clicked(
     proxy: &EventLoopProxy<UserEvent>,
     tab: popup::PopupTab,
@@ -1224,6 +1465,12 @@ fn handle_tab_clicked(
     };
     #[cfg(target_os = "macos")]
     popup::set_draft_mode(active.draft);
+    // A describe-a-change request refines the text on screen: capture it
+    // before switching tabs, so a second "Describe a change…" refines the
+    // latest result.
+    if tab == popup::PopupTab::Custom {
+        active.custom_source = custom_source_text(active).to_string();
+    }
     active.selected = tab;
     popup::set_primary_label(if active.copy_only { "Copy" } else { "Replace" });
     match tab {
@@ -1315,8 +1562,31 @@ fn handle_tab_clicked(
                 }
             }
         }
-        // The describe-a-change box lands in item 4.
-        popup::PopupTab::Custom => {}
+        popup::PopupTab::Custom => {
+            #[cfg(target_os = "macos")]
+            {
+                if active.custom_in_flight {
+                    // A request is already running: keep showing its loading
+                    // state instead of starting a second one.
+                    popup::show_tabbed(
+                        tab,
+                        popup::TabContent::Message {
+                            text: CUSTOM_PROGRESS_TEXT,
+                            is_error: false,
+                            loading: true,
+                            retry: false,
+                        },
+                        &anchor,
+                    );
+                } else {
+                    popup::show_input(popup::InputKind::Change, "", None, &anchor);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // Never constructed off macOS; the input box is macOS only.
+            }
+        }
     }
 }
 
@@ -2419,6 +2689,19 @@ fn main() {
                     &mut last_anchor,
                 );
             }
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(UserEvent::Changed {
+                generation: event_generation,
+                result,
+            }) => {
+                handle_changed(
+                    generation,
+                    event_generation,
+                    result,
+                    &mut pending,
+                    &mut last_anchor,
+                );
+            }
             Event::UserEvent(UserEvent::TextCheckResult {
                 generation: event_generation,
                 result,
@@ -2440,8 +2723,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_range, dimmed_rgba, icon_ready, menu_updates, pause_item_text, provider_item_text,
-        ready_index, rewrite_retry_style, selected_text, style_index, Pending,
+        compose_range, custom_source_text, dimmed_rgba, icon_ready, menu_updates, pause_item_text,
+        provider_item_text, ready_index, rewrite_retry_style, selected_text, style_index, Pending,
     };
     use crate::config::Provider;
     use crate::popup::PopupTab;
@@ -2461,6 +2744,10 @@ mod tests {
             via_clipboard: false,
             copy_only: false,
             draft: false,
+            custom: None,
+            custom_source: String::new(),
+            custom_request: String::new(),
+            custom_in_flight: false,
         }
     }
 
@@ -2531,6 +2818,39 @@ mod tests {
         pending.rewrites[style_index(RewriteStyle::Friendly)] =
             Some("She go to school.".to_string());
         assert_eq!(selected_text(&pending), None);
+    }
+
+    #[test]
+    fn selected_text_custom_tab() {
+        // Uncached: nothing to insert.
+        let mut pending = test_pending();
+        pending.selected = PopupTab::Custom;
+        assert_eq!(selected_text(&pending), None);
+        // Cached result: insert it.
+        pending.custom = Some("She goes to school, you know!".to_string());
+        assert_eq!(
+            selected_text(&pending),
+            Some("She goes to school, you know!")
+        );
+        // Cached but unchanged: nothing to insert.
+        pending.custom = Some("She go to school.".to_string());
+        assert_eq!(selected_text(&pending), None);
+    }
+
+    #[test]
+    fn custom_source_prefers_shown_text() {
+        // Correction shown: refine the correction.
+        let pending = test_pending();
+        assert_eq!(custom_source_text(&pending), "She goes to school.");
+        // Looks-good: refine the original.
+        let mut looks_good = test_pending();
+        looks_good.correction = None;
+        assert_eq!(custom_source_text(&looks_good), "She go to school.");
+        // After a custom result: refine that result.
+        let mut custom = test_pending();
+        custom.selected = PopupTab::Custom;
+        custom.custom = Some("She really goes to school.".to_string());
+        assert_eq!(custom_source_text(&custom), "She really goes to school.");
     }
 
     #[test]
