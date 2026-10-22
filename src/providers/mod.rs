@@ -165,11 +165,7 @@ pub fn rewrite(
 pub const COMPOSE_INSTRUCTION: &str = "You write English text for the user. The user describes what they want to write; write that text, ready to paste. Use correct grammar, spelling and punctuation. Keep it as short as the request allows. Never invent names, dates, numbers or other facts the user didn't give; use a placeholder in square brackets instead, like [name]. Return only the text, with no title, quotes or explanation. If the request is not understandable (random letters or gibberish), reply with exactly UNCLEAR and nothing else.";
 
 /// Writes new text from the user's description of what they want to write.
-pub fn compose(
-    settings: &AppSettings,
-    key: Option<&str>,
-    request: &str,
-) -> Result<String, String> {
+pub fn compose(settings: &AppSettings, key: Option<&str>, request: &str) -> Result<String, String> {
     dispatch(settings, key, request, COMPOSE_INSTRUCTION)
 }
 
