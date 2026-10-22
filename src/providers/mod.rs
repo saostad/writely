@@ -162,22 +162,27 @@ pub fn rewrite(
     dispatch(settings, key, text, &instruction)
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub const COMPOSE_INSTRUCTION: &str = "You write English text for the user. The user describes what they want to write; write that text, ready to paste. Use correct grammar, spelling and punctuation. Keep it as short as the request allows. Never invent names, dates, numbers or other facts the user didn't give; use a placeholder in square brackets instead, like [name]. Return only the text, with no title, quotes or explanation. If the request is not understandable (random letters or gibberish), reply with exactly UNCLEAR and nothing else.";
 
 /// Writes new text from the user's description of what they want to write.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub fn compose(settings: &AppSettings, key: Option<&str>, request: &str) -> Result<String, String> {
     dispatch(settings, key, request, COMPOSE_INSTRUCTION)
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub const CHANGE_INSTRUCTION: &str = "You rewrite English text the way the user asks. The message has the user's request after \"Request:\" and the text after \"Text:\". Apply the request, and fix grammar, spelling and punctuation. Keep the meaning and every fact unless the request asks to change them; never add facts the user didn't give. Keep line breaks and paragraph breaks unless the request asks otherwise. Return only the rewritten text, with no quotes or explanation. If the request or the text is not understandable, reply with exactly UNCLEAR and nothing else.";
 
 /// The user message for a describe-a-change request: the request, then the
 /// text to change.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub fn change_message(request: &str, text: &str) -> String {
     format!("Request: {request}\n\nText:\n{text}")
 }
 
 /// Rewrites `text` the way `request` asks.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub fn change(
     settings: &AppSettings,
     key: Option<&str>,
@@ -193,6 +198,7 @@ pub fn change(
 }
 
 /// Longest accepted compose/describe-a-change request, in chars.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub const MAX_REQUEST_CHARS: usize = 1000;
 
 #[cfg(test)]
