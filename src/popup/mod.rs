@@ -85,14 +85,14 @@ pub fn show_suggestion(original: &str, suggestion: &str, caret: &CaretRect) {
 pub enum PopupTab {
     Correct,
     Rewrite(RewriteStyle),
-    /// Never constructed off macOS: only the macOS popup has the input box.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Never constructed on Linux: only the macOS/Windows popups have the input box.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     Custom,
 }
 
 /// Which text box `show_input` shows: a compose box (no style menu) or a
-/// describe-a-change box (with the style menu). macOS only.
-#[cfg(target_os = "macos")]
+/// describe-a-change box (with the style menu). macOS and Windows only.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputKind {
     Compose,
@@ -149,18 +149,32 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
 }
 
 /// Shows the popup with an editable text box: `prefill` as its text and the
-/// optional `note` (an error) above it in red. macOS only.
-#[cfg(target_os = "macos")]
+/// optional `note` (an error) above it in red. macOS and Windows only.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn show_input(kind: InputKind, prefill: &str, note: Option<&str>, caret: &CaretRect) {
-    macos::show_input(kind, prefill, note, caret);
+    #[cfg(target_os = "macos")]
+    {
+        macos::show_input(kind, prefill, note, caret);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::show_input(kind, prefill, note, caret);
+    }
 }
 
 /// Draft mode for composed text: the style menu's first item reads "Draft"
 /// and the Replace button reads "Insert". Off restores "Fix grammar" and
-/// "Replace". macOS only.
-#[cfg(target_os = "macos")]
+/// "Replace". macOS and Windows only.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn set_draft_mode(draft: bool) {
-    macos::set_draft_mode(draft);
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_draft_mode(draft);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::set_draft_mode(draft);
+    }
 }
 
 pub fn hide() {
@@ -218,6 +232,20 @@ pub fn set_copy_feedback(copied: bool) {
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub fn shows_copy_button(replace_visible: bool, primary_label: &str) -> bool {
     replace_visible && primary_label != "Copy"
+}
+
+/// Whether the popup's input box currently holds keyboard focus: true on
+/// Windows while the user types in our own box (so caret events from our
+/// focus switch don't dismiss it). Always false elsewhere.
+pub fn input_has_focus() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::input_has_focus()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
 }
 
 pub fn focus_handoff_recent() -> bool {

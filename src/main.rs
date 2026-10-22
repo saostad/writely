@@ -28,6 +28,11 @@ use text_access::{CaretRect, FieldSnapshot};
 pub enum UserEvent {
     MenuEvent(MenuEvent),
     CaretChanged,
+    // Fired only by the Windows popup's dismiss controls (Cancel, the close
+    // button, Esc in the text box): like CaretChanged for the popup state,
+    // without the watcher/icon part.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    PopupDismissed,
     IconClicked,
     HotkeyPressed,
     ReplaceClicked,
@@ -41,8 +46,8 @@ pub enum UserEvent {
     RetryClicked,
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     CopyFeedbackEnded(u64),
-    // Fired only by the macOS input box.
-    #[cfg(target_os = "macos")]
+    // Fired only by the macOS/Windows input box.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     InputSubmitted(String),
     // Fired only by the macOS compose worker.
     #[cfg(target_os = "macos")]
