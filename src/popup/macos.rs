@@ -890,9 +890,10 @@ fn layout_plain(text: &str, is_error: bool, footer: Footer) -> f64 {
         } else {
             popup.text.setTextColor(Some(&NSColor::labelColor()));
         }
-        // Loading state: a small spinning indicator before "Checking…".
-        let checking = text == "Checking…" && !is_error && footer == Footer::None;
-        let text_indent = if checking { 18.0 } else { 0.0 };
+        // Loading state: a small spinning indicator before "Checking…" and "Writing…".
+        let loading =
+            (text == "Checking…" || text == "Writing…") && !is_error && footer == Footer::None;
+        let text_indent = if loading { 18.0 } else { 0.0 };
         let text_width = CARD_WIDTH - 2.0 * SIDE_PAD - text_indent;
         // SAFETY: the text container exists for a freshly created NSTextView.
         unsafe {
@@ -950,7 +951,7 @@ fn layout_plain(text: &str, is_error: bool, footer: Footer) -> f64 {
             NSPoint::new(0.0, 0.0),
             NSSize::new(text_width, body_height.max(needed)),
         ));
-        if checking {
+        if loading {
             popup.spinner.setHidden(false);
             popup.spinner.setFrame(NSRect::new(
                 NSPoint::new(SIDE_PAD, footer_height + body_height - 16.0),

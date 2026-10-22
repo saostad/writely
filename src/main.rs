@@ -41,9 +41,15 @@ pub enum UserEvent {
     RetryClicked,
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     CopyFeedbackEnded(u64),
-    // Fired only by the macOS input box; the handler lands with items 3–4.
+    // Fired only by the macOS input box.
     #[cfg(target_os = "macos")]
     InputSubmitted(String),
+    // Fired only by the macOS compose worker.
+    #[cfg(target_os = "macos")]
+    Composed {
+        generation: u64,
+        result: Result<String, String>,
+    },
     PermissionGranted,
     SettingsChanged,
     ProviderMenuState {
@@ -104,6 +110,31 @@ struct Pending {
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     via_clipboard: bool,
     copy_only: bool,
+    /// A composed draft (macOS): the style menu's first item reads "Draft"
+    /// and Replace reads "Insert".
+    draft: bool,
+}
+
+/// A compose box waiting for the user's description: the snapshot and the
+/// empty insert range, filled in once the draft arrives. Only the macOS
+/// input box constructs it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Composing {
+    snap: FieldSnapshot,
+    range: Range<usize>,
+    pid: u32,
+    request: String,
+}
+
+/// The insert range for a compose: an empty range at the caret when the caret
+/// offset is known, else the whole (blank) field.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn compose_range(caret_known: bool, caret: usize, field_len: usize) -> Range<usize> {
+    if caret_known {
+        caret..caret
+    } else {
+        0..field_len
+    }
 }
 
 /// Index into `Pending::rewrites` for a style (its position in
@@ -408,6 +439,193 @@ fn spawn_rewrite_thread(
     Ok(())
 }
 
+/// Remembers the snapshot and the empty insert range and shows the compose
+/// box. macOS only; Windows/Linux keep "Type a sentence first."
+#[cfg(target_os = "macos")]
+fn start_composing(
+    snap: FieldSnapshot,
+    composing: &mut Option<Composing>,
+    anchor: Option<CaretRect>,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    let range = compose_range(snap.caret_known, snap.caret, snap.text.chars().count());
+    let pid = snap.pid;
+    *composing = Some(Composing {
+        snap,
+        range,
+        pid,
+        request: String::new(),
+    });
+    if let Some(rect) = anchor {
+        *last_anchor = Some(rect);
+        popup::show_input(popup::InputKind::Compose, "", None, &rect);
+    } else {
+        eprintln!("Writely: could not show the suggestion: the caret position is unknown.");
+    }
+}
+
+/// One compose worker (same pattern as the grammar check): calls
+/// `providers::compose` off the main thread and sends `UserEvent::Composed`.
+/// Returns the spawn error for the caller to show.
+#[cfg(target_os = "macos")]
+fn spawn_compose_thread(
+    proxy: &EventLoopProxy<UserEvent>,
+    app_settings: config::AppSettings,
+    key: Option<String>,
+    request: String,
+    my_generation: u64,
+) -> Result<(), String> {
+    let worker_proxy = proxy.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("writely-compose".to_string())
+        .spawn(move || {
+            // The key lives only in this thread's request; it is never
+            // logged or put in an error.
+            let result = providers::compose(&app_settings, key.as_deref(), &request);
+            if let Err(error) = worker_proxy.send_event(UserEvent::Composed {
+                generation: my_generation,
+                result,
+            }) {
+                eprintln!("Writely: could not deliver the composed text: {error}");
+            }
+        })
+    {
+        return Err(format!("Could not write the text: {error}"));
+    }
+    Ok(())
+}
+
+/// Handles a compose-box submit: stores the request, shows "Writing…" and
+/// spawns the compose worker. Only when a compose is open and no suggestion
+/// is showing; item 4 adds the describe-a-change submit.
+#[cfg(target_os = "macos")]
+fn handle_input_submitted(
+    proxy: &EventLoopProxy<UserEvent>,
+    request: String,
+    current_generation: u64,
+    composing: &mut Option<Composing>,
+    pending: &mut Option<Pending>,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    let Some(active) = composing.as_mut() else {
+        return;
+    };
+    if pending.is_some() || !popup::is_visible() {
+        return;
+    }
+    let Some(anchor) = (*last_anchor).or(Some(active.snap.caret_rect)) else {
+        eprintln!("Writely: could not show the suggestion: the caret position is unknown.");
+        return;
+    };
+    *last_anchor = Some(anchor);
+    if request.chars().count() > providers::MAX_REQUEST_CHARS {
+        popup::show_input(
+            popup::InputKind::Compose,
+            &request,
+            Some("Keep the description under 1,000 characters."),
+            &anchor,
+        );
+        return;
+    }
+    let (app_settings, key) = match resolve_settings() {
+        Ok(loaded) => loaded,
+        Err(failure) => {
+            show_popup(
+                &failure.message,
+                failure.is_error,
+                false,
+                Some(anchor),
+                None,
+                last_anchor,
+            );
+            return;
+        }
+    };
+    active.request = request.clone();
+    show_popup("Writing…", false, false, Some(anchor), None, last_anchor);
+    if let Err(error) = spawn_compose_thread(proxy, app_settings, key, request, current_generation)
+    {
+        let request = &active.request;
+        popup::show_input(popup::InputKind::Compose, request, Some(&error), &anchor);
+    }
+}
+
+/// Handles the compose worker's reply: errors and UNCLEAR re-show the box
+/// with the typed text kept; a draft becomes a `Pending` shown as a diff of
+/// the draft against itself (plain text) in draft mode.
+#[cfg(target_os = "macos")]
+fn handle_composed(
+    current_generation: u64,
+    event_generation: u64,
+    result: Result<String, String>,
+    composing: &mut Option<Composing>,
+    pending: &mut Option<Pending>,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    // Drop late replies: a newer click, or typing that hid the popup, wins.
+    if event_generation != current_generation || !popup::is_visible() {
+        return;
+    }
+    let Some(active) = composing.as_ref() else {
+        return;
+    };
+    let Some(anchor) = (*last_anchor).or(Some(active.snap.caret_rect)) else {
+        eprintln!("Writely: could not show the suggestion: the caret position is unknown.");
+        return;
+    };
+    *last_anchor = Some(anchor);
+    match result {
+        Err(error) => {
+            let message = format!("Could not write the text: {error}");
+            eprintln!("Writely: {message}");
+            popup::show_input(
+                popup::InputKind::Compose,
+                &active.request,
+                Some(&message),
+                &anchor,
+            );
+        }
+        Ok(draft) => {
+            if providers::classify_suggestion(&draft, "") == providers::SuggestionOutcome::Unclear {
+                popup::show_input(
+                    popup::InputKind::Compose,
+                    &active.request,
+                    Some(
+                        "Writely couldn't understand the description. Try describing it differently.",
+                    ),
+                    &anchor,
+                );
+                return;
+            }
+            let Some(composed) = composing.take() else {
+                return;
+            };
+            popup::set_draft_mode(true);
+            popup::show_tabbed(
+                popup::PopupTab::Correct,
+                popup::TabContent::Diff {
+                    original: &draft,
+                    suggestion: &draft,
+                },
+                &anchor,
+            );
+            *pending = Some(Pending {
+                snap: Some(composed.snap),
+                range: composed.range,
+                original: draft.clone(),
+                correction: Some(draft),
+                rewrites: [None, None, None, None, None],
+                selected: popup::PopupTab::Correct,
+                rewrite_in_flight: [false; 5],
+                pid: composed.pid,
+                via_clipboard: false,
+                copy_only: false,
+                draft: true,
+            });
+        }
+    }
+}
+
 /// Copy-and-paste flow (macOS): the layered chain (AX selection, menu-bar
 /// Copy, simulated ⌘C) runs in a `writely-copy` worker thread — it can take
 /// up to 2 s — which sends `UserEvent::CopiedText`. Never runs for a secure
@@ -571,6 +789,7 @@ fn handle_icon_clicked(
     checking: &mut Option<Checking>,
     pending: &mut Option<Pending>,
     failed_check: &mut Option<Checking>,
+    composing: &mut Option<Composing>,
     last_anchor: &mut Option<CaretRect>,
     from_hotkey: bool,
 ) {
@@ -580,6 +799,7 @@ fn handle_icon_clicked(
     *pending = None;
     *checking = None;
     *failed_check = None;
+    *composing = None;
     // `live_pid` is only consumed by macOS-only paths below; keep the
     // binding on all targets and allow it to be unused elsewhere.
     #[cfg_attr(
@@ -705,15 +925,23 @@ fn handle_icon_clicked(
                 (range, sentence)
             }
             text_access::NoCaretDecision::Empty => {
-                show_popup(
-                    "Type a sentence first.",
-                    false,
-                    false,
-                    anchor,
-                    None,
-                    last_anchor,
-                );
-                return;
+                #[cfg(target_os = "macos")]
+                {
+                    start_composing(snap, composing, anchor, last_anchor);
+                    return;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    show_popup(
+                        "Type a sentence first.",
+                        false,
+                        false,
+                        anchor,
+                        None,
+                        last_anchor,
+                    );
+                    return;
+                }
             }
             text_access::NoCaretDecision::TooLong => {
                 // The whole field doesn't fit: on macOS try the clipboard
@@ -749,28 +977,44 @@ fn handle_icon_clicked(
                 (range, sentence)
             }
             None => {
-                show_popup(
-                    "Type a sentence first.",
-                    false,
-                    false,
-                    anchor,
-                    None,
-                    last_anchor,
-                );
-                return;
+                #[cfg(target_os = "macos")]
+                {
+                    start_composing(snap, composing, anchor, last_anchor);
+                    return;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    show_popup(
+                        "Type a sentence first.",
+                        false,
+                        false,
+                        anchor,
+                        None,
+                        last_anchor,
+                    );
+                    return;
+                }
             }
         }
     };
     if sentence.trim().is_empty() {
-        show_popup(
-            "Type a sentence first.",
-            false,
-            false,
-            anchor,
-            None,
-            last_anchor,
-        );
-        return;
+        #[cfg(target_os = "macos")]
+        {
+            start_composing(snap, composing, anchor, last_anchor);
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            show_popup(
+                "Type a sentence first.",
+                false,
+                false,
+                anchor,
+                None,
+                last_anchor,
+            );
+            return;
+        }
     }
     show_popup("Checking…", false, false, anchor, None, last_anchor);
     let pid = snap.pid;
@@ -847,6 +1091,9 @@ fn handle_suggestion(
                     {
                         *last_anchor = Some(rect);
                         popup::set_primary_label(if copy_only { "Copy" } else { "Replace" });
+                        // A normal check is never a draft: clear draft mode from a compose.
+                        #[cfg(target_os = "macos")]
+                        popup::set_draft_mode(false);
                         popup::show_tabbed(
                             popup::PopupTab::Correct,
                             popup::TabContent::Message {
@@ -873,6 +1120,7 @@ fn handle_suggestion(
                         pid: active.pid,
                         via_clipboard: active.via_clipboard,
                         copy_only,
+                        draft: false,
                     });
                 }
                 providers::SuggestionOutcome::Suggestion => {
@@ -881,6 +1129,9 @@ fn handle_suggestion(
                     {
                         *last_anchor = Some(rect);
                         popup::set_primary_label(if copy_only { "Copy" } else { "Replace" });
+                        // A normal check is never a draft: clear draft mode from a compose.
+                        #[cfg(target_os = "macos")]
+                        popup::set_draft_mode(false);
                         popup::show_tabbed(
                             popup::PopupTab::Correct,
                             popup::TabContent::Diff {
@@ -905,6 +1156,7 @@ fn handle_suggestion(
                         pid: active.pid,
                         via_clipboard: active.via_clipboard,
                         copy_only,
+                        draft: false,
                     });
                 }
             }
@@ -970,6 +1222,8 @@ fn handle_tab_clicked(
         eprintln!("Writely: could not show the rewrite: the caret position is unknown.");
         return;
     };
+    #[cfg(target_os = "macos")]
+    popup::set_draft_mode(active.draft);
     active.selected = tab;
     popup::set_primary_label(if active.copy_only { "Copy" } else { "Replace" });
     match tab {
@@ -1082,6 +1336,8 @@ fn handle_rewrite(
     let Some(active) = pending.as_mut() else {
         return;
     };
+    #[cfg(target_os = "macos")]
+    popup::set_draft_mode(active.draft);
     let index = style_index(style);
     active.rewrite_in_flight[index] = false;
     let tab = popup::PopupTab::Rewrite(style);
@@ -1663,6 +1919,7 @@ fn main() {
     let mut generation: u64 = 0;
     let mut checking: Option<Checking> = None;
     let mut pending: Option<Pending> = None;
+    let mut composing: Option<Composing> = None;
     let mut last_anchor: Option<CaretRect> = None;
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let mut copy_feedback_id: u64 = 0;
@@ -1856,6 +2113,7 @@ fn main() {
                         generation = generation.wrapping_add(1);
                         checking = None;
                         pending = None;
+                        composing = None;
                         // Linux: the AT-SPI watcher thread has no way to stop
                         // (no Drop on WatcherInner), so it is kept and its
                         // events are ignored while paused; never start a
@@ -1891,6 +2149,7 @@ fn main() {
                     checking = None;
                     pending = None;
                     failed_check = None;
+                    composing = None;
                     // A CheckMenuItem toggles itself on click; undo that
                     // instantly so the clicked item shows checked right away.
                     for (listed, item) in &provider_items {
@@ -1980,6 +2239,7 @@ fn main() {
                     checking = None;
                     pending = None;
                     failed_check = None;
+                    composing = None;
                 }
                 if let Some(watcher) = caret_watcher.as_mut() {
                     watcher.handle_caret_changed();
@@ -2002,6 +2262,7 @@ fn main() {
                     &mut checking,
                     &mut pending,
                     &mut failed_check,
+                    &mut composing,
                     &mut last_anchor,
                     false,
                 );
@@ -2013,6 +2274,7 @@ fn main() {
                     &mut checking,
                     &mut pending,
                     &mut failed_check,
+                    &mut composing,
                     &mut last_anchor,
                     true,
                 );
@@ -2056,9 +2318,17 @@ fn main() {
                     &mut last_anchor,
                 );
             }
-            // The input handler lands with items 3–4; ignored until then.
             #[cfg(target_os = "macos")]
-            Event::UserEvent(UserEvent::InputSubmitted(_)) => {}
+            Event::UserEvent(UserEvent::InputSubmitted(request)) => {
+                handle_input_submitted(
+                    &watcher_proxy,
+                    request,
+                    generation,
+                    &mut composing,
+                    &mut pending,
+                    &mut last_anchor,
+                );
+            }
             Event::UserEvent(UserEvent::PermissionGranted) => {
                 handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon, paused);
             }
@@ -2135,6 +2405,20 @@ fn main() {
                     &mut last_anchor,
                 );
             }
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(UserEvent::Composed {
+                generation: event_generation,
+                result,
+            }) => {
+                handle_composed(
+                    generation,
+                    event_generation,
+                    result,
+                    &mut composing,
+                    &mut pending,
+                    &mut last_anchor,
+                );
+            }
             Event::UserEvent(UserEvent::TextCheckResult {
                 generation: event_generation,
                 result,
@@ -2156,8 +2440,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        dimmed_rgba, icon_ready, menu_updates, pause_item_text, provider_item_text, ready_index,
-        rewrite_retry_style, selected_text, style_index, Pending,
+        compose_range, dimmed_rgba, icon_ready, menu_updates, pause_item_text, provider_item_text,
+        ready_index, rewrite_retry_style, selected_text, style_index, Pending,
     };
     use crate::config::Provider;
     use crate::popup::PopupTab;
@@ -2176,6 +2460,7 @@ mod tests {
             pid: 0,
             via_clipboard: false,
             copy_only: false,
+            draft: false,
         }
     }
 
@@ -2352,6 +2637,13 @@ mod tests {
         assert!(updates.iter().all(|(_, checked, _)| checked.is_none()));
         assert_eq!(updates[1].2.as_deref(), Some("Together AI (not set up)"));
         assert!(updates[0].2.is_none() && updates[2].2.is_none());
+    }
+
+    #[test]
+    fn compose_range_targets_caret_or_whole_blank_field() {
+        assert_eq!(compose_range(true, 7, 20), 7..7);
+        assert_eq!(compose_range(false, 0, 0), 0..0);
+        assert_eq!(compose_range(false, 0, 12), 0..12);
     }
 
     #[test]
