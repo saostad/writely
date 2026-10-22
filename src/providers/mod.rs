@@ -127,20 +127,31 @@ pub(crate) fn truncate_body(body: &str) -> String {
     body.chars().take(300).collect()
 }
 
-/// One entry point for every provider: same system instruction, temperature 0
-/// and UNCLEAR handling. The key is `None` for Ollama (no key needed); for
+/// The 3-provider dispatch shared by every request: same model, effort,
+/// temperature 0, key header and error parsing; only the text and the system
+/// instruction differ. The key is `None` for Ollama (no key needed); for
 /// Gemini and Together a missing key or model is an error for the popup.
-pub fn suggest(settings: &AppSettings, key: Option<&str>, text: &str) -> Result<String, String> {
+fn dispatch(
+    settings: &AppSettings,
+    key: Option<&str>,
+    text: &str,
+    instruction: &str,
+) -> Result<String, String> {
     match settings.provider {
-        Provider::Gemini => gemini::suggest(settings, key, text, gemini::SYSTEM_INSTRUCTION),
-        Provider::Together => together::suggest(settings, key, text, gemini::SYSTEM_INSTRUCTION),
-        Provider::Ollama => ollama::suggest(settings, text, gemini::SYSTEM_INSTRUCTION),
+        Provider::Gemini => gemini::suggest(settings, key, text, instruction),
+        Provider::Together => together::suggest(settings, key, text, instruction),
+        Provider::Ollama => ollama::suggest(settings, text, instruction),
     }
 }
 
+/// One entry point for every provider: the grammar instruction, temperature 0
+/// and UNCLEAR handling.
+pub fn suggest(settings: &AppSettings, key: Option<&str>, text: &str) -> Result<String, String> {
+    dispatch(settings, key, text, gemini::SYSTEM_INSTRUCTION)
+}
+
 /// Same dispatch as [`suggest`], but with the given rewrite style's system
-/// instruction instead of the grammar one. Everything else (model, effort,
-/// temperature 0, key header, error parsing) stays the same.
+/// instruction instead of the grammar one.
 pub fn rewrite(
     settings: &AppSettings,
     key: Option<&str>,
@@ -148,17 +159,51 @@ pub fn rewrite(
     style: RewriteStyle,
 ) -> Result<String, String> {
     let instruction = style.instruction();
-    match settings.provider {
-        Provider::Gemini => gemini::suggest(settings, key, text, &instruction),
-        Provider::Together => together::suggest(settings, key, text, &instruction),
-        Provider::Ollama => ollama::suggest(settings, text, &instruction),
-    }
+    dispatch(settings, key, text, &instruction)
 }
+
+pub const COMPOSE_INSTRUCTION: &str = "You write English text for the user. The user describes what they want to write; write that text, ready to paste. Use correct grammar, spelling and punctuation. Keep it as short as the request allows. Never invent names, dates, numbers or other facts the user didn't give; use a placeholder in square brackets instead, like [name]. Return only the text, with no title, quotes or explanation. If the request is not understandable (random letters or gibberish), reply with exactly UNCLEAR and nothing else.";
+
+/// Writes new text from the user's description of what they want to write.
+pub fn compose(
+    settings: &AppSettings,
+    key: Option<&str>,
+    request: &str,
+) -> Result<String, String> {
+    dispatch(settings, key, request, COMPOSE_INSTRUCTION)
+}
+
+pub const CHANGE_INSTRUCTION: &str = "You rewrite English text the way the user asks. The message has the user's request after \"Request:\" and the text after \"Text:\". Apply the request, and fix grammar, spelling and punctuation. Keep the meaning and every fact unless the request asks to change them; never add facts the user didn't give. Keep line breaks and paragraph breaks unless the request asks otherwise. Return only the rewritten text, with no quotes or explanation. If the request or the text is not understandable, reply with exactly UNCLEAR and nothing else.";
+
+/// The user message for a describe-a-change request: the request, then the
+/// text to change.
+pub fn change_message(request: &str, text: &str) -> String {
+    format!("Request: {request}\n\nText:\n{text}")
+}
+
+/// Rewrites `text` the way `request` asks.
+pub fn change(
+    settings: &AppSettings,
+    key: Option<&str>,
+    text: &str,
+    request: &str,
+) -> Result<String, String> {
+    dispatch(
+        settings,
+        key,
+        &change_message(request, text),
+        CHANGE_INSTRUCTION,
+    )
+}
+
+/// Longest accepted compose/describe-a-change request, in chars.
+pub const MAX_REQUEST_CHARS: usize = 1000;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_suggestion, clean_reply, strip_think_block, RewriteStyle, SuggestionOutcome,
+        change_message, classify_suggestion, clean_reply, strip_think_block, RewriteStyle,
+        SuggestionOutcome, CHANGE_INSTRUCTION, COMPOSE_INSTRUCTION,
     };
 
     #[test]
@@ -262,6 +307,24 @@ mod tests {
             assert!(
                 instruction.starts_with("You rewrite English text."),
                 "instruction for {style:?} has the wrong shape"
+            );
+        }
+    }
+
+    #[test]
+    fn change_message_puts_request_before_text() {
+        assert_eq!(
+            change_message("sound confident", "We might go."),
+            "Request: sound confident\n\nText:\nWe might go."
+        );
+    }
+
+    #[test]
+    fn compose_and_change_instructions_end_in_unclear() {
+        for instruction in [COMPOSE_INSTRUCTION, CHANGE_INSTRUCTION] {
+            assert!(
+                instruction.contains("UNCLEAR"),
+                "instruction misses UNCLEAR: {instruction}"
             );
         }
     }
