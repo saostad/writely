@@ -49,14 +49,14 @@ pub enum UserEvent {
     // Fired only by the macOS/Windows input box.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     InputSubmitted(String),
-    // Fired only by the macOS compose worker.
-    #[cfg(target_os = "macos")]
+    // Fired only by the macOS/Windows compose worker.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     Composed {
         generation: u64,
         result: Result<String, String>,
     },
-    // Fired only by the macOS describe-a-change worker.
-    #[cfg(target_os = "macos")]
+    // Fired only by the macOS/Windows describe-a-change worker.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     Changed {
         generation: u64,
         result: Result<String, String>,
@@ -121,27 +121,27 @@ struct Pending {
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     via_clipboard: bool,
     copy_only: bool,
-    /// A composed draft (macOS): the style menu's first item reads "Draft"
-    /// and Replace reads "Insert".
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// A composed draft (macOS/Windows): the style menu's first item reads
+    /// "Draft" and Replace reads "Insert".
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     draft: bool,
-    /// Latest describe-a-change result (macOS).
+    /// Latest describe-a-change result (macOS/Windows).
     custom: Option<String>,
-    /// Text the describe-a-change request refines (macOS).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Text the describe-a-change request refines (macOS/Windows).
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     custom_source: String,
-    /// Latest describe-a-change request, kept to re-show the box (macOS).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Latest describe-a-change request, kept to re-show the box (macOS/Windows).
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     custom_request: String,
-    /// A describe-a-change request is in flight (macOS).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// A describe-a-change request is in flight (macOS/Windows).
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     custom_in_flight: bool,
 }
 
 /// A compose box waiting for the user's description: the snapshot and the
-/// empty insert range, filled in once the draft arrives. Only the macOS
-/// input box constructs it.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// empty insert range, filled in once the draft arrives. Only the
+/// macOS/Windows input box constructs it.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 struct Composing {
     snap: FieldSnapshot,
     range: Range<usize>,
@@ -151,7 +151,7 @@ struct Composing {
 
 /// The insert range for a compose: an empty range at the caret when the caret
 /// offset is known, else the whole (blank) field.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn compose_range(caret_known: bool, caret: usize, field_len: usize) -> Range<usize> {
     if caret_known {
         caret..caret
@@ -477,8 +477,8 @@ fn spawn_rewrite_thread(
 }
 
 /// Remembers the snapshot and the empty insert range and shows the compose
-/// box. macOS only; Windows/Linux keep "Type a sentence first."
-#[cfg(target_os = "macos")]
+/// box. macOS and Windows; Linux keeps "Type a sentence first."
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn start_composing(
     snap: FieldSnapshot,
     composing: &mut Option<Composing>,
@@ -504,7 +504,7 @@ fn start_composing(
 /// One compose worker (same pattern as the grammar check): calls
 /// `providers::compose` off the main thread and sends `UserEvent::Composed`.
 /// Returns the spawn error for the caller to show.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn spawn_compose_thread(
     proxy: &EventLoopProxy<UserEvent>,
     app_settings: config::AppSettings,
@@ -535,7 +535,7 @@ fn spawn_compose_thread(
 /// One describe-a-change worker (same pattern as the rewrite): calls
 /// `providers::change` off the main thread and sends `UserEvent::Changed`.
 /// Returns the spawn error for the caller to show.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn spawn_change_thread(
     proxy: &EventLoopProxy<UserEvent>,
     app_settings: config::AppSettings,
@@ -567,7 +567,7 @@ fn spawn_change_thread(
 /// Handles an input-box submit: a describe-a-change submit when a suggestion
 /// is pending on the Custom tab, else a compose-box submit (only when a
 /// compose is open and no suggestion is showing).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn handle_input_submitted(
     proxy: &EventLoopProxy<UserEvent>,
     request: String,
@@ -628,7 +628,7 @@ fn handle_input_submitted(
 
 /// Handles a describe-a-change submit: shows "Rewriting…" and spawns the
 /// change worker. Only when a suggestion is pending on the Custom tab.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn handle_change_submitted(
     proxy: &EventLoopProxy<UserEvent>,
     request: String,
@@ -703,7 +703,7 @@ fn handle_change_submitted(
 /// Handles the compose worker's reply: errors and UNCLEAR re-show the box
 /// with the typed text kept; a draft becomes a `Pending` shown as a diff of
 /// the draft against itself (plain text) in draft mode.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn handle_composed(
     current_generation: u64,
     event_generation: u64,
@@ -784,7 +784,7 @@ fn handle_composed(
 /// as a diff against the original when Custom is still selected; errors and
 /// UNCLEAR re-show the box with the typed request kept. Like `handle_rewrite`,
 /// the generation is never bumped and nothing shows on another tab.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn handle_changed(
     current_generation: u64,
     event_generation: u64,
@@ -1159,12 +1159,12 @@ fn handle_icon_clicked(
                 (range, sentence)
             }
             text_access::NoCaretDecision::Empty => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
                     start_composing(snap, composing, anchor, last_anchor);
                     return;
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 {
                     show_popup(
                         "Type a sentence first.",
@@ -1211,12 +1211,12 @@ fn handle_icon_clicked(
                 (range, sentence)
             }
             None => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
                     start_composing(snap, composing, anchor, last_anchor);
                     return;
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 {
                     show_popup(
                         "Type a sentence first.",
@@ -1232,12 +1232,12 @@ fn handle_icon_clicked(
         }
     };
     if sentence.trim().is_empty() {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             start_composing(snap, composing, anchor, last_anchor);
             return;
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             show_popup(
                 "Type a sentence first.",
@@ -1326,7 +1326,7 @@ fn handle_suggestion(
                         *last_anchor = Some(rect);
                         popup::set_primary_label(if copy_only { "Copy" } else { "Replace" });
                         // A normal check is never a draft: clear draft mode from a compose.
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "windows"))]
                         popup::set_draft_mode(false);
                         popup::show_tabbed(
                             popup::PopupTab::Correct,
@@ -1368,7 +1368,7 @@ fn handle_suggestion(
                         *last_anchor = Some(rect);
                         popup::set_primary_label(if copy_only { "Copy" } else { "Replace" });
                         // A normal check is never a draft: clear draft mode from a compose.
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "windows"))]
                         popup::set_draft_mode(false);
                         popup::show_tabbed(
                             popup::PopupTab::Correct,
@@ -1448,7 +1448,7 @@ fn show_rewrite_result(tab: popup::PopupTab, rewrite: &str, original: &str, anch
 }
 
 /// Progress text while a describe-a-change request loads. macOS only.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const CUSTOM_PROGRESS_TEXT: &str = "Rewriting…";
 
 fn handle_tab_clicked(
@@ -1468,7 +1468,7 @@ fn handle_tab_clicked(
         eprintln!("Writely: could not show the rewrite: the caret position is unknown.");
         return;
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     popup::set_draft_mode(active.draft);
     // A describe-a-change request refines the text on screen: capture it
     // before switching tabs, so a second "Describe a change…" refines the
@@ -1568,7 +1568,7 @@ fn handle_tab_clicked(
             }
         }
         popup::PopupTab::Custom => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 if active.custom_in_flight {
                     // A request is already running: keep showing its loading
@@ -1587,9 +1587,9 @@ fn handle_tab_clicked(
                     popup::show_input(popup::InputKind::Change, "", None, &anchor);
                 }
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                // Never constructed off macOS; the input box is macOS only.
+                // Never constructed on Linux; the input box is macOS/Windows only.
             }
         }
     }
@@ -1611,7 +1611,7 @@ fn handle_rewrite(
     let Some(active) = pending.as_mut() else {
         return;
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     popup::set_draft_mode(active.draft);
     let index = style_index(style);
     active.rewrite_in_flight[index] = false;
@@ -2507,8 +2507,12 @@ fn main() {
                     return;
                 }
                 // Typing or moving focus hides the popup and drops any
-                // in-flight suggestion.
-                if popup::is_visible() && !popup::focus_handoff_recent() {
+                // in-flight suggestion — but not while the user types in
+                // our own input box (its focus switch fires this too).
+                if popup::is_visible()
+                    && !popup::focus_handoff_recent()
+                    && !popup::input_has_focus()
+                {
                     popup::hide();
                     generation = generation.wrapping_add(1);
                     checking = None;
@@ -2524,6 +2528,17 @@ fn main() {
                 // here, so per-keystroke work shrinks.
                 overlay::hide();
                 icon_due = Some(Instant::now() + ICON_IDLE_DELAY);
+            }
+            Event::UserEvent(UserEvent::PopupDismissed) => {
+                // From the Windows popup's dismiss controls: exactly the
+                // popup-state part of CaretChanged, without the watcher
+                // and icon part.
+                popup::hide();
+                generation = generation.wrapping_add(1);
+                checking = None;
+                pending = None;
+                failed_check = None;
+                composing = None;
             }
             Event::UserEvent(UserEvent::IconClicked) => {
                 // While paused the icon is hidden; a queued click from
@@ -2593,7 +2608,7 @@ fn main() {
                     &mut last_anchor,
                 );
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Event::UserEvent(UserEvent::InputSubmitted(request)) => {
                 handle_input_submitted(
                     &watcher_proxy,
@@ -2680,7 +2695,7 @@ fn main() {
                     &mut last_anchor,
                 );
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Event::UserEvent(UserEvent::Composed {
                 generation: event_generation,
                 result,
@@ -2694,7 +2709,7 @@ fn main() {
                     &mut last_anchor,
                 );
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Event::UserEvent(UserEvent::Changed {
                 generation: event_generation,
                 result,
