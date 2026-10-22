@@ -281,6 +281,8 @@ fn tab_label(tab: PopupTab) -> &'static str {
     match tab {
         PopupTab::Correct => "Fix grammar",
         PopupTab::Rewrite(style) => style.label(),
+        // Never constructed on Windows; the input box is macOS only.
+        PopupTab::Custom => "Describe a change…",
     }
 }
 
@@ -294,6 +296,8 @@ fn menu_id_for_tab(tab: PopupTab) -> u32 {
             .position(|candidate| *candidate == style)
             .map(|index| index as u32 + 2)
             .unwrap_or(1),
+        // Never in the Windows menu (macOS only); 0 is the reserved none id.
+        PopupTab::Custom => 0,
     }
 }
 

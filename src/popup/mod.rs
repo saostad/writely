@@ -78,13 +78,25 @@ pub fn show_suggestion(original: &str, suggestion: &str, caret: &CaretRect) {
     let _ = original;
 }
 
-/// The tabs of the suggestion popup: the grammar correction, or one rewrite
-/// style. macOS and Windows show them in a menu button in the footer; Linux
-/// keeps today's single-view popup.
+/// The tabs of the suggestion popup: the grammar correction, one rewrite
+/// style, or the user's own change description. macOS and Windows show them
+/// in a menu button in the footer; Linux keeps today's single-view popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PopupTab {
     Correct,
     Rewrite(RewriteStyle),
+    /// Never constructed off macOS: only the macOS popup has the input box.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Custom,
+}
+
+/// Which text box `show_input` shows: a compose box (no style menu) or a
+/// describe-a-change box (with the style menu). macOS only.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputKind {
+    Compose,
+    Change,
 }
 
 /// The body shown above the style menu: a word diff, or a plain message (with
@@ -134,6 +146,21 @@ pub fn show_tabbed(selected: PopupTab, content: TabContent, caret: &CaretRect) {
         }
         let _ = selected;
     }
+}
+
+/// Shows the popup with an editable text box: `prefill` as its text and the
+/// optional `note` (an error) above it in red. macOS only.
+#[cfg(target_os = "macos")]
+pub fn show_input(kind: InputKind, prefill: &str, note: Option<&str>, caret: &CaretRect) {
+    macos::show_input(kind, prefill, note, caret);
+}
+
+/// Draft mode for composed text: the style menu's first item reads "Draft"
+/// and the Replace button reads "Insert". Off restores "Fix grammar" and
+/// "Replace". macOS only.
+#[cfg(target_os = "macos")]
+pub fn set_draft_mode(draft: bool) {
+    macos::set_draft_mode(draft);
 }
 
 pub fn hide() {

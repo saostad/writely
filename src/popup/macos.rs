@@ -10,8 +10,9 @@ use objc2_app_kit::{
     NSFontWeightSemibold, NSForegroundColorAttributeName, NSImage, NSMenu, NSMenuItem,
     NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName, NSPopUpButton,
     NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSScrollView, NSStatusWindowLevel,
-    NSStrikethroughStyleAttributeName, NSTextField, NSTextView, NSView, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSStrikethroughStyleAttributeName, NSTextField, NSTextFieldBezelStyle, NSTextView, NSView,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSAttributedString, NSAttributedStringKey, NSDictionary, NSInteger,
@@ -20,7 +21,7 @@ use objc2_foundation::{
 };
 use tao::event_loop::EventLoopProxy;
 
-use super::{shows_copy_button, PopupTab, TabContent};
+use super::{shows_copy_button, InputKind, PopupTab, TabContent};
 use crate::providers::RewriteStyle;
 use crate::text_access::CaretRect;
 use crate::UserEvent;
@@ -38,6 +39,8 @@ const BODY_MIN: f64 = 40.0;
 const BODY_MAX: f64 = 340.0;
 /// Height of the icon panel, used to place the popup below the icon.
 const ICON_SIZE: f64 = 20.0;
+/// Height of the editable input field: about 3 lines at 13 pt.
+const INPUT_FIELD_HEIGHT: f64 = 56.0;
 
 static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
 
@@ -170,14 +173,107 @@ impl TabTarget {
     }
 }
 
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements and InputTarget does not implement Drop.
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    struct InputTarget;
+
+    // SAFETY: NSObjectProtocol has no safety requirements.
+    unsafe impl NSObjectProtocol for InputTarget {}
+
+    impl InputTarget {
+        #[unsafe(method(inputSubmitted:))]
+        fn input_submitted(&self, _sender: Option<&AnyObject>) {
+            // Fired by Return in the field and by the Write/Rewrite button.
+            // An empty field submits nothing.
+            let text = STATE.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .map(|popup| popup.field.stringValue().to_string())
+            });
+            let Some(text) = text else {
+                return;
+            };
+            if text.trim().is_empty() {
+                return;
+            }
+            if let Some(proxy) = PROXY.get() {
+                if let Err(error) = proxy.send_event(UserEvent::InputSubmitted(text)) {
+                    eprintln!("Writely: could not deliver the input event: {error}");
+                }
+            }
+        }
+    }
+);
+
+impl InputTarget {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: NSObject init signature is correct.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+define_class!(
+    // SAFETY: NSPanel has no subclassing requirements and KeyPanel does not implement Drop.
+    #[unsafe(super = NSPanel)]
+    #[thread_kind = MainThreadOnly]
+    struct KeyPanel;
+
+    // SAFETY: NSObjectProtocol has no safety requirements.
+    unsafe impl NSObjectProtocol for KeyPanel {}
+
+    impl KeyPanel {
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key_window(&self) -> bool {
+            // A borderless panel can't become key, so the input box could
+            // never take typing. The panel stays a nonactivating panel that
+            // becomes key only if needed, so buttons still never steal focus.
+            true
+        }
+
+        #[unsafe(method(cancelOperation:))]
+        fn cancel_operation(&self, _sender: Option<&AnyObject>) {
+            // Exactly like DismissTarget: Esc closes the popup.
+            if let Some(proxy) = PROXY.get() {
+                if let Err(error) = proxy.send_event(UserEvent::CaretChanged) {
+                    eprintln!("Writely: could not deliver the dismiss event: {error}");
+                }
+            }
+        }
+    }
+);
+
+impl KeyPanel {
+    fn new(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        mask: NSWindowStyleMask,
+        backing: NSBackingStoreType,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: initWithContentRect:styleMask:backing:defer: is NSWindow's
+        // designated initializer and mtm is the main thread.
+        unsafe {
+            msg_send![super(this), initWithContentRect: frame, styleMask: mask, backing: backing, defer: false]
+        }
+    }
+}
+
 /// Tag for menu items that never map to a tab (separators, section headers).
 const MENU_TAG_NONE: NSInteger = -1;
+/// Tag for "Describe a change…", after the five rewrite styles.
+const CUSTOM_TAG: NSInteger = 6;
 
-/// Tag 0 is `Correct`; tags 1..=5 follow `RewriteStyle::ALL`.
-/// Returns `None` for header/separator tags and anything unexpected.
+/// Tag 0 is `Correct`; tags 1..=5 follow `RewriteStyle::ALL`; tag 6 is
+/// `Custom`. Returns `None` for header/separator tags and anything unexpected.
 fn tab_for_tag(tag: NSInteger) -> Option<PopupTab> {
     if tag == 0 {
         Some(PopupTab::Correct)
+    } else if tag == CUSTOM_TAG {
+        Some(PopupTab::Custom)
     } else {
         usize::try_from(tag)
             .ok()
@@ -189,6 +285,7 @@ fn tab_for_tag(tag: NSInteger) -> Option<PopupTab> {
 fn tag_for_tab(tab: PopupTab) -> NSInteger {
     match tab {
         PopupTab::Correct => 0,
+        PopupTab::Custom => CUSTOM_TAG,
         PopupTab::Rewrite(style) => RewriteStyle::ALL
             .iter()
             .position(|candidate| *candidate == style)
@@ -356,6 +453,13 @@ fn build_style_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
             tag_for_tab(PopupTab::Rewrite(style)),
         ));
     }
+    menu.addItem(&separator_menu_item(mtm));
+    menu.addItem(&style_menu_item(
+        mtm,
+        "Describe a change…",
+        "text.bubble",
+        tag_for_tab(PopupTab::Custom),
+    ));
     menu
 }
 
@@ -389,7 +493,7 @@ impl SeparatorView {
 }
 
 struct PopupState {
-    panel: Retained<NSPanel>,
+    panel: Retained<KeyPanel>,
     card: Retained<NSVisualEffectView>,
     scroll: Retained<NSScrollView>,
     text: Retained<NSTextView>,
@@ -400,12 +504,20 @@ struct PopupState {
     copy_button: Retained<NSButton>,
     spinner: Retained<NSProgressIndicator>,
     style_button: Retained<NSPopUpButton>,
+    /// Red error note above the input field, shown only by `show_input`.
+    note: Retained<NSTextField>,
+    /// Editable text box, shown only by `show_input`.
+    field: Retained<NSTextField>,
+    /// Accent Write/Rewrite button, shown only by `show_input`.
+    input_button: Retained<NSButton>,
     #[allow(dead_code)]
     replace_target: Retained<ReplaceTarget>,
     #[allow(dead_code)]
     dismiss_target: Retained<DismissTarget>,
     #[allow(dead_code)]
     tab_target: Retained<TabTarget>,
+    #[allow(dead_code)]
+    input_target: Retained<InputTarget>,
     visible: bool,
     /// Global keyDown monitor, installed only while the popup is visible so
     /// typing hides the popup even in apps that send no AX notifications
@@ -439,13 +551,11 @@ fn ensure_popup(mtm: MainThreadMarker) {
             return;
         }
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 40.0));
-        // SAFETY: the content rect, style mask and backing store are valid and mtm is the main thread.
-        let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
-            NSPanel::alloc(mtm),
+        let panel = KeyPanel::new(
+            mtm,
             frame,
             NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
             NSBackingStoreType::Buffered,
-            false,
         );
         panel.setBecomesKeyOnlyIfNeeded(true);
         panel.setLevel(NSStatusWindowLevel);
@@ -618,6 +728,60 @@ fn ensure_popup(mtm: MainThreadMarker) {
         style_button.setHidden(true);
         card.addSubview(&style_button);
 
+        // Input-box views, added last so the title/close views stay at
+        // subview indices 0 and 1. Hidden until an input layout shows them.
+        let input_target = InputTarget::new(mtm);
+        let input_object: &AnyObject = &input_target;
+        let note = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        note.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        note.setTextColor(Some(&NSColor::systemRedColor()));
+        if let Some(cell) = note.cell() {
+            cell.setWraps(true);
+            cell.setScrollable(false);
+        }
+        note.setHidden(true);
+        card.addSubview(&note);
+
+        // SAFETY: initWithFrame: is the designated initializer and mtm is the main thread.
+        let field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(100.0, INPUT_FIELD_HEIGHT),
+            ),
+        );
+        field.setEditable(true);
+        field.setSelectable(true);
+        field.setBezeled(true);
+        field.setBezelStyle(NSTextFieldBezelStyle::RoundedBezel);
+        field.setDrawsBackground(true);
+        field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        if let Some(cell) = field.cell() {
+            cell.setWraps(true);
+            cell.setScrollable(false);
+        }
+        // SAFETY: input target implements inputSubmitted: and lives in STATE while the panel is alive.
+        unsafe {
+            field.setTarget(Some(input_object));
+            field.setAction(Some(sel!(inputSubmitted:)));
+        }
+        field.setHidden(true);
+        card.addSubview(&field);
+
+        // SAFETY: input target implements inputSubmitted: and lives in STATE while the panel is alive.
+        let input_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Write"),
+                Some(input_object),
+                Some(sel!(inputSubmitted:)),
+                mtm,
+            )
+        };
+        input_button.setBezelColor(Some(&NSColor::controlAccentColor()));
+        input_button.setKeyEquivalent(&NSString::from_str(""));
+        input_button.setHidden(true);
+        card.addSubview(&input_button);
+
         panel.setContentView(Some(&card));
         *state.borrow_mut() = Some(PopupState {
             panel,
@@ -631,18 +795,35 @@ fn ensure_popup(mtm: MainThreadMarker) {
             copy_button,
             spinner,
             style_button,
+            note,
+            field,
+            input_button,
             replace_target,
             dismiss_target,
             tab_target,
+            input_target,
             visible: false,
             key_monitor: None,
         });
     });
 }
 
+/// Whether the popup panel is the key window: while the user types in the
+/// input box, keystrokes go to the popup itself and must not dismiss it.
+fn panel_is_key() -> bool {
+    STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|popup| popup.panel.isKeyWindow())
+            .unwrap_or(false)
+    })
+}
+
 /// Installs the global keyDown monitor while the popup is visible. Any key
 /// gets the same handling as `CaretChanged` while visible (which hides the
-/// popup and drops the in-flight suggestion).
+/// popup and drops the in-flight suggestion) — except while the input box
+/// has focus, when the keystrokes are the user's request.
 fn install_key_monitor() {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -653,7 +834,7 @@ fn install_key_monitor() {
             return;
         }
         let block = block2::RcBlock::new(|_event: NonNull<NSEvent>| {
-            if crate::popup::is_visible() {
+            if crate::popup::is_visible() && !panel_is_key() {
                 if let Some(proxy) = PROXY.get() {
                     if let Err(error) = proxy.send_event(UserEvent::CaretChanged) {
                         eprintln!("Writely: could not deliver the key event: {error}");
@@ -783,6 +964,11 @@ fn layout_plain(text: &str, is_error: bool, footer: Footer) -> f64 {
             popup.spinner.setHidden(true);
         }
         popup.style_button.setHidden(true);
+        popup.note.setHidden(true);
+        popup.field.setHidden(true);
+        popup.input_button.setHidden(true);
+        // Plain layouts never take typing: drop key status from an input box.
+        popup.panel.resignKeyWindow();
         popup.separator.setHidden(!has_footer);
         if has_footer {
             popup.separator.setFrame(NSRect::new(
@@ -972,6 +1158,11 @@ fn layout_tabbed_diff(body: &NSAttributedString, selected: PopupTab) -> f64 {
         popup.replace_button.setHidden(false);
         popup.retry_button.setHidden(true);
         popup.copy_button.setHidden(!copy_visible(true));
+        popup.note.setHidden(true);
+        popup.field.setHidden(true);
+        popup.input_button.setHidden(true);
+        // Diff layouts never take typing: drop key status from an input box.
+        popup.panel.resignKeyWindow();
         popup.replace_button.setFrame(NSRect::new(
             NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
             NSSize::new(90.0, 24.0),
@@ -1094,6 +1285,11 @@ fn layout_tabbed_message(
         popup.replace_button.setHidden(true);
         popup.retry_button.setHidden(!retry);
         popup.copy_button.setHidden(!copy_visible(false));
+        popup.note.setHidden(true);
+        popup.field.setHidden(true);
+        popup.input_button.setHidden(true);
+        // Message layouts never take typing: drop key status from an input box.
+        popup.panel.resignKeyWindow();
         popup.cancel_button.setFrame(NSRect::new(
             NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
             NSSize::new(90.0, 24.0),
@@ -1106,6 +1302,181 @@ fn layout_tabbed_message(
     });
     set_copy_feedback(false);
     panel_height
+}
+
+/// Height of the red input note for `text`: 12 pt wraps to about 56 chars
+/// per line on the card; capped so a long provider error can't fill the card.
+fn note_height(text: &str) -> f64 {
+    const CHARS_PER_LINE: usize = 56;
+    const LINE_HEIGHT: f64 = 15.0;
+    const MAX_LINES: usize = 6;
+    let lines = text
+        .chars()
+        .count()
+        .max(1)
+        .div_ceil(CHARS_PER_LINE)
+        .min(MAX_LINES);
+    lines as f64 * LINE_HEIGHT
+}
+
+/// Lays out the card for the input box: header, the optional red note, the
+/// editable field, separator, footer. Compose has no style menu and a Write
+/// button; Change keeps the style menu (showing "Describe a change…") and a
+/// Rewrite button. Returns the panel height.
+fn layout_input(kind: InputKind, prefill: &str, note: Option<&str>) -> f64 {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(popup) = state.as_mut() else {
+            return 0.0;
+        };
+        let (placeholder, button_title) = match kind {
+            InputKind::Compose => (
+                "Describe what you want to write, e.g. a short thank-you note to my team",
+                "Write",
+            ),
+            InputKind::Change => (
+                "Describe the change, e.g. mention the Friday deadline and sound confident",
+                "Rewrite",
+            ),
+        };
+        let note_box = note.map(note_height).unwrap_or(0.0);
+        let gap = if note.is_some() { 6.0 } else { 0.0 };
+        let body_height = 6.0 + note_box + gap + INPUT_FIELD_HEIGHT + 8.0;
+        let panel_height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
+
+        popup.card.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(CARD_WIDTH, panel_height),
+        ));
+        let subviews = popup.card.subviews();
+        if subviews.count() >= 2 {
+            let title_view = subviews.objectAtIndex(0);
+            title_view.setFrame(NSRect::new(
+                NSPoint::new(SIDE_PAD, panel_height - HEADER_HEIGHT + 4.0),
+                NSSize::new(300.0, 20.0),
+            ));
+            let close_view = subviews.objectAtIndex(1);
+            close_view.setFrame(NSRect::new(
+                NSPoint::new(CARD_WIDTH - 36.0, panel_height - HEADER_HEIGHT + 2.0),
+                NSSize::new(24.0, 24.0),
+            ));
+        }
+        popup.scroll.setHidden(true);
+        // SAFETY: the spinner is alive in STATE for the life of the popup.
+        unsafe {
+            popup.spinner.stopAnimation(None);
+        }
+        popup.spinner.setHidden(true);
+        let field_y = FOOTER_HEIGHT + 8.0;
+        let field_width = CARD_WIDTH - 2.0 * SIDE_PAD;
+        match note {
+            Some(text) => {
+                popup.note.setStringValue(&NSString::from_str(text));
+                popup.note.setHidden(false);
+                popup.note.setFrame(NSRect::new(
+                    NSPoint::new(SIDE_PAD, field_y + INPUT_FIELD_HEIGHT + gap),
+                    NSSize::new(field_width, note_box),
+                ));
+            }
+            None => popup.note.setHidden(true),
+        }
+        popup.field.setStringValue(&NSString::from_str(prefill));
+        popup
+            .field
+            .setPlaceholderString(Some(&NSString::from_str(placeholder)));
+        popup.field.setHidden(false);
+        popup.field.setFrame(NSRect::new(
+            NSPoint::new(SIDE_PAD, field_y),
+            NSSize::new(field_width, INPUT_FIELD_HEIGHT),
+        ));
+        popup.separator.setHidden(false);
+        popup.separator.setFrame(NSRect::new(
+            NSPoint::new(0.0, FOOTER_HEIGHT),
+            NSSize::new(CARD_WIDTH, 1.0),
+        ));
+        if kind == InputKind::Change {
+            popup.style_button.setHidden(false);
+            popup
+                .style_button
+                .selectItemWithTag(tag_for_tab(PopupTab::Custom));
+            popup.style_button.setFrame(NSRect::new(
+                NSPoint::new(SIDE_PAD, 8.0),
+                NSSize::new(STYLE_BUTTON_WIDTH, 24.0),
+            ));
+        } else {
+            popup.style_button.setHidden(true);
+        }
+        popup.cancel_button.setHidden(false);
+        popup.replace_button.setHidden(true);
+        popup.retry_button.setHidden(true);
+        popup.copy_button.setHidden(true);
+        popup
+            .input_button
+            .setTitle(&NSString::from_str(button_title));
+        popup.input_button.setHidden(false);
+        popup.input_button.setFrame(NSRect::new(
+            NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0, 8.0),
+            NSSize::new(90.0, 24.0),
+        ));
+        popup.cancel_button.setFrame(NSRect::new(
+            NSPoint::new(CARD_WIDTH - SIDE_PAD - 90.0 - 8.0 - 90.0, 8.0),
+            NSSize::new(90.0, 24.0),
+        ));
+        panel_height
+    })
+}
+
+/// Shows the popup with an editable text box: `prefill` as its text and the
+/// optional `note` (an error) above it in red. Focuses the field with its
+/// text selected so the user can type right away.
+pub fn show_input(kind: InputKind, prefill: &str, note: Option<&str>, caret: &CaretRect) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        eprintln!(
+            "Writely: could not show the suggestion: Writely must update it on the main thread."
+        );
+        return;
+    };
+    ensure_popup(mtm);
+    let panel_height = layout_input(kind, prefill, note);
+    show_body(panel_height, caret, mtm);
+    STATE.with(|state| {
+        let popup = state.borrow();
+        let Some(popup) = popup.as_ref() else {
+            return;
+        };
+        popup.panel.makeKeyWindow();
+        popup.panel.makeFirstResponder(Some(&popup.field));
+        // SAFETY: selectText: exists on NSTextField and the field is alive in STATE.
+        unsafe { popup.field.selectText(None) };
+    });
+}
+
+/// Draft mode for composed text: the style menu's tag-0 item reads "Draft"
+/// (pencil icon) and the Replace button reads "Insert". Off restores
+/// "Fix grammar" (checkmark) and "Replace".
+pub fn set_draft_mode(draft: bool) {
+    STATE.with(|state| {
+        let popup = state.borrow();
+        let Some(popup) = popup.as_ref() else {
+            return;
+        };
+        let (title, symbol) = if draft {
+            ("Draft", "pencil")
+        } else {
+            ("Fix grammar", "checkmark.circle")
+        };
+        if let Some(menu) = popup.style_button.menu() {
+            if let Some(item) = menu.itemWithTag(tag_for_tab(PopupTab::Correct)) {
+                item.setTitle(&NSString::from_str(title));
+                item.setImage(menu_icon(symbol, title).as_deref());
+            }
+        }
+        popup.replace_button.setTitle(&NSString::from_str(if draft {
+            "Insert"
+        } else {
+            "Replace"
+        }));
+    });
 }
 
 /// Shows the popup with the style menu button showing `selected`: a word diff
@@ -1291,6 +1662,9 @@ pub fn hide() {
             popup.cancel_button.setHidden(true);
             popup.copy_button.setHidden(true);
             popup.separator.setHidden(true);
+            popup.note.setHidden(true);
+            popup.field.setHidden(true);
+            popup.input_button.setHidden(true);
             popup.visible = false;
         }
     });
@@ -1313,13 +1687,14 @@ mod tests {
     #[test]
     fn style_tags_round_trip() {
         assert_eq!(tag_for_tab(PopupTab::Correct), 0);
+        assert_eq!(tag_for_tab(PopupTab::Custom), 6);
         for (index, style) in RewriteStyle::ALL.iter().enumerate() {
             assert_eq!(
                 tag_for_tab(PopupTab::Rewrite(*style)),
                 index as NSInteger + 1
             );
         }
-        for tab in [PopupTab::Correct]
+        for tab in [PopupTab::Correct, PopupTab::Custom]
             .into_iter()
             .chain(RewriteStyle::ALL.map(PopupTab::Rewrite))
         {

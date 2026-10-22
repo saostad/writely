@@ -41,6 +41,9 @@ pub enum UserEvent {
     RetryClicked,
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     CopyFeedbackEnded(u64),
+    // Fired only by the macOS input box; the handler lands with items 3–4.
+    #[cfg(target_os = "macos")]
+    InputSubmitted(String),
     PermissionGranted,
     SettingsChanged,
     ProviderMenuState {
@@ -128,6 +131,8 @@ fn selected_text(pending: &Pending) -> Option<&str> {
                 }
             }
         }
+        // The custom cache lands in item 4; nothing to insert until then.
+        popup::PopupTab::Custom => None,
     }
 }
 
@@ -145,6 +150,8 @@ fn rewrite_retry_style(pending: &Pending) -> Option<providers::RewriteStyle> {
             }
         }
         popup::PopupTab::Correct => None,
+        // Custom errors retry through the input box, never the Retry button.
+        popup::PopupTab::Custom => None,
     }
 }
 
@@ -1054,6 +1061,8 @@ fn handle_tab_clicked(
                 }
             }
         }
+        // The describe-a-change box lands in item 4.
+        popup::PopupTab::Custom => {}
     }
 }
 
@@ -2047,6 +2056,9 @@ fn main() {
                     &mut last_anchor,
                 );
             }
+            // The input handler lands with items 3–4; ignored until then.
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(UserEvent::InputSubmitted(_)) => {}
             Event::UserEvent(UserEvent::PermissionGranted) => {
                 handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon, paused);
             }
