@@ -45,7 +45,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_DROPSHADOW, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE, HMENU, HWND_TOPMOST, MA_NOACTIVATE,
     MENU_ITEM_FLAGS, MF_CHECKED, MF_DISABLED, MF_SEPARATOR, NONCLIENTMETRICSW,
     SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, TPM_LEFTALIGN,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_COMMAND,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN, WM_MOUSEACTIVATE, WM_NOTIFY, WM_PAINT,
     WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
@@ -822,6 +822,21 @@ unsafe extern "system" fn edit_subclass_proc(
                 }
                 return LRESULT(0);
             }
+        }
+    }
+    if message == WM_CHAR {
+        // Swallow the character for each key handled above, so the EDIT
+        // doesn't insert a stray line break or beep. Shift+Enter keeps its
+        // default line break.
+        let ch = wparam.0 as u32;
+        if ch == '\r' as u32 {
+            // SAFETY: GetKeyState takes a virtual-key code and no pointers.
+            let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            if !shift_down {
+                return LRESULT(0);
+            }
+        } else if ch == 0x1B || ch == 0x01 {
+            return LRESULT(0);
         }
     }
     // SAFETY: edit, wparam and lparam come from the subclass message.
