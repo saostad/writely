@@ -1,4 +1,5 @@
 pub mod gemini;
+pub mod local;
 pub mod ollama;
 pub mod together;
 
@@ -127,10 +128,10 @@ pub(crate) fn truncate_body(body: &str) -> String {
     body.chars().take(300).collect()
 }
 
-/// The 3-provider dispatch shared by every request: same model, effort,
+/// The provider dispatch shared by every request: same model, effort,
 /// temperature 0, key header and error parsing; only the text and the system
-/// instruction differ. The key is `None` for Ollama (no key needed); for
-/// Gemini and Together a missing key or model is an error for the popup.
+/// instruction differ. The key is `None` for providers that need no key;
+/// for Gemini and Together a missing key or model is an error for the popup.
 fn dispatch(
     settings: &AppSettings,
     key: Option<&str>,
@@ -141,10 +142,7 @@ fn dispatch(
         Provider::Gemini => gemini::suggest(settings, key, text, instruction),
         Provider::Together => together::suggest(settings, key, text, instruction),
         Provider::Ollama => ollama::suggest(settings, text, instruction),
-        Provider::Local => Err(
-            "The local model isn't downloaded yet. Open Settings, choose On this computer, and click Download."
-                .to_string(),
-        ),
+        Provider::Local => local::suggest(settings, text, instruction),
     }
 }
 
