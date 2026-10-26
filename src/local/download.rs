@@ -135,9 +135,11 @@ pub fn download_file(
     size: u64,
     name: &str,
     progress: &mut dyn FnMut(u64, u64),
+    verifying: &mut dyn FnMut(),
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     if dest.exists() {
+        verifying();
         let existing = sha256_hex(dest)?;
         if existing.eq_ignore_ascii_case(sha256) {
             return Ok(());
@@ -229,6 +231,7 @@ pub fn download_file(
         }
     }
 
+    verifying();
     let damaged = || {
         format!(
             "The download of {name} was damaged (its fingerprint didn't match), so Writely deleted it. Try again."

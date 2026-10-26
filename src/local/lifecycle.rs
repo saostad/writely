@@ -57,7 +57,13 @@ fn start_idle_thread() {
                     BUSY.load(Ordering::SeqCst),
                     server::is_running(),
                 ) {
-                    server::stop(&format!("not used for {minutes} minutes"));
+                    let unit = if minutes == 1 { "minute" } else { "minutes" };
+                    server::stop_if(&format!("not used for {minutes} {unit}"), &|| {
+                        let idle_for = lock_last_activity()
+                            .map(|activity| activity.elapsed())
+                            .unwrap_or(Duration::ZERO);
+                        should_free(idle_for, minutes, BUSY.load(Ordering::SeqCst), true)
+                    });
                 }
             });
         if let Err(e) = spawn {

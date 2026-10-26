@@ -420,6 +420,19 @@ pub fn stop(reason: &str) {
     }
 }
 
+pub fn stop_if(reason: &str, still_ok: &dyn Fn() -> bool) {
+    let mut guard = lock_running();
+    if guard.is_none() || !still_ok() {
+        return;
+    }
+    if let Some(mut running) = guard.take() {
+        kill_and_wait(&mut running.child);
+    }
+    drop(guard);
+    remove_pid_file();
+    eprintln!("Writely: stopped the local model helper ({reason}).");
+}
+
 pub fn is_running() -> bool {
     let mut guard = lock_running();
     match guard.as_mut() {

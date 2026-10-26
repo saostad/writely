@@ -14,6 +14,7 @@ const RUNTIME_WHAT: &str = "the llama.cpp helper";
 pub enum InstallPhase {
     Idle,
     Downloading { what: String, done: u64, total: u64 },
+    Verifying { what: String },
     Unpacking,
     Failed(String),
 }
@@ -96,7 +97,16 @@ fn asset_file_name(url: &str) -> &str {
     url.rsplit('/').next().unwrap_or(url)
 }
 
-type DownloadFn<'a> = dyn FnMut(&str, &Path, &str, u64, &str, &mut dyn FnMut(u64, u64), &AtomicBool) -> Result<(), String>
+type DownloadFn<'a> = dyn FnMut(
+        &str,
+        &Path,
+        &str,
+        u64,
+        &str,
+        &mut dyn FnMut(u64, u64),
+        &mut dyn FnMut(),
+        &AtomicBool,
+    ) -> Result<(), String>
     + 'a;
 type UnpackFn<'a> = dyn FnMut(&Path, ArchiveKind, &Path) -> Result<(), String> + 'a;
 
@@ -108,20 +118,27 @@ fn run_install_steps(
     download_fn: &mut DownloadFn<'_>,
     unpack_fn: &mut UnpackFn<'_>,
 ) -> Result<(), String> {
+    // Shared so the progress and verifying callbacks can both set the phase.
+    let set_phase = std::cell::RefCell::new(set_phase);
     if !runtime_ready_in(data_dir) {
         let runtime = catalog::runtime_file()?;
         let archive = data_dir.join("runtime").join(asset_file_name(runtime.url));
-        set_phase(InstallPhase::Downloading {
+        (**set_phase.borrow_mut())(InstallPhase::Downloading {
             what: RUNTIME_WHAT.to_string(),
             done: 0,
             total: runtime.size,
         });
         {
             let mut progress = |done: u64, total: u64| {
-                set_phase(InstallPhase::Downloading {
+                (**set_phase.borrow_mut())(InstallPhase::Downloading {
                     what: RUNTIME_WHAT.to_string(),
                     done,
                     total,
+                });
+            };
+            let mut verifying = || {
+                (**set_phase.borrow_mut())(InstallPhase::Verifying {
+                    what: RUNTIME_WHAT.to_string(),
                 });
             };
             download_fn(
@@ -131,10 +148,11 @@ fn run_install_steps(
                 runtime.size,
                 RUNTIME_WHAT,
                 &mut progress,
+                &mut verifying,
                 cancel,
             )?;
         }
-        set_phase(InstallPhase::Unpacking);
+        (**set_phase.borrow_mut())(InstallPhase::Unpacking);
         unpack_fn(&archive, runtime.kind, &runtime_dir_in(data_dir))?;
         if let Err(e) = std::fs::remove_file(&archive) {
             eprintln!(
@@ -145,16 +163,21 @@ fn run_install_steps(
     }
     if !model_ready_in(data_dir, id) {
         let model = catalog::model_file(id);
-        set_phase(InstallPhase::Downloading {
+        (**set_phase.borrow_mut())(InstallPhase::Downloading {
             what: model.label.to_string(),
             done: 0,
             total: model.size,
         });
         let mut progress = |done: u64, total: u64| {
-            set_phase(InstallPhase::Downloading {
+            (**set_phase.borrow_mut())(InstallPhase::Downloading {
                 what: model.label.to_string(),
                 done,
                 total,
+            });
+        };
+        let mut verifying = || {
+            (**set_phase.borrow_mut())(InstallPhase::Verifying {
+                what: model.label.to_string(),
             });
         };
         download_fn(
@@ -164,6 +187,7 @@ fn run_install_steps(
             model.size,
             model.label,
             &mut progress,
+            &mut verifying,
             cancel,
         )?;
     }
@@ -212,8 +236,9 @@ pub fn start_install(
                                      size: u64,
                                      name: &str,
                                      progress: &mut dyn FnMut(u64, u64),
+                                     verifying: &mut dyn FnMut(),
                                      cancel: &AtomicBool| {
-                download::download_file(url, dest, sha256, size, name, progress, cancel)
+                download::download_file(url, dest, sha256, size, name, progress, verifying, cancel)
             };
             let mut real_unpack = |archive: &Path, kind: ArchiveKind, into: &Path| {
                 unpack::unpack(archive, kind, into)
@@ -355,6 +380,7 @@ mod tests {
                                 _size: u64,
                                 name: &str,
                                 progress: &mut dyn FnMut(u64, u64),
+                                verifying: &mut dyn FnMut(),
                                 _cancel: &AtomicBool|
              -> Result<(), String> {
                 events.borrow_mut().push(format!("download:{name}"));
@@ -362,6 +388,7 @@ mod tests {
                     .map_err(|e| e.to_string())?;
                 std::fs::write(dest, b"fake").map_err(|e| e.to_string())?;
                 progress(1, 2);
+                verifying();
                 Ok(())
             };
             let mut unpack_fake = |_a: &Path, _k: ArchiveKind, _i: &Path| -> Result<(), String> {
@@ -378,6 +405,9 @@ mod tests {
             );
         }
         assert_eq!(*events.borrow(), vec![format!("download:{label}")]);
+        assert!(phases.borrow().contains(&InstallPhase::Verifying {
+            what: label.to_string()
+        }));
         assert_eq!(phases.borrow().last(), Some(&InstallPhase::Idle));
         cleanup(&dir);
     }
@@ -399,6 +429,7 @@ mod tests {
                                 _size: u64,
                                 name: &str,
                                 progress: &mut dyn FnMut(u64, u64),
+                                verifying: &mut dyn FnMut(),
                                 _cancel: &AtomicBool|
              -> Result<(), String> {
                 events.borrow_mut().push(format!("download:{name}"));
@@ -406,6 +437,7 @@ mod tests {
                     .map_err(|e| e.to_string())?;
                 std::fs::write(dest, b"fake").map_err(|e| e.to_string())?;
                 progress(1, 2);
+                verifying();
                 Ok(())
             };
             let mut unpack_fake = |_a: &Path, _k: ArchiveKind, _i: &Path| -> Result<(), String> {
@@ -431,6 +463,12 @@ mod tests {
         );
         assert!(!archive.exists(), "archive deleted after unpack");
         let phases = phases.borrow();
+        assert!(phases.contains(&InstallPhase::Verifying {
+            what: RUNTIME_WHAT.to_string()
+        }));
+        assert!(phases.contains(&InstallPhase::Verifying {
+            what: label.to_string()
+        }));
         assert!(phases.contains(&InstallPhase::Unpacking));
         assert_eq!(phases.last(), Some(&InstallPhase::Idle));
         drop(phases);
@@ -451,6 +489,7 @@ mod tests {
                                 _size: u64,
                                 name: &str,
                                 _progress: &mut dyn FnMut(u64, u64),
+                                _verifying: &mut dyn FnMut(),
                                 _cancel: &AtomicBool|
              -> Result<(), String> {
                 events.borrow_mut().push(format!("download:{name}"));
