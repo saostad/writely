@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Wired up in a later round (local-model task).
-
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};

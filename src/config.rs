@@ -262,7 +262,6 @@ impl Default for AppSettings {
     }
 }
 
-#[allow(dead_code)] // Wired up in a later round (local-model task).
 pub fn validate_local_settings(s: &AppSettings) -> Result<(), String> {
     if s.local_idle_minutes > 1440 {
         return Err(

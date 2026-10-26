@@ -2213,6 +2213,7 @@ fn main() {
 
         match event {
             Event::NewEvents(StartCause::Init) => {
+                local::lifecycle::app_started();
                 // Apply the start-at-login setting (on by default): this
                 // also heals the entry if the app moved since last launch.
                 match config::load_settings() {
@@ -2469,6 +2470,7 @@ fn main() {
                         }
                         Ok(()) => {
                             settings::provider_switched(provider);
+                            local::lifecycle::settings_changed();
                             // The cached readiness is what the menu label
                             // showed; with no cache yet treat it as ready.
                             let ready = provider_menu_state
@@ -2510,6 +2512,7 @@ fn main() {
                 } else if event.id == quit_id {
                     drop(tray_icon.take());
                     caret_watcher = None;
+                    local::server::stop("Writely is quitting");
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -2639,6 +2642,7 @@ fn main() {
                 handle_permission_granted(&watcher_proxy, &mut caret_watcher, &tray_icon, paused);
             }
             Event::UserEvent(UserEvent::SettingsChanged) => {
+                local::lifecycle::settings_changed();
                 request_provider_menu_refresh(&watcher_proxy, &mut menu_refresh_id);
             }
             Event::UserEvent(UserEvent::ProviderMenuState { id, current, ready }) => {

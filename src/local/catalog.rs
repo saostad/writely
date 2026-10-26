@@ -1,10 +1,9 @@
-#![allow(dead_code)] // Wired up in a later round (local-model task).
-
 use std::path::PathBuf;
 
 use crate::config::LocalModelId;
 
 pub struct ModelFile {
+    #[allow(dead_code)] // Used by the Settings window (local-model rounds 4–6).
     pub id: LocalModelId,
     pub label: &'static str,
     pub file_name: &'static str,
@@ -42,12 +41,14 @@ pub fn model_file(id: LocalModelId) -> &'static ModelFile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Zip is used on Windows; TarGz elsewhere (see runtime_file).
 pub enum ArchiveKind {
     TarGz,
     Zip,
 }
 
 pub struct RuntimeFile {
+    #[allow(dead_code)] // Used by the Settings window (local-model rounds 4–6).
     pub version: &'static str,
     pub url: &'static str,
     pub sha256: &'static str,
@@ -58,6 +59,7 @@ pub struct RuntimeFile {
 
 pub const RUNTIME_VERSION: &str = "b11900";
 
+#[allow(dead_code)] // Used on macOS (see runtime_file).
 static RUNTIME_MACOS_ARM64: RuntimeFile = RuntimeFile {
     version: "b11900",
     url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-macos-arm64.tar.gz",
@@ -67,6 +69,7 @@ static RUNTIME_MACOS_ARM64: RuntimeFile = RuntimeFile {
     server_path: "llama-b11900/llama-server",
 };
 
+#[allow(dead_code)] // Used on macOS (see runtime_file).
 static RUNTIME_MACOS_X64: RuntimeFile = RuntimeFile {
     version: "b11900",
     url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-macos-x64.tar.gz",
@@ -76,6 +79,7 @@ static RUNTIME_MACOS_X64: RuntimeFile = RuntimeFile {
     server_path: "llama-b11900/llama-server",
 };
 
+#[allow(dead_code)] // Used on Windows (see runtime_file).
 static RUNTIME_WINDOWS_X64: RuntimeFile = RuntimeFile {
     version: "b11900",
     url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cpu-x64.zip",
@@ -166,10 +170,12 @@ pub fn local_data_dir() -> PathBuf {
     }
 }
 
+#[allow(dead_code)] // Used by the Settings window (local-model rounds 4–6).
 pub fn models_dir() -> PathBuf {
     local_data_dir().join("models")
 }
 
+#[allow(dead_code)] // Used by the Settings window (local-model rounds 4–6).
 pub fn runtime_dir() -> PathBuf {
     local_data_dir().join("runtime").join(RUNTIME_VERSION)
 }

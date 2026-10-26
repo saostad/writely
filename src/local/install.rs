@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Wired up in a later round (local-model task).
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -31,6 +29,7 @@ fn lock_phase() -> MutexGuard<'static, InstallPhase> {
     }
 }
 
+#[allow(dead_code)] // Used by the Settings window (local-model rounds 4–6).
 pub fn install_phase() -> InstallPhase {
     lock_phase().clone()
 }
@@ -188,6 +187,7 @@ fn perform_install(
     }
 }
 
+#[allow(dead_code)] // Used by the Settings window (local-model rounds 4–6).
 pub fn start_install(
     id: LocalModelId,
     on_change: Arc<dyn Fn() + Send + Sync>,
@@ -237,6 +237,7 @@ pub fn start_install(
     }
 }
 
+#[allow(dead_code)] // Used by the Settings window (local-model rounds 4–6).
 pub fn cancel_install() {
     CANCEL.store(true, Ordering::SeqCst);
 }
@@ -268,6 +269,7 @@ fn delete_model_in(data_dir: &Path, id: LocalModelId, running: bool) -> Result<(
     Ok(())
 }
 
+#[allow(dead_code)] // Used by the Settings window (local-model rounds 4–6).
 pub fn delete_model(id: LocalModelId) -> Result<(), String> {
     delete_model_in(
         &catalog::local_data_dir(),

@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Wired up in a later round (local-model task).
-
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
