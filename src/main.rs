@@ -7,6 +7,7 @@ mod check_window;
 mod clipboard;
 mod config;
 mod diff;
+mod local;
 mod overlay;
 mod popup;
 mod providers;
