@@ -141,6 +141,10 @@ fn dispatch(
         Provider::Gemini => gemini::suggest(settings, key, text, instruction),
         Provider::Together => together::suggest(settings, key, text, instruction),
         Provider::Ollama => ollama::suggest(settings, text, instruction),
+        Provider::Local => Err(
+            "The local model isn't downloaded yet. Open Settings, choose On this computer, and click Download."
+                .to_string(),
+        ),
     }
 }
 

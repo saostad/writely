@@ -28,7 +28,6 @@ struct ServerConfig {
     model: LocalModelId,
     threads: u32,
     context: u32,
-    max_reply: u32,
 }
 
 impl ServerConfig {
@@ -37,7 +36,6 @@ impl ServerConfig {
             model: settings.local_model,
             threads: settings.local_threads,
             context: settings.local_context_tokens,
-            max_reply: settings.local_max_reply_tokens,
         }
     }
 }

@@ -9,10 +9,11 @@ use gtk::{
 
 use crate::config::{AppSettings, Effort, Provider};
 
-const PROVIDER_NAMES: [&str; 3] = [
+const PROVIDER_NAMES: [&str; 4] = [
     "Google Gemini",
     "Together AI",
     "Ollama (local, no key needed)",
+    "On this computer",
 ];
 const EFFORT_NAMES: [&str; 5] = ["Default", "Minimal (fastest)", "Low", "Medium", "High"];
 
@@ -20,6 +21,7 @@ fn provider_at(index: u32) -> Provider {
     match index {
         1 => Provider::Together,
         2 => Provider::Ollama,
+        3 => Provider::Local,
         _ => Provider::Gemini,
     }
 }
@@ -29,6 +31,7 @@ fn provider_index(provider: Provider) -> u32 {
         Provider::Gemini => 0,
         Provider::Together => 1,
         Provider::Ollama => 2,
+        Provider::Local => 3,
     }
 }
 
@@ -57,6 +60,7 @@ fn model_placeholder_for(provider: Provider) -> &'static str {
         Provider::Gemini => "gemini-3.5-flash-lite",
         Provider::Together => "deepseek-ai/DeepSeek-V4.1-Flash",
         Provider::Ollama => "llama3.2",
+        Provider::Local => "",
     }
 }
 
@@ -65,6 +69,7 @@ fn key_title_for(provider: Provider) -> &'static str {
         Provider::Gemini => "Google Gemini API key",
         Provider::Together => "Together AI API key",
         Provider::Ollama => "Ollama address",
+        Provider::Local => "Ollama address",
     }
 }
 
@@ -73,6 +78,7 @@ fn key_help_for(provider: Provider) -> &'static str {
         Provider::Gemini => "Writely sends the sentence you're editing to Google Gemini to check its grammar. Get a free key at ",
         Provider::Together => "Writely sends the sentence you're editing to Together AI to check its grammar. Get a key at ",
         Provider::Ollama => "Where Ollama runs on your computer. No key needed.",
+        Provider::Local => "This runs a small AI model on your computer. Download and memory options are being added.",
     }
 }
 
@@ -104,7 +110,10 @@ fn set_status(status: &Label, text: &str, is_error: bool) {
 
 struct Controls {
     provider_combo: ComboBoxText,
+    model_label: Label,
     model_entry: Entry,
+    model_help: Label,
+    local_help: Label,
     effort_combo: ComboBoxText,
     key_entry: Entry,
     url_entry: Entry,
@@ -135,12 +144,17 @@ fn refresh_provider_rows(controls: &Rc<RefCell<Controls>>) {
         .model_entry
         .set_placeholder_text(Some(model_placeholder_for(provider)));
     let is_ollama = provider == Provider::Ollama;
+    let is_local = provider == Provider::Local;
     borrowed.key_label.set_text(key_title_for(provider));
     borrowed.key_help.set_text(key_help_for(provider));
-    borrowed.key_label.set_visible(!is_ollama);
-    borrowed.key_entry.set_visible(!is_ollama);
-    borrowed.key_help.set_visible(!is_ollama);
-    borrowed.link_box.set_visible(!is_ollama);
+    borrowed.model_label.set_visible(!is_local);
+    borrowed.model_entry.set_visible(!is_local);
+    borrowed.model_help.set_visible(!is_local);
+    borrowed.local_help.set_visible(is_local);
+    borrowed.key_label.set_visible(!is_ollama && !is_local);
+    borrowed.key_entry.set_visible(!is_ollama && !is_local);
+    borrowed.key_help.set_visible(!is_ollama && !is_local);
+    borrowed.link_box.set_visible(!is_ollama && !is_local);
     borrowed.url_label.set_visible(is_ollama);
     borrowed.url_entry.set_visible(is_ollama);
     borrowed.url_help.set_visible(is_ollama);
@@ -160,7 +174,7 @@ fn refresh_provider_rows(controls: &Rc<RefCell<Controls>>) {
     borrowed
         .url_entry
         .set_placeholder_text(Some(crate::config::DEFAULT_OLLAMA_URL));
-    if !is_ollama {
+    if provider.needs_key() {
         match super::has_api_key_for(provider) {
             Ok(true) => borrowed.key_entry.set_placeholder_text(Some("••••••••")),
             Ok(false) => borrowed
@@ -380,6 +394,13 @@ pub fn show_settings() -> Result<(), String> {
     url_help.set_line_wrap(true);
     container.pack_start(&url_help, false, false, 0);
 
+    let local_help = Label::new(Some(
+        "This runs a small AI model on your computer. Download and memory options are being added.",
+    ));
+    local_help.set_halign(gtk::Align::Start);
+    local_help.set_line_wrap(true);
+    container.pack_start(&local_help, false, false, 0);
+
     let autostart_check = CheckButton::with_label("Start Writely at login");
     autostart_check.set_active(settings.launch_at_login);
     autostart_check.set_halign(gtk::Align::Start);
@@ -411,7 +432,10 @@ pub fn show_settings() -> Result<(), String> {
 
     let controls = Rc::new(RefCell::new(Controls {
         provider_combo: provider_combo.clone(),
+        model_label: model_label.clone(),
         model_entry: model_entry.clone(),
+        model_help: model_help.clone(),
+        local_help: local_help.clone(),
         effort_combo: effort_combo.clone(),
         key_entry: key_entry.clone(),
         url_entry: url_entry.clone(),
@@ -455,10 +479,12 @@ pub fn show_settings() -> Result<(), String> {
                 )
             };
             let (provider, model, effort, url, key) = snapshot;
-            if let Err(error) = crate::config::validate_model_name(&model) {
-                let borrowed = controls_for_save.borrow();
-                set_status(&borrowed.status_label, &error, true);
-                return;
+            if provider != Provider::Local {
+                if let Err(error) = crate::config::validate_model_name(&model) {
+                    let borrowed = controls_for_save.borrow();
+                    set_status(&borrowed.status_label, &error, true);
+                    return;
+                }
             }
             stash_draft(&controls_for_save);
             let save_result = {

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::config::LocalModelId;
+use crate::config::{AppSettings, LocalModelId};
 
 use super::catalog::{self, ArchiveKind};
 use super::{download, unpack};
@@ -87,6 +87,10 @@ fn model_ready_in(data_dir: &Path, id: LocalModelId) -> bool {
 
 pub fn model_ready(id: LocalModelId) -> bool {
     model_ready_in(&catalog::local_data_dir(), id)
+}
+
+pub fn local_ready(settings: &AppSettings) -> bool {
+    runtime_ready() && model_ready(settings.local_model)
 }
 
 fn asset_file_name(url: &str) -> &str {

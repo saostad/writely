@@ -60,6 +60,8 @@ pub enum Provider {
     Together,
     #[serde(rename = "ollama")]
     Ollama,
+    #[serde(rename = "local")]
+    Local,
 }
 
 impl Provider {
@@ -68,6 +70,14 @@ impl Provider {
             Provider::Gemini => "gemini",
             Provider::Together => "together",
             Provider::Ollama => "ollama",
+            Provider::Local => "local",
+        }
+    }
+
+    pub fn needs_key(&self) -> bool {
+        match self {
+            Provider::Gemini | Provider::Together => true,
+            Provider::Ollama | Provider::Local => false,
         }
     }
 
@@ -77,6 +87,7 @@ impl Provider {
             Provider::Gemini => "Gemini",
             Provider::Together => "Together AI",
             Provider::Ollama => "Ollama",
+            Provider::Local => "On this computer",
         }
     }
 }
@@ -141,6 +152,15 @@ pub enum LocalModelId {
     Qwen35_2B,
 }
 
+impl LocalModelId {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LocalModelId::Qwen35_0_8B => "qwen3.5-0.8b",
+            LocalModelId::Qwen35_2B => "qwen3.5-2b",
+        }
+    }
+}
+
 fn default_local_model() -> LocalModelId {
     LocalModelId::Qwen35_0_8B
 }
@@ -167,6 +187,10 @@ fn default_local_context_tokens() -> u32 {
 
 fn default_local_startup_timeout_secs() -> u32 {
     60
+}
+
+fn default_local_reply_timeout_secs() -> u32 {
+    120
 }
 
 fn default_models() -> HashMap<String, String> {
@@ -213,6 +237,8 @@ pub struct AppSettings {
     pub local_context_tokens: u32,
     #[serde(default = "default_local_startup_timeout_secs")]
     pub local_startup_timeout_secs: u32,
+    #[serde(default = "default_local_reply_timeout_secs")]
+    pub local_reply_timeout_secs: u32,
 }
 
 impl Default for AppSettings {
@@ -231,6 +257,7 @@ impl Default for AppSettings {
             local_max_reply_tokens: 1024,
             local_context_tokens: 4096,
             local_startup_timeout_secs: 60,
+            local_reply_timeout_secs: 120,
         }
     }
 }
@@ -254,6 +281,9 @@ pub fn validate_local_settings(s: &AppSettings) -> Result<(), String> {
     if s.local_startup_timeout_secs < 5 || s.local_startup_timeout_secs > 600 {
         return Err("Startup time limit must be between 5 and 600 seconds.".to_string());
     }
+    if s.local_reply_timeout_secs < 10 || s.local_reply_timeout_secs > 900 {
+        return Err("Reply time limit must be between 10 and 900 seconds.".to_string());
+    }
     if s.local_max_reply_tokens >= s.local_context_tokens {
         return Err("Longest reply must be smaller than the context size.".to_string());
     }
@@ -262,6 +292,9 @@ pub fn validate_local_settings(s: &AppSettings) -> Result<(), String> {
 
 impl AppSettings {
     pub fn model_for(&self, provider: Provider) -> String {
+        if provider == Provider::Local {
+            return self.local_model.as_str().to_string();
+        }
         self.models
             .get(provider.as_str())
             .cloned()
@@ -269,6 +302,9 @@ impl AppSettings {
     }
 
     pub fn set_model(&mut self, provider: Provider, model: &str) {
+        if provider == Provider::Local {
+            return;
+        }
         self.models
             .insert(provider.as_str().to_string(), model.to_string());
     }
@@ -280,12 +316,12 @@ impl AppSettings {
 }
 
 /// Whether `provider` is ready to use: it needs a non-blank model, and every
-/// provider except Ollama also needs a saved key.
+/// provider that needs a key also needs a saved key.
 pub fn provider_ready(provider: Provider, model: &str, has_key: bool) -> bool {
     if model.trim().is_empty() {
         return false;
     }
-    provider == Provider::Ollama || has_key
+    !provider.needs_key() || has_key
 }
 
 /// A copy of `settings` switched to `provider`; every other field (all models,
@@ -357,6 +393,42 @@ mod tests {
         assert_eq!(settings.effort, Effort::Default);
         assert_eq!(settings.ollama_url, DEFAULT_OLLAMA_URL);
         assert!(settings.launch_at_login);
+    }
+
+    #[test]
+    fn needs_key_only_for_gemini_and_together() {
+        assert!(Provider::Gemini.needs_key());
+        assert!(Provider::Together.needs_key());
+        assert!(!Provider::Ollama.needs_key());
+        assert!(!Provider::Local.needs_key());
+    }
+
+    #[test]
+    fn local_provider_serde_round_trip() {
+        let s = AppSettings {
+            provider: Provider::Local,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(json.contains(r#""provider":"local""#));
+        let back: AppSettings = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.provider, Provider::Local);
+        assert_eq!(Provider::Local.as_str(), "local");
+        assert_eq!(Provider::Local.display_name(), "On this computer");
+    }
+
+    #[test]
+    fn model_for_local_follows_local_model() {
+        let mut s = AppSettings::default();
+        assert_eq!(s.model_for(Provider::Local), "qwen3.5-0.8b");
+        s.local_model = LocalModelId::Qwen35_2B;
+        assert_eq!(s.model_for(Provider::Local), "qwen3.5-2b");
+        assert_eq!(LocalModelId::Qwen35_0_8B.as_str(), "qwen3.5-0.8b");
+        assert_eq!(LocalModelId::Qwen35_2B.as_str(), "qwen3.5-2b");
+        // set_model for Local is a no-op.
+        s.set_model(Provider::Local, "something-else");
+        assert_eq!(s.model_for(Provider::Local), "qwen3.5-2b");
+        assert!(!s.models.contains_key("local"));
     }
 
     #[test]
@@ -465,8 +537,10 @@ mod tests {
             "deepseek-ai/DeepSeek-V4.1-Flash",
             true
         ));
-        // Ollama needs no key.
+        // Ollama and Local need no key.
         assert!(provider_ready(Provider::Ollama, "llama3.2", false));
+        assert!(provider_ready(Provider::Local, "qwen3.5-0.8b", false));
+        assert!(!provider_ready(Provider::Local, "", false));
     }
 
     #[test]
@@ -501,6 +575,7 @@ mod tests {
         assert_eq!(s.local_max_reply_tokens, 1024);
         assert_eq!(s.local_context_tokens, 4096);
         assert_eq!(s.local_startup_timeout_secs, 60);
+        assert_eq!(s.local_reply_timeout_secs, 120);
         assert!(validate_local_settings(&s).is_ok());
     }
 
@@ -509,6 +584,7 @@ mod tests {
         let old =
             r#"{"provider":"gemini","effort":"default","ollama_url":"http://localhost:11434"}"#;
         let s: AppSettings = serde_json::from_str(old).expect("old file should parse");
+        assert_eq!(s.local_reply_timeout_secs, 120);
         assert_eq!(s, AppSettings::default());
     }
 
@@ -638,6 +714,27 @@ mod tests {
                 })
                 .expect_err("fail"),
                 "Startup time limit must be between 5 and 600 seconds."
+            );
+        }
+        // reply timeout 10-900
+        assert!(validate_local_settings(&AppSettings {
+            local_reply_timeout_secs: 10,
+            ..base.clone()
+        })
+        .is_ok());
+        assert!(validate_local_settings(&AppSettings {
+            local_reply_timeout_secs: 900,
+            ..base.clone()
+        })
+        .is_ok());
+        for v in [9, 901] {
+            assert_eq!(
+                validate_local_settings(&AppSettings {
+                    local_reply_timeout_secs: v,
+                    ..base.clone()
+                })
+                .expect_err("fail"),
+                "Reply time limit must be between 10 and 900 seconds."
             );
         }
     }

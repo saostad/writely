@@ -14,10 +14,11 @@ use objc2_foundation::{
 
 use crate::config::{AppSettings, Effort, Provider};
 
-const PROVIDER_TITLES: [&str; 3] = [
+const PROVIDER_TITLES: [&str; 4] = [
     "Google Gemini",
     "Together AI",
     "Ollama (local, no key needed)",
+    "On this computer",
 ];
 
 const EFFORT_TITLES: [&str; 5] = ["Default", "Minimal (fastest)", "Low", "Medium", "High"];
@@ -26,6 +27,7 @@ fn provider_at(index: isize) -> Provider {
     match index {
         1 => Provider::Together,
         2 => Provider::Ollama,
+        3 => Provider::Local,
         _ => Provider::Gemini,
     }
 }
@@ -35,6 +37,7 @@ fn provider_index(provider: Provider) -> isize {
         Provider::Gemini => 0,
         Provider::Together => 1,
         Provider::Ollama => 2,
+        Provider::Local => 3,
     }
 }
 
@@ -63,6 +66,7 @@ fn model_placeholder_for(provider: Provider) -> &'static str {
         Provider::Gemini => "gemini-3.5-flash-lite",
         Provider::Together => "deepseek-ai/DeepSeek-V4.1-Flash",
         Provider::Ollama => "llama3.2",
+        Provider::Local => "",
     }
 }
 
@@ -71,6 +75,7 @@ fn key_title_for(provider: Provider) -> &'static str {
         Provider::Gemini => "Google Gemini API key",
         Provider::Together => "Together AI API key",
         Provider::Ollama => "Ollama address",
+        Provider::Local => "Ollama address",
     }
 }
 
@@ -79,6 +84,7 @@ fn key_help_for(provider: Provider) -> &'static str {
         Provider::Gemini => "Writely sends the sentence you're editing to Google Gemini to check its grammar. Get a free key at ",
         Provider::Together => "Writely sends the sentence you're editing to Together AI to check its grammar. Get a key at ",
         Provider::Ollama => "Where Ollama runs on your computer. No key needed.",
+        Provider::Local => "This runs a small AI model on your computer. Download and memory options are being added.",
     }
 }
 
@@ -102,7 +108,10 @@ fn set_status(status: &NSTextField, text: &str, is_error: bool) {
 fn refresh_provider_rows() {
     struct Rows {
         provider: Provider,
+        model_label: Retained<NSTextField>,
         model_field: Retained<NSTextField>,
+        model_help: Retained<NSTextField>,
+        local_help: Retained<NSTextField>,
         key_field: Retained<NSSecureTextField>,
         url_field: Retained<NSTextField>,
         key_label: Retained<NSTextField>,
@@ -117,7 +126,10 @@ fn refresh_provider_rows() {
     let rows = STATE.with(|state| {
         state.borrow().as_ref().map(|window_state| Rows {
             provider: provider_at(window_state.provider_popup.indexOfSelectedItem()),
+            model_label: window_state.model_label.clone(),
             model_field: window_state.model_field.clone(),
+            model_help: window_state.model_help.clone(),
+            local_help: window_state.local_help.clone(),
             key_field: window_state.field.clone(),
             url_field: window_state.url_field.clone(),
             key_label: window_state.key_label.clone(),
@@ -140,10 +152,15 @@ fn refresh_provider_rows() {
             rows.provider,
         ))));
     let is_ollama = rows.provider == Provider::Ollama;
-    rows.key_label.setHidden(is_ollama);
-    rows.key_field.setHidden(is_ollama);
-    rows.key_help.setHidden(is_ollama);
-    rows.link_button.setHidden(is_ollama);
+    let is_local = rows.provider == Provider::Local;
+    rows.model_label.setHidden(is_local);
+    rows.model_field.setHidden(is_local);
+    rows.model_help.setHidden(is_local);
+    rows.local_help.setHidden(!is_local);
+    rows.key_label.setHidden(is_ollama || is_local);
+    rows.key_field.setHidden(is_ollama || is_local);
+    rows.key_help.setHidden(is_ollama || is_local);
+    rows.link_button.setHidden(is_ollama || is_local);
     rows.url_label.setHidden(!is_ollama);
     rows.url_field.setHidden(!is_ollama);
     rows.url_help.setHidden(!is_ollama);
@@ -154,7 +171,7 @@ fn refresh_provider_rows() {
     if let Some(page) = super::api_key_page_for(rows.provider) {
         rows.link_button.setTitle(&NSString::from_str(page));
     }
-    if !is_ollama {
+    if rows.provider.needs_key() {
         match super::has_api_key_for(rows.provider) {
             Ok(true) => rows
                 .key_field
@@ -291,9 +308,11 @@ define_class!(
             let Some((provider, model, _, _, launch_at_login, _)) = read_draft() else {
                 return;
             };
-            if let Err(error) = crate::config::validate_model_name(&model) {
-                set_status(status, &error, true);
-                return;
+            if provider != Provider::Local {
+                if let Err(error) = crate::config::validate_model_name(&model) {
+                    set_status(status, &error, true);
+                    return;
+                }
             }
             stash_draft();
             let save_result = STATE.with(|state| {
@@ -484,7 +503,10 @@ struct WindowState {
     status: Retained<NSTextField>,
     accessibility_button: Option<Retained<NSButton>>,
     provider_popup: Retained<NSPopUpButton>,
+    model_label: Retained<NSTextField>,
     model_field: Retained<NSTextField>,
+    model_help: Retained<NSTextField>,
+    local_help: Retained<NSTextField>,
     effort_popup: Retained<NSPopUpButton>,
     url_field: Retained<NSTextField>,
     key_label: Retained<NSTextField>,
@@ -588,7 +610,7 @@ pub fn show_settings() -> Result<(), String> {
                         button.setHidden(true);
                     }
                     let provider = provider_at(window_state.provider_popup.indexOfSelectedItem());
-                    if provider != Provider::Ollama {
+                    if provider.needs_key() {
                         match super::has_api_key_for(provider) {
                             Ok(true) => window_state
                                 .field
@@ -728,6 +750,12 @@ pub fn show_settings() -> Result<(), String> {
     );
     url_help.setFrame(key_help_frame);
 
+    let local_help = NSTextField::wrappingLabelWithString(
+        ns_string!("This runs a small AI model on your computer. Download and memory options are being added."),
+        mtm,
+    );
+    local_help.setFrame(key_help_frame);
+
     // SAFETY: a checkbox with no target/action is valid; its state is read on Save.
     let autostart_checkbox = unsafe {
         NSButton::checkboxWithTitle_target_action(
@@ -859,14 +887,19 @@ pub fn show_settings() -> Result<(), String> {
         link_button.setTitle(&NSString::from_str(page));
     }
     let is_ollama = settings.provider == Provider::Ollama;
-    key_label.setHidden(is_ollama);
-    field.setHidden(is_ollama);
-    key_help.setHidden(is_ollama);
-    link_button.setHidden(is_ollama);
+    let is_local = settings.provider == Provider::Local;
+    model_label.setHidden(is_local);
+    model_field.setHidden(is_local);
+    model_help.setHidden(is_local);
+    local_help.setHidden(!is_local);
+    key_label.setHidden(is_ollama || is_local);
+    field.setHidden(is_ollama || is_local);
+    key_help.setHidden(is_ollama || is_local);
+    link_button.setHidden(is_ollama || is_local);
     url_label.setHidden(!is_ollama);
     url_field.setHidden(!is_ollama);
     url_help.setHidden(!is_ollama);
-    if !is_ollama {
+    if settings.provider.needs_key() {
         match super::has_api_key_for(settings.provider) {
             Ok(true) => field.setPlaceholderString(Some(&NSString::from_str("••••••••"))),
             Ok(false) => {
@@ -911,6 +944,7 @@ pub fn show_settings() -> Result<(), String> {
     content.addSubview(&url_label);
     content.addSubview(&url_field);
     content.addSubview(&url_help);
+    content.addSubview(&local_help);
     content.addSubview(&autostart_checkbox);
     content.addSubview(&autostart_help);
     content.addSubview(&clipboard_checkbox);
@@ -928,7 +962,10 @@ pub fn show_settings() -> Result<(), String> {
             status: status_label.clone(),
             accessibility_button,
             provider_popup: provider_popup.clone(),
+            model_label: model_label.clone(),
             model_field: model_field.clone(),
+            model_help: model_help.clone(),
+            local_help: local_help.clone(),
             effort_popup: effort_popup.clone(),
             url_field: url_field.clone(),
             key_label: key_label.clone(),

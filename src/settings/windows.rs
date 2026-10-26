@@ -45,10 +45,11 @@ const ID_AUTOSTART: i32 = 1009;
 const ID_CLIPBOARD: i32 = 1010;
 const TAB_SUBCLASS_ID: usize = 1;
 
-const PROVIDER_NAMES: [&str; 3] = [
+const PROVIDER_NAMES: [&str; 4] = [
     "Google Gemini",
     "Together AI",
     "Ollama (local, no key needed)",
+    "On this computer",
 ];
 const EFFORT_NAMES: [&str; 5] = ["Default", "Minimal (fastest)", "Low", "Medium", "High"];
 
@@ -96,6 +97,7 @@ struct Layout {
     url_label: Rect,
     url_edit: Rect,
     url_help: Rect,
+    local_help: Rect,
     autostart: Rect,
     autostart_help: Rect,
     clipboard: Rect,
@@ -135,6 +137,7 @@ fn layout(show_url: bool) -> Layout {
     let url_label = key_label;
     let url_edit = key_edit;
     let url_help = key_help;
+    let local_help = key_help;
     let autostart = row(22, 2);
     let autostart_help = row(16, 10);
     let clipboard = row(22, 2);
@@ -174,6 +177,7 @@ fn layout(show_url: bool) -> Layout {
         url_label,
         url_edit,
         url_help,
+        local_help,
         autostart,
         autostart_help,
         clipboard,
@@ -283,6 +287,7 @@ fn provider_at(index: i32) -> Provider {
     match index {
         1 => Provider::Together,
         2 => Provider::Ollama,
+        3 => Provider::Local,
         _ => Provider::Gemini,
     }
 }
@@ -292,6 +297,7 @@ fn provider_index(provider: Provider) -> usize {
         Provider::Gemini => 0,
         Provider::Together => 1,
         Provider::Ollama => 2,
+        Provider::Local => 3,
     }
 }
 
@@ -320,6 +326,7 @@ fn model_cue_for(provider: Provider) -> &'static str {
         Provider::Gemini => "gemini-3.5-flash-lite",
         Provider::Together => "deepseek-ai/DeepSeek-V4.1-Flash",
         Provider::Ollama => "llama3.2",
+        Provider::Local => "",
     }
 }
 
@@ -341,6 +348,7 @@ struct Handles {
     link: HWND,
     url_label: HWND,
     url_help: HWND,
+    local_help: HWND,
     autostart_checkbox: HWND,
     autostart_help: HWND,
     clipboard_checkbox: HWND,
@@ -452,6 +460,7 @@ fn child_rects(handles: &Handles) -> Vec<(HWND, Rect)> {
         (handles.url_label, lay.url_label),
         (handles.url_edit, lay.url_edit),
         (handles.url_help, lay.url_help),
+        (handles.local_help, lay.local_help),
         (handles.autostart_checkbox, lay.autostart),
         (handles.autostart_help, lay.autostart_help),
         (handles.clipboard_checkbox, lay.clipboard),
@@ -642,7 +651,10 @@ fn refresh_key_cue(edit: HWND, provider: Provider) {
 fn refresh_provider_rows() {
     struct Rows {
         provider: Provider,
+        model_label: HWND,
         model_edit: HWND,
+        model_help: HWND,
+        local_help: HWND,
         edit: HWND,
         url_edit: HWND,
         key_label: HWND,
@@ -655,7 +667,10 @@ fn refresh_provider_rows() {
     let rows = STATE.with(|state| {
         state.borrow().as_ref().map(|handles| Rows {
             provider: provider_at(combo_selection(handles.provider_combo)),
+            model_label: handles.model_label,
             model_edit: handles.model_edit,
+            model_help: handles.model_help,
+            local_help: handles.local_help,
             edit: handles.edit,
             url_edit: handles.url_edit,
             key_label: handles.key_label,
@@ -681,19 +696,32 @@ fn refresh_provider_rows() {
         );
     }
     let is_ollama = rows.provider == Provider::Ollama;
+    let is_local = rows.provider == Provider::Local;
     // SAFETY: all handles are live child windows while Settings is open.
     unsafe {
         for handle in [rows.key_label, rows.edit, rows.key_help, rows.link] {
-            let _ = ShowWindow(handle, if is_ollama { SW_HIDE } else { SW_SHOW });
+            let _ = ShowWindow(
+                handle,
+                if is_ollama || is_local {
+                    SW_HIDE
+                } else {
+                    SW_SHOW
+                },
+            );
         }
         for handle in [rows.url_label, rows.url_edit, rows.url_help] {
             let _ = ShowWindow(handle, if is_ollama { SW_SHOW } else { SW_HIDE });
         }
+        for handle in [rows.model_label, rows.model_edit, rows.model_help] {
+            let _ = ShowWindow(handle, if is_local { SW_HIDE } else { SW_SHOW });
+        }
+        let _ = ShowWindow(rows.local_help, if is_local { SW_SHOW } else { SW_HIDE });
     }
     let key_title = wide(match rows.provider {
         Provider::Gemini => "Google Gemini API key",
         Provider::Together => "Together AI API key",
         Provider::Ollama => "Ollama address",
+        Provider::Local => "Ollama address",
     });
     // SAFETY: key_label is a live STATIC while the window is open.
     if let Err(error) = unsafe { SetWindowTextW(rows.key_label, PCWSTR(key_title.as_ptr())) } {
@@ -703,6 +731,7 @@ fn refresh_provider_rows() {
         Provider::Gemini => "Writely sends the sentence you're editing to Google Gemini to check its grammar. Get a free key at ",
         Provider::Together => "Writely sends the sentence you're editing to Together AI to check its grammar. Get a key at ",
         Provider::Ollama => "Where Ollama runs on your computer. No key needed.",
+        Provider::Local => "This runs a small AI model on your computer. Download and memory options are being added.",
     });
     // SAFETY: key_help is a live STATIC while the window is open.
     if let Err(error) = unsafe { SetWindowTextW(rows.key_help, PCWSTR(key_help_text.as_ptr())) } {
@@ -715,7 +744,7 @@ fn refresh_provider_rows() {
             eprintln!("Writely: could not update the Settings link: {error}");
         }
     }
-    if !is_ollama {
+    if rows.provider.needs_key() {
         refresh_key_cue(rows.edit, rows.provider);
     }
 }
@@ -949,9 +978,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 )) = snapshot
                 {
                     let model = read_edit_text(model_edit);
-                    if let Err(error) = crate::config::validate_model_name(&model) {
-                        set_status(&error, true);
-                        return LRESULT(0);
+                    if provider != Provider::Local {
+                        if let Err(error) = crate::config::validate_model_name(&model) {
+                            set_status(&error, true);
+                            return LRESULT(0);
+                        }
                     }
                     let effort = effort_at(combo_selection(effort_combo));
                     let url = read_edit_text(url_edit);
@@ -1386,6 +1417,13 @@ pub fn show_settings() -> Result<(), String> {
         lay.url_help,
         0,
     )?;
+    let local_help = make_child(
+        "STATIC",
+        "This runs a small AI model on your computer. Download and memory options are being added.",
+        WINDOW_STYLE(0),
+        lay.local_help,
+        0,
+    )?;
     let autostart_checkbox = make_child(
         "BUTTON",
         "Start Writely at login",
@@ -1467,6 +1505,7 @@ pub fn show_settings() -> Result<(), String> {
             link,
             url_label,
             url_help,
+            local_help,
             autostart_checkbox,
             autostart_help,
             clipboard_checkbox,

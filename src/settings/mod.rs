@@ -20,6 +20,7 @@ pub fn api_key_page_for(provider: crate::config::Provider) -> Option<&'static st
         crate::config::Provider::Gemini => Some(API_KEY_PAGE),
         crate::config::Provider::Together => Some(TOGETHER_API_KEY_PAGE),
         crate::config::Provider::Ollama => None,
+        crate::config::Provider::Local => None,
     }
 }
 
@@ -28,6 +29,7 @@ fn keychain_user_for(provider: crate::config::Provider) -> Option<&'static str> 
         crate::config::Provider::Gemini => Some(USER),
         crate::config::Provider::Together => Some(TOGETHER_USER),
         crate::config::Provider::Ollama => None,
+        crate::config::Provider::Local => None,
     }
 }
 
@@ -185,6 +187,7 @@ pub(crate) fn draft_slot(provider: crate::config::Provider) -> Option<usize> {
         crate::config::Provider::Gemini => Some(0),
         crate::config::Provider::Together => Some(1),
         crate::config::Provider::Ollama => None,
+        crate::config::Provider::Local => None,
     }
 }
 

@@ -67,7 +67,7 @@ pub enum UserEvent {
     ProviderMenuState {
         id: u64,
         current: config::Provider,
-        ready: [bool; 3],
+        ready: [bool; 4],
     },
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     CopiedText {
@@ -382,8 +382,8 @@ impl SettingsFailure {
 }
 
 /// Loads the app settings and the selected provider's API key, exactly as the
-/// grammar check does. `Ok` carries `(settings, key)` with `key == None` only
-/// for Ollama; `Err` is the user-facing popup message with its severity.
+/// grammar check does. `Ok` carries `(settings, key)` with `key == None` for
+/// providers that need no key; `Err` is the user-facing popup message with its severity.
 fn resolve_settings() -> Result<(config::AppSettings, Option<String>), SettingsFailure> {
     let app_settings = config::load_settings().map_err(SettingsFailure::error)?;
     if app_settings.current_model().is_empty() {
@@ -391,13 +391,14 @@ fn resolve_settings() -> Result<(config::AppSettings, Option<String>), SettingsF
             "Choose a model first: click the Writely menu-bar icon › Settings…".to_string(),
         ));
     }
-    // Ollama runs locally and needs no key; the other providers read the
+    // Providers that need no key run locally; the others read the
     // selected provider's key from the keychain (never shown or logged).
-    let key: Option<String> = match app_settings.provider {
-        config::Provider::Ollama => None,
-        provider => settings::load_api_key_for(provider).map_err(SettingsFailure::error)?,
+    let key: Option<String> = if app_settings.provider.needs_key() {
+        settings::load_api_key_for(app_settings.provider).map_err(SettingsFailure::error)?
+    } else {
+        None
     };
-    if key.is_none() && app_settings.provider != config::Provider::Ollama {
+    if key.is_none() && app_settings.provider.needs_key() {
         return Err(SettingsFailure::guidance(format!(
             "Add your {} API key first: click the Writely menu-bar icon › Settings…",
             app_settings.provider.display_name()
@@ -1997,12 +1998,13 @@ fn update_tray_paused(tray: &TrayIcon, paused: bool) {
     }
 }
 
-/// Index into a `ProviderMenuState` readiness array (Gemini, Together, Ollama).
+/// Index into a `ProviderMenuState` readiness array (Gemini, Together, Ollama, Local).
 fn ready_index(provider: config::Provider) -> usize {
     match provider {
         config::Provider::Gemini => 0,
         config::Provider::Together => 1,
         config::Provider::Ollama => 2,
+        config::Provider::Local => 3,
     }
 }
 
@@ -2016,18 +2018,19 @@ fn provider_item_text(provider: config::Provider, ready: bool) -> String {
     }
 }
 
-/// The Provider submenu diff: for each provider (Gemini, Together, Ollama),
+/// The Provider submenu diff: for each provider (Gemini, Together, Ollama, Local),
 /// the checked state and label to apply, each `None` when unchanged from
 /// `previous`. A missing cache means everything is applied.
 fn menu_updates(
-    previous: Option<(config::Provider, [bool; 3])>,
+    previous: Option<(config::Provider, [bool; 4])>,
     current: config::Provider,
-    ready: [bool; 3],
+    ready: [bool; 4],
 ) -> Vec<(config::Provider, Option<bool>, Option<String>)> {
     [
         config::Provider::Gemini,
         config::Provider::Together,
         config::Provider::Ollama,
+        config::Provider::Local,
     ]
     .iter()
     .map(|provider| {
@@ -2072,22 +2075,26 @@ fn request_provider_menu_refresh(proxy: &EventLoopProxy<UserEvent>, menu_refresh
                 config::Provider::Gemini,
                 config::Provider::Together,
                 config::Provider::Ollama,
+                config::Provider::Local,
             ];
-            let mut ready = [false; 3];
+            let mut ready = [false; 4];
             for (index, provider) in providers.iter().enumerate() {
-                let has_key = if *provider == config::Provider::Ollama {
-                    false
+                ready[index] = if *provider == config::Provider::Local {
+                    local::install::local_ready(&settings)
                 } else {
-                    match settings::has_api_key_for(*provider) {
-                        Ok(has_key) => has_key,
-                        Err(error) => {
-                            eprintln!("Writely: {error}");
-                            false
+                    let has_key = if !provider.needs_key() {
+                        false
+                    } else {
+                        match settings::has_api_key_for(*provider) {
+                            Ok(has_key) => has_key,
+                            Err(error) => {
+                                eprintln!("Writely: {error}");
+                                false
+                            }
                         }
-                    }
+                    };
+                    config::provider_ready(*provider, &settings.model_for(*provider), has_key)
                 };
-                ready[index] =
-                    config::provider_ready(*provider, &settings.model_for(*provider), has_key);
             }
             if let Err(error) = proxy.send_event(UserEvent::ProviderMenuState {
                 id,
@@ -2182,7 +2189,7 @@ fn main() {
     let mut pause_item: Option<MenuItem> = None;
     let mut provider_items: Vec<(config::Provider, CheckMenuItem)> = Vec::new();
     let mut menu_refresh_id: u64 = 0;
-    let mut provider_menu_state: Option<(config::Provider, [bool; 3])> = None;
+    let mut provider_menu_state: Option<(config::Provider, [bool; 4])> = None;
     let mut quit_id = tray_icon::menu::MenuId::new("quit");
     #[cfg(target_os = "linux")]
     let mut check_text_id = tray_icon::menu::MenuId::new("check-text");
@@ -2231,8 +2238,15 @@ fn main() {
                 );
                 let ollama_item =
                     CheckMenuItem::with_id("provider-ollama", "Ollama", true, false, None);
-                if let Err(error) =
-                    provider_submenu.append_items(&[&gemini_item, &together_item, &ollama_item])
+                let local_item = CheckMenuItem::with_id(
+                    "provider-local",
+                    "On this computer",
+                    true,
+                    false,
+                    None,
+                );
+                if let Err(error) = provider_submenu
+                    .append_items(&[&gemini_item, &together_item, &ollama_item, &local_item])
                 {
                     eprintln!("Writely: could not create the tray icon: {error}");
                     std::process::exit(1);
@@ -2295,6 +2309,7 @@ fn main() {
                     (config::Provider::Gemini, gemini_item),
                     (config::Provider::Together, together_item),
                     (config::Provider::Ollama, ollama_item),
+                    (config::Provider::Local, local_item),
                 ];
                 let menu = match menu_result {
                     Ok(menu) => menu,
@@ -2902,6 +2917,7 @@ mod tests {
         assert_eq!(ready_index(Provider::Gemini), 0);
         assert_eq!(ready_index(Provider::Together), 1);
         assert_eq!(ready_index(Provider::Ollama), 2);
+        assert_eq!(ready_index(Provider::Local), 3);
     }
 
     #[test]
@@ -2909,6 +2925,10 @@ mod tests {
         assert_eq!(provider_item_text(Provider::Gemini, true), "Gemini");
         assert_eq!(provider_item_text(Provider::Together, true), "Together AI");
         assert_eq!(provider_item_text(Provider::Ollama, true), "Ollama");
+        assert_eq!(
+            provider_item_text(Provider::Local, true),
+            "On this computer"
+        );
         assert_eq!(
             provider_item_text(Provider::Gemini, false),
             "Gemini (not set up)"
@@ -2921,11 +2941,15 @@ mod tests {
             provider_item_text(Provider::Ollama, false),
             "Ollama (not set up)"
         );
+        assert_eq!(
+            provider_item_text(Provider::Local, false),
+            "On this computer (not set up)"
+        );
     }
 
     #[test]
     fn menu_updates_no_cache_applies_everything() {
-        let updates = menu_updates(None, Provider::Gemini, [true, false, true]);
+        let updates = menu_updates(None, Provider::Gemini, [true, false, true, false]);
         assert_eq!(
             updates,
             vec![
@@ -2936,6 +2960,11 @@ mod tests {
                     Some("Together AI (not set up)".to_string())
                 ),
                 (Provider::Ollama, Some(false), Some("Ollama".to_string())),
+                (
+                    Provider::Local,
+                    Some(false),
+                    Some("On this computer (not set up)".to_string())
+                ),
             ]
         );
     }
@@ -2943,9 +2972,9 @@ mod tests {
     #[test]
     fn menu_updates_unchanged_applies_nothing() {
         let updates = menu_updates(
-            Some((Provider::Gemini, [true, true, true])),
+            Some((Provider::Gemini, [true, true, true, true])),
             Provider::Gemini,
-            [true, true, true],
+            [true, true, true, true],
         );
         assert!(updates
             .iter()
@@ -2958,26 +2987,27 @@ mod tests {
         // the refresh still says Gemini: Gemini is re-checked and Together
         // is unchecked, with labels untouched.
         let updates = menu_updates(
-            Some((Provider::Together, [true, true, true])),
+            Some((Provider::Together, [true, true, true, true])),
             Provider::Gemini,
-            [true, true, true],
+            [true, true, true, true],
         );
         assert_eq!(updates[0].1, Some(true));
         assert_eq!(updates[1].1, Some(false));
         assert_eq!(updates[2].1, None);
+        assert_eq!(updates[3].1, None);
         assert!(updates.iter().all(|(_, _, text)| text.is_none()));
     }
 
     #[test]
     fn menu_updates_readiness_change_updates_label_only() {
         let updates = menu_updates(
-            Some((Provider::Gemini, [true, true, true])),
+            Some((Provider::Gemini, [true, true, true, true])),
             Provider::Gemini,
-            [true, false, true],
+            [true, false, true, true],
         );
         assert!(updates.iter().all(|(_, checked, _)| checked.is_none()));
         assert_eq!(updates[1].2.as_deref(), Some("Together AI (not set up)"));
-        assert!(updates[0].2.is_none() && updates[2].2.is_none());
+        assert!(updates[0].2.is_none() && updates[2].2.is_none() && updates[3].2.is_none());
     }
 
     #[test]

@@ -120,19 +120,20 @@ fn on_check() {
         });
         return;
     }
-    // Ollama runs locally and needs no key; the other providers read the
+    // Providers that need no key run locally; the others read the
     // selected provider's key from the keychain (never shown or logged).
-    let key: Option<String> = match app_settings.provider {
-        crate::config::Provider::Ollama => None,
-        provider => match crate::settings::load_api_key_for(provider) {
+    let key: Option<String> = if app_settings.provider.needs_key() {
+        match crate::settings::load_api_key_for(app_settings.provider) {
             Ok(key) => key,
             Err(error) => {
                 with_state(|st| set_status(&st.status, &error, true));
                 return;
             }
-        },
+        }
+    } else {
+        None
     };
-    if key.is_none() && app_settings.provider != crate::config::Provider::Ollama {
+    if key.is_none() && app_settings.provider.needs_key() {
         with_state(|st| {
             set_status(
                 &st.status,
