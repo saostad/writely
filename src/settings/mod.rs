@@ -239,6 +239,170 @@ pub(crate) fn clear_key_draft(drafts: &mut [String; 3], provider: crate::config:
     }
 }
 
+#[allow(dead_code)] // Used by the Linux Settings window (local-model round 4, item 3).
+pub(crate) fn local_model_choices() -> Vec<(crate::config::LocalModelId, String)> {
+    [
+        crate::config::LocalModelId::Qwen35_0_8B,
+        crate::config::LocalModelId::Qwen35_2B,
+    ]
+    .into_iter()
+    .map(|id| {
+        let model = crate::local::catalog::model_file(id);
+        (
+            id,
+            format!(
+                "{} ({} download)",
+                model.label,
+                crate::local::download::human_size(model.size)
+            ),
+        )
+    })
+    .collect()
+}
+
+#[allow(dead_code)] // Used by the Linux Settings window (local-model round 4, item 3).
+pub(crate) struct LocalView {
+    pub status: String,
+    pub is_error: bool,
+    pub show_download: bool,
+    pub show_cancel: bool,
+    pub show_delete: bool,
+    pub fields_enabled: bool,
+}
+
+#[allow(dead_code)] // Used by the Linux Settings window (local-model round 4, item 3).
+pub(crate) fn local_view(
+    phase: &crate::local::install::InstallPhase,
+    selected_ready: bool,
+    _selected_label: &str,
+) -> LocalView {
+    use crate::local::install::InstallPhase;
+    match phase {
+        InstallPhase::Idle => {
+            if selected_ready {
+                LocalView {
+                    status: "Ready. The model runs on this computer; your text doesn't leave it."
+                        .to_string(),
+                    is_error: false,
+                    show_download: false,
+                    show_cancel: false,
+                    show_delete: true,
+                    fields_enabled: true,
+                }
+            } else {
+                LocalView {
+                    status: "Not downloaded yet. Click Download to get it (nothing is downloaded until you do)."
+                        .to_string(),
+                    is_error: false,
+                    show_download: true,
+                    show_cancel: false,
+                    show_delete: false,
+                    fields_enabled: true,
+                }
+            }
+        }
+        InstallPhase::Downloading { what, done, total } => {
+            let pct = if *total == 0 {
+                0
+            } else {
+                (*done as u128 * 100 / *total as u128) as u64
+            };
+            LocalView {
+                status: format!(
+                    "Downloading {what}: {pct}% ({} of {})",
+                    crate::local::download::human_size(*done),
+                    crate::local::download::human_size(*total)
+                ),
+                is_error: false,
+                show_download: false,
+                show_cancel: true,
+                show_delete: false,
+                fields_enabled: false,
+            }
+        }
+        InstallPhase::Verifying { what } => LocalView {
+            status: format!("Checking the download of {what}…"),
+            is_error: false,
+            show_download: false,
+            show_cancel: true,
+            show_delete: false,
+            fields_enabled: false,
+        },
+        InstallPhase::Unpacking => LocalView {
+            status: "Unpacking the llama.cpp helper…".to_string(),
+            is_error: false,
+            show_download: false,
+            show_cancel: false,
+            show_delete: false,
+            fields_enabled: false,
+        },
+        InstallPhase::Failed(msg) => {
+            if msg == "Download cancelled." {
+                LocalView {
+                    status: "Download cancelled.".to_string(),
+                    is_error: false,
+                    show_download: true,
+                    show_cancel: false,
+                    show_delete: false,
+                    fields_enabled: true,
+                }
+            } else {
+                LocalView {
+                    status: format!("Download failed: {msg}"),
+                    is_error: true,
+                    show_download: true,
+                    show_cancel: false,
+                    show_delete: false,
+                    fields_enabled: true,
+                }
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // Used by the Linux Settings window (local-model round 4, item 3).
+pub(crate) struct LocalFields {
+    pub idle_minutes: String,
+    pub threads: String,
+    pub max_reply: String,
+    pub context: String,
+    pub startup_secs: String,
+    pub reply_secs: String,
+}
+
+fn parse_local_field(text: &str, name: &str) -> Result<u32, String> {
+    text.trim()
+        .parse::<u32>()
+        .map_err(|_| format!("{name} must be a whole number."))
+}
+
+#[allow(dead_code)] // Used by the Linux Settings window (local-model round 4, item 3).
+pub(crate) fn apply_local_fields(
+    settings: &mut crate::config::AppSettings,
+    model: crate::config::LocalModelId,
+    warm_up: bool,
+    fields: &LocalFields,
+) -> Result<(), String> {
+    let idle_minutes = parse_local_field(&fields.idle_minutes, "Free memory after")?;
+    let threads = parse_local_field(&fields.threads, "Processor threads")?;
+    let max_reply = parse_local_field(&fields.max_reply, "Longest reply")?;
+    let context = parse_local_field(&fields.context, "Context size")?;
+    let startup_secs = parse_local_field(&fields.startup_secs, "Startup time limit")?;
+    let reply_secs = parse_local_field(&fields.reply_secs, "Reply time limit")?;
+    let mut copy = settings.clone();
+    copy.local_model = model;
+    copy.local_warm_up = warm_up;
+    copy.local_idle_minutes = idle_minutes;
+    copy.local_threads = threads;
+    copy.local_max_reply_tokens = max_reply;
+    copy.local_context_tokens = context;
+    copy.local_startup_timeout_secs = startup_secs;
+    copy.local_reply_timeout_secs = reply_secs;
+    crate::config::validate_local_settings(&copy)?;
+    *settings = copy;
+    Ok(())
+}
+
 pub fn load_api_key() -> Result<Option<String>, String> {
     let entry = keyring_entry()
         .map_err(|e| format!("Could not read the key from the system keychain: {e}"))?;
@@ -349,9 +513,11 @@ pub fn show_settings() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_key_draft, file_key_draft, pending_key_drafts, restore_key_draft, validate_api_key,
+        apply_local_fields, clear_key_draft, file_key_draft, local_model_choices, local_view,
+        pending_key_drafts, restore_key_draft, validate_api_key, LocalFields,
     };
-    use crate::config::Provider;
+    use crate::config::{AppSettings, LocalModelId, Provider};
+    use crate::local::install::InstallPhase;
 
     #[test]
     fn trims_surrounding_whitespace() {
@@ -434,6 +600,156 @@ mod tests {
         file_key_draft(&mut drafts, Provider::Together, "   \t\n ");
         assert_eq!(restore_key_draft(&drafts, Provider::Together), "");
         assert!(pending_key_drafts(&drafts).is_empty());
+    }
+
+    #[test]
+    fn local_model_choices_have_exact_texts() {
+        assert_eq!(
+            local_model_choices(),
+            vec![
+                (
+                    LocalModelId::Qwen35_0_8B,
+                    "Qwen3.5 0.8B — fast (533 MB download)".to_string()
+                ),
+                (
+                    LocalModelId::Qwen35_2B,
+                    "Qwen3.5 2B — better quality, slower (1.3 GB download)".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_view_for_every_phase() {
+        let ready = local_view(&InstallPhase::Idle, true, "label");
+        assert_eq!(
+            ready.status,
+            "Ready. The model runs on this computer; your text doesn't leave it."
+        );
+        assert!(!ready.is_error && !ready.show_download && !ready.show_cancel);
+        assert!(ready.show_delete && ready.fields_enabled);
+
+        let missing = local_view(&InstallPhase::Idle, false, "label");
+        assert_eq!(
+            missing.status,
+            "Not downloaded yet. Click Download to get it (nothing is downloaded until you do)."
+        );
+        assert!(missing.show_download && !missing.show_delete && missing.fields_enabled);
+
+        let downloading = local_view(
+            &InstallPhase::Downloading {
+                what: "the thing".to_string(),
+                done: 1_500_000,
+                total: 4_000_000,
+            },
+            false,
+            "label",
+        );
+        assert_eq!(
+            downloading.status,
+            "Downloading the thing: 37% (2 MB of 4 MB)"
+        );
+        assert!(downloading.show_cancel && !downloading.fields_enabled);
+
+        let zero = local_view(
+            &InstallPhase::Downloading {
+                what: "the thing".to_string(),
+                done: 0,
+                total: 0,
+            },
+            false,
+            "label",
+        );
+        assert_eq!(zero.status, "Downloading the thing: 0% (0 B of 0 B)");
+
+        let verifying = local_view(
+            &InstallPhase::Verifying {
+                what: "the thing".to_string(),
+            },
+            false,
+            "label",
+        );
+        assert_eq!(verifying.status, "Checking the download of the thing…");
+        assert!(verifying.show_cancel && !verifying.fields_enabled);
+
+        let unpacking = local_view(&InstallPhase::Unpacking, false, "label");
+        assert_eq!(unpacking.status, "Unpacking the llama.cpp helper…");
+        assert!(!unpacking.show_cancel && !unpacking.fields_enabled);
+
+        let failed = local_view(
+            &InstallPhase::Failed("disk exploded".to_string()),
+            false,
+            "label",
+        );
+        assert_eq!(failed.status, "Download failed: disk exploded");
+        assert!(failed.is_error && failed.show_download && failed.fields_enabled);
+
+        let cancelled = local_view(
+            &InstallPhase::Failed("Download cancelled.".to_string()),
+            false,
+            "label",
+        );
+        assert_eq!(cancelled.status, "Download cancelled.");
+        assert!(!cancelled.is_error && cancelled.show_download);
+    }
+
+    fn valid_local_fields() -> LocalFields {
+        LocalFields {
+            idle_minutes: " 5 ".to_string(),
+            threads: "8".to_string(),
+            max_reply: "512".to_string(),
+            context: "8192".to_string(),
+            startup_secs: "90".to_string(),
+            reply_secs: "300".to_string(),
+        }
+    }
+
+    #[test]
+    fn apply_local_fields_applies_valid_set() {
+        let mut settings = AppSettings::default();
+        apply_local_fields(
+            &mut settings,
+            LocalModelId::Qwen35_2B,
+            false,
+            &valid_local_fields(),
+        )
+        .expect("apply");
+        assert_eq!(settings.local_model, LocalModelId::Qwen35_2B);
+        assert!(!settings.local_warm_up);
+        assert_eq!(settings.local_idle_minutes, 5);
+        assert_eq!(settings.local_threads, 8);
+        assert_eq!(settings.local_max_reply_tokens, 512);
+        assert_eq!(settings.local_context_tokens, 8192);
+        assert_eq!(settings.local_startup_timeout_secs, 90);
+        assert_eq!(settings.local_reply_timeout_secs, 300);
+    }
+
+    #[test]
+    fn apply_local_fields_rejects_non_number_unchanged() {
+        let mut settings = AppSettings::default();
+        let before = settings.clone();
+        let mut fields = valid_local_fields();
+        fields.threads = "many".to_string();
+        assert_eq!(
+            apply_local_fields(&mut settings, LocalModelId::Qwen35_2B, false, &fields)
+                .expect_err("non-number"),
+            "Processor threads must be a whole number."
+        );
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn apply_local_fields_rejects_out_of_range_unchanged() {
+        let mut settings = AppSettings::default();
+        let before = settings.clone();
+        let mut fields = valid_local_fields();
+        fields.idle_minutes = "1441".to_string();
+        assert_eq!(
+            apply_local_fields(&mut settings, LocalModelId::Qwen35_2B, false, &fields)
+                .expect_err("out of range"),
+            "Free memory after must be between 0 and 1440 minutes (0 means never)."
+        );
+        assert_eq!(settings, before);
     }
 
     #[test]
