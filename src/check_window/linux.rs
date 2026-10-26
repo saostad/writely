@@ -24,6 +24,9 @@ struct CheckState {
     generation: u64,
     original: String,
     suggestion: Option<String>,
+    /// A check is running, so its partials may be shown; cleared when the
+    /// final result is shown so a late partial can't replace it.
+    in_flight: bool,
 }
 
 thread_local! {
@@ -163,6 +166,7 @@ fn on_check() {
         st.generation = st.generation.wrapping_add(1);
         st.original = trimmed.clone();
         st.suggestion = None;
+        st.in_flight = true;
         st.check_button.set_sensitive(false);
         st.copy_button.set_sensitive(false);
         if let Some(buffer) = st.result.buffer() {
@@ -203,13 +207,16 @@ fn on_check() {
             }
         })
     {
-        with_state(|st| {
-            st.check_button.set_sensitive(true);
-            set_status(
-                &st.status,
-                &format!("Could not check the text: {error}"),
-                true,
-            );
+        STATE.with(|state| {
+            if let Some(st) = state.borrow_mut().as_mut() {
+                st.in_flight = false;
+                st.check_button.set_sensitive(true);
+                set_status(
+                    &st.status,
+                    &format!("Could not check the text: {error}"),
+                    true,
+                );
+            }
         });
     }
 }
@@ -222,6 +229,7 @@ fn on_clear() {
             st.generation = st.generation.wrapping_add(1);
             st.original.clear();
             st.suggestion = None;
+            st.in_flight = false;
             if let Some(buffer) = st.input.buffer() {
                 buffer.set_text("");
             }
@@ -258,6 +266,7 @@ pub fn handle_result(generation: u64, result: Result<String, String>) {
         if generation != st.generation {
             return;
         }
+        st.in_flight = false;
         st.check_button.set_sensitive(true);
         match result {
             Err(error) => set_status(&st.status, &error, true),
@@ -284,6 +293,25 @@ pub fn handle_result(generation: u64, result: Result<String, String>) {
                 }
             }
         }
+    });
+}
+
+/// Shows a streamed partial in the result buffer, keeping the status
+/// "Checking…". Dropped when the window was closed, a newer Check or Clear
+/// happened, or the final result was already shown.
+pub fn show_partial(generation: u64, text: &str) {
+    STATE.with(|state| {
+        let borrowed = state.borrow();
+        let Some(st) = borrowed.as_ref() else {
+            return;
+        };
+        if generation != st.generation || !st.in_flight {
+            return;
+        }
+        if let Some(buffer) = st.result.buffer() {
+            buffer.set_text(text);
+        }
+        set_status(&st.status, "Checking…", false);
     });
 }
 
@@ -417,6 +445,7 @@ pub fn show() -> Result<(), String> {
             generation: 0,
             original: String::new(),
             suggestion: None,
+            in_flight: false,
         });
     });
     window.show_all();

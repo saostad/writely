@@ -31,6 +31,19 @@ pub fn show() -> Result<(), String> {
     }
 }
 
+/// Shows a streamed partial in the result buffer while its check is still
+/// running, dropping it for a stale generation (Linux only).
+pub fn show_partial(generation: u64, text: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        linux::show_partial(generation, text);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (generation, text);
+    }
+}
+
 /// Shows a finished check, dropping it when a newer Check or Clear happened
 /// or the window was closed.
 pub fn handle_result(generation: u64, result: Result<String, String>) {

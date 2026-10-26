@@ -167,6 +167,9 @@ struct Composing {
     range: Range<usize>,
     pid: u32,
     request: String,
+    /// A compose request is in flight, so its partials may be shown; cleared
+    /// when the final reply is handled so a late partial can't replace it.
+    in_flight: bool,
 }
 
 /// The insert range for a compose: an empty range at the caret when the caret
@@ -563,6 +566,7 @@ fn start_composing(
         range,
         pid,
         request: String::new(),
+        in_flight: false,
     });
     if let Some(rect) = anchor {
         *last_anchor = Some(rect);
@@ -716,9 +720,11 @@ fn handle_input_submitted(
         }
     };
     active.request = request.clone();
+    active.in_flight = true;
     show_popup("Writing…", false, false, Some(anchor), None, last_anchor);
     if let Err(error) = spawn_compose_thread(proxy, app_settings, key, request, current_generation)
     {
+        active.in_flight = false;
         let request = &active.request;
         popup::show_input(popup::InputKind::Compose, request, Some(&error), &anchor);
     }
@@ -813,6 +819,9 @@ fn handle_composed(
     // Drop late replies: a newer click, or typing that hid the popup, wins.
     if event_generation != current_generation || !popup::is_visible() {
         return;
+    }
+    if let Some(active) = composing.as_mut() {
+        active.in_flight = false;
     }
     let Some(active) = composing.as_ref() else {
         return;
@@ -1367,6 +1376,154 @@ fn handle_icon_clicked(
         anchor,
         last_anchor,
     );
+}
+
+/// The live-state facts `partial_target` needs, copied out of
+/// `checking`/`pending`/`composing` so the drop rules stay pure.
+#[derive(Clone, Copy, Default)]
+struct PartialState {
+    checking: bool,
+    pending: bool,
+    rewrite_selected: bool,
+    rewrite_cached: bool,
+    rewrite_in_flight: bool,
+    composing_in_flight: bool,
+    change_selected: bool,
+    change_in_flight: bool,
+    text_check_in_flight: bool,
+}
+
+/// Whether a partial may be shown: exactly when the final event for the same
+/// kind would not be dropped. A stale generation always drops; the popup
+/// kinds also need the popup visible and their in-flight state still live
+/// (each final handler clears that state, so a partial can never replace a
+/// final result). `TextCheck` has no popup: its window enforces the same
+/// generation/in-flight rule itself.
+fn partial_target(
+    kind: PartialKind,
+    generation: u64,
+    current_generation: u64,
+    popup_visible: bool,
+    state: PartialState,
+) -> bool {
+    if generation != current_generation {
+        return false;
+    }
+    match kind {
+        PartialKind::TextCheck => state.text_check_in_flight,
+        _ if !popup_visible => false,
+        PartialKind::Check => state.checking,
+        PartialKind::Rewrite(_) => {
+            state.pending
+                && state.rewrite_selected
+                && !state.rewrite_cached
+                && state.rewrite_in_flight
+        }
+        PartialKind::Compose => state.composing_in_flight,
+        PartialKind::Change => state.pending && state.change_selected && state.change_in_flight,
+    }
+}
+
+/// Shows a streamed partial where the waiting message is shown today; the
+/// final handlers replace it exactly as before.
+#[allow(clippy::too_many_arguments)]
+fn handle_partial(
+    current_generation: u64,
+    generation: u64,
+    kind: PartialKind,
+    text: String,
+    checking: &Option<Checking>,
+    pending: &Option<Pending>,
+    composing: &Option<Composing>,
+    last_anchor: &mut Option<CaretRect>,
+) {
+    // The Check text window counts its own generations and drops stale
+    // replies itself, like `TextCheckResult`.
+    if kind == PartialKind::TextCheck {
+        check_window::show_partial(generation, &text);
+        return;
+    }
+    let state = PartialState {
+        checking: checking.is_some(),
+        pending: pending.is_some(),
+        rewrite_selected: matches!(kind, PartialKind::Rewrite(style) if pending
+            .as_ref()
+            .is_some_and(|active| active.selected == popup::PopupTab::Rewrite(style))),
+        rewrite_cached: matches!(kind, PartialKind::Rewrite(style) if pending
+            .as_ref()
+            .is_some_and(|active| active.rewrites[style_index(style)].is_some())),
+        rewrite_in_flight: matches!(kind, PartialKind::Rewrite(style) if pending
+            .as_ref()
+            .is_some_and(|active| active.rewrite_in_flight[style_index(style)])),
+        composing_in_flight: composing.as_ref().is_some_and(|active| active.in_flight),
+        change_selected: pending
+            .as_ref()
+            .is_some_and(|active| active.selected == popup::PopupTab::Custom),
+        change_in_flight: pending
+            .as_ref()
+            .is_some_and(|active| active.custom_in_flight),
+        // Delegated to the Check text window above.
+        text_check_in_flight: false,
+    };
+    if !partial_target(
+        kind,
+        generation,
+        current_generation,
+        popup::is_visible(),
+        state,
+    ) {
+        return;
+    }
+    match kind {
+        PartialKind::Check => {
+            show_popup(&text, false, false, *last_anchor, None, last_anchor);
+        }
+        PartialKind::Rewrite(style) => {
+            let Some(anchor) = *last_anchor else {
+                eprintln!("Writely: could not show the rewrite: the caret position is unknown.");
+                return;
+            };
+            popup::show_tabbed(
+                popup::PopupTab::Rewrite(style),
+                popup::TabContent::Message {
+                    text: &text,
+                    is_error: false,
+                    loading: true,
+                    retry: false,
+                },
+                &anchor,
+            );
+        }
+        PartialKind::Compose => {
+            show_popup(
+                &text,
+                false,
+                false,
+                *last_anchor,
+                composing.as_ref().map(|active| active.snap.caret_rect),
+                last_anchor,
+            );
+        }
+        PartialKind::Change => {
+            let Some(anchor) = *last_anchor else {
+                eprintln!("Writely: could not show the rewrite: the caret position is unknown.");
+                return;
+            };
+            popup::show_tabbed(
+                popup::PopupTab::Custom,
+                popup::TabContent::Message {
+                    text: &text,
+                    is_error: false,
+                    loading: true,
+                    retry: false,
+                },
+                &anchor,
+            );
+        }
+        PartialKind::TextCheck => {
+            // Handled above.
+        }
+    }
 }
 
 fn handle_suggestion(
@@ -2783,6 +2940,22 @@ fn main() {
                     &mut last_anchor,
                 );
             }
+            Event::UserEvent(UserEvent::Partial {
+                generation: event_generation,
+                kind,
+                text,
+            }) => {
+                handle_partial(
+                    generation,
+                    event_generation,
+                    kind,
+                    text,
+                    &checking,
+                    &pending,
+                    &composing,
+                    &mut last_anchor,
+                );
+            }
             Event::UserEvent(UserEvent::Suggestion {
                 generation: event_generation,
                 result,
@@ -2859,8 +3032,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_range, custom_source_text, dimmed_rgba, icon_ready, menu_updates, pause_item_text,
-        provider_item_text, ready_index, rewrite_retry_style, selected_text, style_index, Pending,
+        compose_range, custom_source_text, dimmed_rgba, icon_ready, menu_updates, partial_target,
+        pause_item_text, provider_item_text, ready_index, rewrite_retry_style, selected_text,
+        style_index, PartialKind, PartialState, Pending,
     };
     use crate::config::Provider;
     use crate::popup::PopupTab;
@@ -2885,6 +3059,154 @@ mod tests {
             custom_request: String::new(),
             custom_in_flight: false,
         }
+    }
+
+    fn live_partial_state() -> PartialState {
+        PartialState {
+            checking: true,
+            pending: true,
+            rewrite_selected: true,
+            rewrite_cached: false,
+            rewrite_in_flight: true,
+            composing_in_flight: true,
+            change_selected: true,
+            change_in_flight: true,
+            text_check_in_flight: true,
+        }
+    }
+
+    #[test]
+    fn partial_target_accepts_each_kind_in_its_live_state() {
+        let style = RewriteStyle::ALL[0];
+        for kind in [
+            PartialKind::Check,
+            PartialKind::Rewrite(style),
+            PartialKind::Compose,
+            PartialKind::Change,
+            PartialKind::TextCheck,
+        ] {
+            assert!(
+                partial_target(kind, 7, 7, true, live_partial_state()),
+                "{kind:?}"
+            );
+        }
+        // The Check text window is not a popup, so popup visibility is
+        // irrelevant for it.
+        assert!(partial_target(
+            PartialKind::TextCheck,
+            7,
+            7,
+            false,
+            live_partial_state()
+        ));
+    }
+
+    #[test]
+    fn partial_target_drops_stale_hidden_and_finished() {
+        let style = RewriteStyle::ALL[0];
+        // Stale generation and a hidden popup drop every popup kind.
+        assert!(!partial_target(
+            PartialKind::Check,
+            6,
+            7,
+            true,
+            live_partial_state()
+        ));
+        assert!(!partial_target(
+            PartialKind::TextCheck,
+            6,
+            7,
+            true,
+            live_partial_state()
+        ));
+        assert!(!partial_target(
+            PartialKind::Rewrite(style),
+            7,
+            7,
+            false,
+            live_partial_state()
+        ));
+        // Check after the final result: `checking` was taken.
+        assert!(!partial_target(
+            PartialKind::Check,
+            7,
+            7,
+            true,
+            PartialState {
+                checking: false,
+                ..live_partial_state()
+            }
+        ));
+        // Rewrite for an unselected style, an already cached result, and one
+        // whose final event cleared the in-flight flag.
+        for state in [
+            PartialState {
+                rewrite_selected: false,
+                ..live_partial_state()
+            },
+            PartialState {
+                rewrite_cached: true,
+                ..live_partial_state()
+            },
+            PartialState {
+                rewrite_in_flight: false,
+                ..live_partial_state()
+            },
+            PartialState {
+                pending: false,
+                ..live_partial_state()
+            },
+        ] {
+            assert!(!partial_target(
+                PartialKind::Rewrite(style),
+                7,
+                7,
+                true,
+                state
+            ));
+        }
+        // Compose and change drop once their in-flight state is gone; a
+        // change partial never shows on another tab.
+        assert!(!partial_target(
+            PartialKind::Compose,
+            7,
+            7,
+            true,
+            PartialState {
+                composing_in_flight: false,
+                ..live_partial_state()
+            }
+        ));
+        assert!(!partial_target(
+            PartialKind::Change,
+            7,
+            7,
+            true,
+            PartialState {
+                change_in_flight: false,
+                ..live_partial_state()
+            }
+        ));
+        assert!(!partial_target(
+            PartialKind::Change,
+            7,
+            7,
+            true,
+            PartialState {
+                change_selected: false,
+                ..live_partial_state()
+            }
+        ));
+        assert!(!partial_target(
+            PartialKind::TextCheck,
+            7,
+            7,
+            true,
+            PartialState {
+                text_check_in_flight: false,
+                ..live_partial_state()
+            }
+        ));
     }
 
     #[test]
