@@ -1,13 +1,17 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
 use gtk::prelude::*;
 use gtk::{
-    Box as GtkBox, Button, CheckButton, ComboBoxText, Entry, Label, LinkButton, Orientation,
-    Window, WindowType,
+    Box as GtkBox, Button, ButtonsType, CheckButton, ComboBoxText, DialogFlags, Entry, Expander,
+    Label, LinkButton, MessageDialog, MessageType, Orientation, PolicyType, ResponseType,
+    ScrolledWindow, Window, WindowType,
 };
 
-use crate::config::{AppSettings, Effort, Provider};
+use crate::config::{AppSettings, Effort, LocalModelId, Provider};
+use crate::local::{catalog, download, install, server};
 
 const PROVIDER_NAMES: [&str; 4] = [
     "Google Gemini",
@@ -32,6 +36,20 @@ fn provider_index(provider: Provider) -> u32 {
         Provider::Together => 1,
         Provider::Ollama => 2,
         Provider::Local => 3,
+    }
+}
+
+fn local_model_at(index: u32) -> LocalModelId {
+    match index {
+        1 => LocalModelId::Qwen35_2B,
+        _ => LocalModelId::Qwen35_0_8B,
+    }
+}
+
+fn local_model_index(model: LocalModelId) -> u32 {
+    match model {
+        LocalModelId::Qwen35_0_8B => 0,
+        LocalModelId::Qwen35_2B => 1,
     }
 }
 
@@ -113,7 +131,21 @@ struct Controls {
     model_label: Label,
     model_entry: Entry,
     model_help: Label,
-    local_help: Label,
+    local_box: GtkBox,
+    local_model_combo: ComboBoxText,
+    local_status_label: Label,
+    local_download_button: Button,
+    local_cancel_button: Button,
+    local_delete_button: Button,
+    local_warm_check: CheckButton,
+    local_idle_entry: Entry,
+    local_threads_entry: Entry,
+    local_max_reply_entry: Entry,
+    local_context_entry: Entry,
+    local_startup_entry: Entry,
+    local_reply_entry: Entry,
+    local_runtime_error: bool,
+    local_was_busy: bool,
     effort_combo: ComboBoxText,
     key_entry: Entry,
     url_entry: Entry,
@@ -127,6 +159,50 @@ struct Controls {
     settings: AppSettings,
     draft_keys: [String; 3],
     suppress_provider_changed: bool,
+}
+
+/// Re-renders the local-model status, buttons and model-combo sensitivity
+/// from the current install phase for the selected model.
+fn render_local(controls: &Rc<RefCell<Controls>>) {
+    let (selected, runtime_error) = {
+        let borrowed = controls.borrow();
+        (
+            local_model_at(borrowed.local_model_combo.active().unwrap_or(0)),
+            borrowed.local_runtime_error,
+        )
+    };
+    let phase = install::install_phase();
+    let ready = install::model_ready(selected);
+    let view = super::local_view(&phase, ready, catalog::model_file(selected).label);
+    let busy = matches!(
+        phase,
+        install::InstallPhase::Downloading { .. }
+            | install::InstallPhase::Verifying { .. }
+            | install::InstallPhase::Unpacking
+    );
+    let finished = {
+        let mut borrowed = controls.borrow_mut();
+        set_status(&borrowed.local_status_label, &view.status, view.is_error);
+        borrowed
+            .local_download_button
+            .set_visible(view.show_download && !runtime_error);
+        borrowed
+            .local_cancel_button
+            .set_visible(view.show_cancel && !runtime_error);
+        borrowed
+            .local_delete_button
+            .set_visible(view.show_delete && !runtime_error);
+        borrowed
+            .local_model_combo
+            .set_sensitive(view.fields_enabled);
+        let finished =
+            borrowed.local_was_busy && matches!(phase, install::InstallPhase::Idle) && ready;
+        borrowed.local_was_busy = busy;
+        finished
+    };
+    if finished {
+        super::notify_changed();
+    }
 }
 
 /// Refreshes the provider-dependent rows for the selected provider: the model
@@ -150,7 +226,7 @@ fn refresh_provider_rows(controls: &Rc<RefCell<Controls>>) {
     borrowed.model_label.set_visible(!is_local);
     borrowed.model_entry.set_visible(!is_local);
     borrowed.model_help.set_visible(!is_local);
-    borrowed.local_help.set_visible(is_local);
+    borrowed.local_box.set_visible(is_local);
     borrowed.key_label.set_visible(!is_ollama && !is_local);
     borrowed.key_entry.set_visible(!is_ollama && !is_local);
     borrowed.key_help.set_visible(!is_ollama && !is_local);
@@ -394,12 +470,101 @@ pub fn show_settings() -> Result<(), String> {
     url_help.set_line_wrap(true);
     container.pack_start(&url_help, false, false, 0);
 
-    let local_help = Label::new(Some(
-        "This runs a small AI model on your computer. Download and memory options are being added.",
-    ));
-    local_help.set_halign(gtk::Align::Start);
-    local_help.set_line_wrap(true);
-    container.pack_start(&local_help, false, false, 0);
+    // The "On this computer" section, shown only for that provider.
+    let local_box = GtkBox::new(Orientation::Vertical, 8);
+    fn local_label(text: &str, parent: &GtkBox) -> Label {
+        let label = Label::new(Some(text));
+        label.set_halign(gtk::Align::Start);
+        label.set_line_wrap(true);
+        parent.pack_start(&label, false, false, 0);
+        label
+    }
+    fn local_entry(value: u32, parent: &GtkBox) -> Entry {
+        let entry = Entry::new();
+        entry.set_text(&value.to_string());
+        entry.set_input_purpose(gtk::InputPurpose::Digits);
+        parent.pack_start(&entry, false, false, 0);
+        entry
+    }
+    local_label("Model", &local_box);
+    let local_model_combo = ComboBoxText::new();
+    for (_id, text) in super::local_model_choices() {
+        local_model_combo.append_text(&text);
+    }
+    local_model_combo.set_active(Some(local_model_index(settings.local_model)));
+    local_box.pack_start(&local_model_combo, false, false, 0);
+    local_label(
+        "Smaller is faster; larger makes fewer mistakes. Your text never leaves this computer.",
+        &local_box,
+    );
+    let local_status_label = local_label("", &local_box);
+    let local_button_row = GtkBox::new(Orientation::Horizontal, 8);
+    let local_download_button = Button::with_label("Download");
+    let local_cancel_button = Button::with_label("Cancel");
+    let local_delete_button = Button::with_label("Delete model");
+    local_button_row.pack_start(&local_download_button, false, false, 0);
+    local_button_row.pack_start(&local_cancel_button, false, false, 0);
+    local_button_row.pack_start(&local_delete_button, false, false, 0);
+    local_box.pack_start(&local_button_row, false, false, 0);
+    let (local_runtime_help_text, local_runtime_error) = match catalog::runtime_file() {
+        Ok(runtime) => (
+            format!(
+                "The first download also gets the llama.cpp helper ({}). Files are saved in {}.",
+                download::human_size(runtime.size),
+                catalog::local_data_dir().display()
+            ),
+            false,
+        ),
+        Err(error) => (error, true),
+    };
+    local_label(&local_runtime_help_text, &local_box);
+    let local_warm_check = CheckButton::with_label("Load the model when Writely starts");
+    local_warm_check.set_active(settings.local_warm_up);
+    local_warm_check.set_halign(gtk::Align::Start);
+    local_box.pack_start(&local_warm_check, false, false, 0);
+    local_label(
+        "Makes the first check fast. While loaded it uses about 1 GB of memory (2 GB for the 2B model).",
+        &local_box,
+    );
+    local_label("Free memory after (minutes)", &local_box);
+    let local_idle_entry = local_entry(settings.local_idle_minutes, &local_box);
+    local_label(
+        "Unload the model after this many minutes without use. 0 = never. It loads again in about a second when needed.",
+        &local_box,
+    );
+    let local_advanced = Expander::new(Some("Advanced"));
+    local_advanced.set_expanded(false);
+    let local_advanced_box = GtkBox::new(Orientation::Vertical, 8);
+    local_label("Processor threads", &local_advanced_box);
+    let local_threads_entry = local_entry(settings.local_threads, &local_advanced_box);
+    local_label(
+        "How many processor cores the model uses. 4 suits most computers.",
+        &local_advanced_box,
+    );
+    local_label("Longest reply (tokens)", &local_advanced_box);
+    let local_max_reply_entry = local_entry(settings.local_max_reply_tokens, &local_advanced_box);
+    local_label(
+        "Stops a reply that runs too long. A token is about 4 characters.",
+        &local_advanced_box,
+    );
+    local_label("Context size (tokens)", &local_advanced_box);
+    let local_context_entry = local_entry(settings.local_context_tokens, &local_advanced_box);
+    local_label(
+        "How much text the model reads at once. Larger uses more memory.",
+        &local_advanced_box,
+    );
+    local_label("Startup time limit (seconds)", &local_advanced_box);
+    let local_startup_entry = local_entry(settings.local_startup_timeout_secs, &local_advanced_box);
+    local_label(
+        "How long to wait for the model to load.",
+        &local_advanced_box,
+    );
+    local_label("Reply time limit (seconds)", &local_advanced_box);
+    let local_reply_entry = local_entry(settings.local_reply_timeout_secs, &local_advanced_box);
+    local_label("How long to wait for a reply.", &local_advanced_box);
+    local_advanced.add(&local_advanced_box);
+    local_box.pack_start(&local_advanced, false, false, 0);
+    container.pack_start(&local_box, false, false, 0);
 
     let autostart_check = CheckButton::with_label("Start Writely at login");
     autostart_check.set_active(settings.launch_at_login);
@@ -435,7 +600,21 @@ pub fn show_settings() -> Result<(), String> {
         model_label: model_label.clone(),
         model_entry: model_entry.clone(),
         model_help: model_help.clone(),
-        local_help: local_help.clone(),
+        local_box: local_box.clone(),
+        local_model_combo: local_model_combo.clone(),
+        local_status_label: local_status_label.clone(),
+        local_download_button: local_download_button.clone(),
+        local_cancel_button: local_cancel_button.clone(),
+        local_delete_button: local_delete_button.clone(),
+        local_warm_check: local_warm_check.clone(),
+        local_idle_entry: local_idle_entry.clone(),
+        local_threads_entry: local_threads_entry.clone(),
+        local_max_reply_entry: local_max_reply_entry.clone(),
+        local_context_entry: local_context_entry.clone(),
+        local_startup_entry: local_startup_entry.clone(),
+        local_reply_entry: local_reply_entry.clone(),
+        local_runtime_error,
+        local_was_busy: false,
         effort_combo: effort_combo.clone(),
         key_entry: key_entry.clone(),
         url_entry: url_entry.clone(),
@@ -451,6 +630,89 @@ pub fn show_settings() -> Result<(), String> {
         suppress_provider_changed: false,
     }));
     refresh_provider_rows(&controls);
+    render_local(&controls);
+
+    {
+        let controls_for_local_model = controls.clone();
+        local_model_combo.connect_changed(move |_| {
+            render_local(&controls_for_local_model);
+        });
+    }
+    {
+        let controls_for_download = controls.clone();
+        local_download_button.connect_clicked(move |_| {
+            let selected = {
+                let borrowed = controls_for_download.borrow();
+                local_model_at(borrowed.local_model_combo.active().unwrap_or(0))
+            };
+            if let Err(error) = install::start_install(selected, Arc::new(|| {})) {
+                let borrowed = controls_for_download.borrow();
+                set_status(&borrowed.status_label, &error, true);
+                return;
+            }
+            render_local(&controls_for_download);
+        });
+    }
+    {
+        let controls_for_cancel = controls.clone();
+        local_cancel_button.connect_clicked(move |_| {
+            install::cancel_install();
+            render_local(&controls_for_cancel);
+        });
+    }
+    {
+        let controls_for_delete = controls.clone();
+        let window_for_delete = window.clone();
+        local_delete_button.connect_clicked(move |_| {
+            let selected = {
+                let borrowed = controls_for_delete.borrow();
+                local_model_at(borrowed.local_model_combo.active().unwrap_or(0))
+            };
+            let label = catalog::model_file(selected).label;
+            // No borrow of controls is held across run(): it spins a nested
+            // main loop and handlers (and the refresh timer) borrow controls.
+            let dialog = MessageDialog::new(
+                Some(&window_for_delete),
+                DialogFlags::MODAL,
+                MessageType::Question,
+                ButtonsType::None,
+                &format!("Delete {label}? You can download it again later."),
+            );
+            dialog.add_button("Cancel", ResponseType::Cancel);
+            dialog.add_button("Delete", ResponseType::Accept);
+            let response = dialog.run();
+            dialog.close();
+            if response != ResponseType::Accept {
+                return;
+            }
+            server::stop("model deleted");
+            match install::delete_model(selected) {
+                Ok(()) => {
+                    {
+                        let borrowed = controls_for_delete.borrow();
+                        set_status(&borrowed.status_label, "Deleted.", false);
+                    }
+                    super::notify_changed();
+                }
+                Err(error) => {
+                    let borrowed = controls_for_delete.borrow();
+                    set_status(&borrowed.status_label, &error, true);
+                }
+            }
+            render_local(&controls_for_delete);
+        });
+    }
+    {
+        let controls_for_timer = controls.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(250), move || {
+            let open = STATE.with(|state| state.borrow().is_some());
+            if !open {
+                return gtk::glib::ControlFlow::Break;
+            }
+            render_local(&controls_for_timer);
+            gtk::glib::ControlFlow::Continue
+        });
+    }
 
     {
         let controls_for_provider = controls.clone();
@@ -482,6 +744,33 @@ pub fn show_settings() -> Result<(), String> {
             if provider != Provider::Local {
                 if let Err(error) = crate::config::validate_model_name(&model) {
                     let borrowed = controls_for_save.borrow();
+                    set_status(&borrowed.status_label, &error, true);
+                    return;
+                }
+            }
+            let local_snapshot = {
+                let borrowed = controls_for_save.borrow();
+                (
+                    local_model_at(borrowed.local_model_combo.active().unwrap_or(0)),
+                    borrowed.local_warm_check.is_active(),
+                    super::LocalFields {
+                        idle_minutes: borrowed.local_idle_entry.text().to_string(),
+                        threads: borrowed.local_threads_entry.text().to_string(),
+                        max_reply: borrowed.local_max_reply_entry.text().to_string(),
+                        context: borrowed.local_context_entry.text().to_string(),
+                        startup_secs: borrowed.local_startup_entry.text().to_string(),
+                        reply_secs: borrowed.local_reply_entry.text().to_string(),
+                    },
+                )
+            };
+            {
+                let mut borrowed = controls_for_save.borrow_mut();
+                if let Err(error) = super::apply_local_fields(
+                    &mut borrowed.settings,
+                    local_snapshot.0,
+                    local_snapshot.1,
+                    &local_snapshot.2,
+                ) {
                     set_status(&borrowed.status_label, &error, true);
                     return;
                 }
@@ -583,7 +872,10 @@ pub fn show_settings() -> Result<(), String> {
         });
     });
 
-    window.add(&container);
+    let scrolled = ScrolledWindow::new(gtk::Adjustment::NONE, gtk::Adjustment::NONE);
+    scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scrolled.add(&container);
+    window.add(&scrolled);
     STATE.with(|state| {
         *state.borrow_mut() = Some(OpenWindow {
             window: window.clone(),
@@ -594,6 +886,7 @@ pub fn show_settings() -> Result<(), String> {
     // refresh_provider_rows ran before show_all; re-apply visibility now that
     // everything is realized.
     refresh_provider_rows(&controls);
+    render_local(&controls);
     window.present();
     Ok(())
 }

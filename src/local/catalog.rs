@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use crate::config::LocalModelId;
 
 pub struct ModelFile {
-    #[allow(dead_code)] // Used by the Settings window (local-model rounds 4–6).
     pub id: LocalModelId,
     pub label: &'static str,
     pub file_name: &'static str,

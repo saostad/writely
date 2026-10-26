@@ -239,7 +239,6 @@ pub(crate) fn clear_key_draft(drafts: &mut [String; 3], provider: crate::config:
     }
 }
 
-#[allow(dead_code)] // Used by the Linux Settings window (local-model round 4, item 3).
 pub(crate) fn local_model_choices() -> Vec<(crate::config::LocalModelId, String)> {
     [
         crate::config::LocalModelId::Qwen35_0_8B,
@@ -249,7 +248,7 @@ pub(crate) fn local_model_choices() -> Vec<(crate::config::LocalModelId, String)
     .map(|id| {
         let model = crate::local::catalog::model_file(id);
         (
-            id,
+            model.id,
             format!(
                 "{} ({} download)",
                 model.label,
@@ -260,7 +259,6 @@ pub(crate) fn local_model_choices() -> Vec<(crate::config::LocalModelId, String)
     .collect()
 }
 
-#[allow(dead_code)] // Used by the Linux Settings window (local-model round 4, item 3).
 pub(crate) struct LocalView {
     pub status: String,
     pub is_error: bool,
@@ -270,7 +268,6 @@ pub(crate) struct LocalView {
     pub fields_enabled: bool,
 }
 
-#[allow(dead_code)] // Used by the Linux Settings window (local-model round 4, item 3).
 pub(crate) fn local_view(
     phase: &crate::local::install::InstallPhase,
     selected_ready: bool,
@@ -360,7 +357,6 @@ pub(crate) fn local_view(
     }
 }
 
-#[allow(dead_code)] // Used by the Linux Settings window (local-model round 4, item 3).
 pub(crate) struct LocalFields {
     pub idle_minutes: String,
     pub threads: String,
@@ -376,7 +372,6 @@ fn parse_local_field(text: &str, name: &str) -> Result<u32, String> {
         .map_err(|_| format!("{name} must be a whole number."))
 }
 
-#[allow(dead_code)] // Used by the Linux Settings window (local-model round 4, item 3).
 pub(crate) fn apply_local_fields(
     settings: &mut crate::config::AppSettings,
     model: crate::config::LocalModelId,
