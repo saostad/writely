@@ -179,7 +179,22 @@ fn on_check() {
         .spawn(move || {
             // The key lives only in this thread's request; it is never
             // logged or put in an error.
-            let result = crate::providers::suggest(&app_settings, key.as_deref(), &trimmed);
+            let partial_proxy = worker_proxy.clone();
+            let mut partial_failed = false;
+            let result = crate::providers::suggest_stream(
+                &app_settings,
+                key.as_deref(),
+                &trimmed,
+                &mut |text| {
+                    crate::send_partial(
+                        &partial_proxy,
+                        &mut partial_failed,
+                        my_generation,
+                        crate::PartialKind::TextCheck,
+                        text,
+                    );
+                },
+            );
             if let Err(error) = worker_proxy.send_event(UserEvent::TextCheckResult {
                 generation: my_generation,
                 result,

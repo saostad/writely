@@ -25,6 +25,20 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use text_access::{CaretRect, FieldSnapshot};
 
+/// Which in-flight request a streamed partial reply belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialKind {
+    Check,
+    Rewrite(providers::RewriteStyle),
+    // Sent only by the macOS/Windows compose worker.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    Compose,
+    // Sent only by the macOS/Windows describe-a-change worker.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    Change,
+    TextCheck,
+}
+
 #[derive(Debug)]
 pub enum UserEvent {
     MenuEvent(MenuEvent),
@@ -76,6 +90,11 @@ pub enum UserEvent {
         pid: u32,
         from_hotkey: bool,
         from_terminal: bool,
+    },
+    Partial {
+        generation: u64,
+        kind: PartialKind,
+        text: String,
     },
     Suggestion {
         generation: u64,
@@ -407,6 +426,29 @@ fn resolve_settings() -> Result<(config::AppSettings, Option<String>), SettingsF
     Ok((app_settings, key))
 }
 
+/// Sends one streamed partial reply from a worker. A send failure is logged
+/// once per worker (`failed` is the worker's flag); later partials are
+/// skipped, but the final result is still sent as usual.
+fn send_partial(
+    proxy: &EventLoopProxy<UserEvent>,
+    failed: &mut bool,
+    generation: u64,
+    kind: PartialKind,
+    text: &str,
+) {
+    if *failed {
+        return;
+    }
+    if let Err(error) = proxy.send_event(UserEvent::Partial {
+        generation,
+        kind,
+        text: text.to_string(),
+    }) {
+        eprintln!("Writely: could not deliver the partial reply: {error}");
+        *failed = true;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_check_thread(
     proxy: &EventLoopProxy<UserEvent>,
@@ -424,7 +466,18 @@ fn spawn_check_thread(
         .spawn(move || {
             // The key lives only in this thread's request; it is never
             // logged or put in an error.
-            let result = providers::suggest(&app_settings, key.as_deref(), &sentence);
+            let partial_proxy = worker_proxy.clone();
+            let mut partial_failed = false;
+            let result =
+                providers::suggest_stream(&app_settings, key.as_deref(), &sentence, &mut |text| {
+                    send_partial(
+                        &partial_proxy,
+                        &mut partial_failed,
+                        my_generation,
+                        PartialKind::Check,
+                        text,
+                    );
+                });
             if let Err(error) = worker_proxy.send_event(UserEvent::Suggestion {
                 generation: my_generation,
                 result,
@@ -446,7 +499,7 @@ fn spawn_check_thread(
 }
 
 /// One rewrite worker (same pattern as the grammar check): calls
-/// `providers::rewrite` off the main thread and sends `UserEvent::Rewrite`.
+/// `providers::rewrite_stream` off the main thread and sends `UserEvent::Rewrite`.
 /// Returns the spawn error for the caller to show; the popup already says
 /// the style's progress text, so the caller replaces it with the failure.
 fn spawn_rewrite_thread(
@@ -463,7 +516,23 @@ fn spawn_rewrite_thread(
         .spawn(move || {
             // The key lives only in this thread's request; it is never
             // logged or put in an error.
-            let result = providers::rewrite(&app_settings, key.as_deref(), &text, style);
+            let partial_proxy = worker_proxy.clone();
+            let mut partial_failed = false;
+            let result = providers::rewrite_stream(
+                &app_settings,
+                key.as_deref(),
+                &text,
+                style,
+                &mut |text| {
+                    send_partial(
+                        &partial_proxy,
+                        &mut partial_failed,
+                        my_generation,
+                        PartialKind::Rewrite(style),
+                        text,
+                    );
+                },
+            );
             if let Err(error) = worker_proxy.send_event(UserEvent::Rewrite {
                 generation: my_generation,
                 style,
@@ -504,7 +573,7 @@ fn start_composing(
 }
 
 /// One compose worker (same pattern as the grammar check): calls
-/// `providers::compose` off the main thread and sends `UserEvent::Composed`.
+/// `providers::compose_stream` off the main thread and sends `UserEvent::Composed`.
 /// Returns the spawn error for the caller to show.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn spawn_compose_thread(
@@ -520,7 +589,18 @@ fn spawn_compose_thread(
         .spawn(move || {
             // The key lives only in this thread's request; it is never
             // logged or put in an error.
-            let result = providers::compose(&app_settings, key.as_deref(), &request);
+            let partial_proxy = worker_proxy.clone();
+            let mut partial_failed = false;
+            let result =
+                providers::compose_stream(&app_settings, key.as_deref(), &request, &mut |text| {
+                    send_partial(
+                        &partial_proxy,
+                        &mut partial_failed,
+                        my_generation,
+                        PartialKind::Compose,
+                        text,
+                    );
+                });
             if let Err(error) = worker_proxy.send_event(UserEvent::Composed {
                 generation: my_generation,
                 result,
@@ -535,7 +615,7 @@ fn spawn_compose_thread(
 }
 
 /// One describe-a-change worker (same pattern as the rewrite): calls
-/// `providers::change` off the main thread and sends `UserEvent::Changed`.
+/// `providers::change_stream` off the main thread and sends `UserEvent::Changed`.
 /// Returns the spawn error for the caller to show.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn spawn_change_thread(
@@ -552,7 +632,23 @@ fn spawn_change_thread(
         .spawn(move || {
             // The key lives only in this thread's request; it is never
             // logged or put in an error.
-            let result = providers::change(&app_settings, key.as_deref(), &source, &request);
+            let partial_proxy = worker_proxy.clone();
+            let mut partial_failed = false;
+            let result = providers::change_stream(
+                &app_settings,
+                key.as_deref(),
+                &source,
+                &request,
+                &mut |text| {
+                    send_partial(
+                        &partial_proxy,
+                        &mut partial_failed,
+                        my_generation,
+                        PartialKind::Change,
+                        text,
+                    );
+                },
+            );
             if let Err(error) = worker_proxy.send_event(UserEvent::Changed {
                 generation: my_generation,
                 result,

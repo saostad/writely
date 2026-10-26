@@ -133,7 +133,6 @@ pub(crate) fn truncate_body(body: &str) -> String {
 /// temperature 0, key header and error parsing; only the text and the system
 /// instruction differ. The key is `None` for providers that need no key;
 /// for Gemini and Together a missing key or model is an error for the popup.
-#[allow(dead_code)] // Used by the popups (local-model round 6+).
 fn dispatch_stream(
     settings: &AppSettings,
     key: Option<&str>,
@@ -153,11 +152,11 @@ fn dispatch_stream(
 
 /// One entry point for every provider: the grammar instruction, temperature 0
 /// and UNCLEAR handling.
+#[allow(dead_code)] // Non-streaming wrapper; the workers call suggest_stream directly.
 pub fn suggest(settings: &AppSettings, key: Option<&str>, text: &str) -> Result<String, String> {
     suggest_stream(settings, key, text, &mut |_| {})
 }
 
-#[allow(dead_code)] // Used by the popups (local-model round 6+).
 pub fn suggest_stream(
     settings: &AppSettings,
     key: Option<&str>,
@@ -169,6 +168,7 @@ pub fn suggest_stream(
 
 /// Same dispatch as [`suggest`], but with the given rewrite style's system
 /// instruction instead of the grammar one.
+#[allow(dead_code)] // Non-streaming wrapper; the workers call rewrite_stream directly.
 pub fn rewrite(
     settings: &AppSettings,
     key: Option<&str>,
@@ -178,7 +178,6 @@ pub fn rewrite(
     rewrite_stream(settings, key, text, style, &mut |_| {})
 }
 
-#[allow(dead_code)] // Used by the popups (local-model round 6+).
 pub fn rewrite_stream(
     settings: &AppSettings,
     key: Option<&str>,
@@ -194,12 +193,12 @@ pub fn rewrite_stream(
 pub const COMPOSE_INSTRUCTION: &str = "You write English text for the user. The user describes what they want to write; write that text, ready to paste. Use correct grammar, spelling and punctuation. Keep it as short as the request allows. Never invent names, dates, numbers or other facts the user didn't give; use a placeholder in square brackets instead, like [name]. Return only the text, with no title, quotes or explanation. If the request is not understandable (random letters or gibberish), reply with exactly UNCLEAR and nothing else.";
 
 /// Writes new text from the user's description of what they want to write.
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[allow(dead_code)] // Non-streaming wrapper; the workers call compose_stream directly.
 pub fn compose(settings: &AppSettings, key: Option<&str>, request: &str) -> Result<String, String> {
     compose_stream(settings, key, request, &mut |_| {})
 }
 
-#[allow(dead_code)] // Used by the popups (local-model round 6+).
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub fn compose_stream(
     settings: &AppSettings,
     key: Option<&str>,
@@ -220,7 +219,7 @@ pub fn change_message(request: &str, text: &str) -> String {
 }
 
 /// Rewrites `text` the way `request` asks.
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[allow(dead_code)] // Non-streaming wrapper; the workers call change_stream directly.
 pub fn change(
     settings: &AppSettings,
     key: Option<&str>,
@@ -230,7 +229,7 @@ pub fn change(
     change_stream(settings, key, text, request, &mut |_| {})
 }
 
-#[allow(dead_code)] // Used by the popups (local-model round 6+).
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub fn change_stream(
     settings: &AppSettings,
     key: Option<&str>,
