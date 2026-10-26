@@ -177,6 +177,7 @@ fn run_stream(
     finish(partial.into_raw(), finish_reason, model)
 }
 
+#[allow(dead_code)] // Non-streaming wrapper; dispatch_stream calls suggest_stream directly.
 pub fn suggest(
     settings: &AppSettings,
     key: Option<&str>,

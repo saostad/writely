@@ -133,24 +133,38 @@ pub(crate) fn truncate_body(body: &str) -> String {
 /// temperature 0, key header and error parsing; only the text and the system
 /// instruction differ. The key is `None` for providers that need no key;
 /// for Gemini and Together a missing key or model is an error for the popup.
-fn dispatch(
+#[allow(dead_code)] // Used by the popups (local-model round 6+).
+fn dispatch_stream(
     settings: &AppSettings,
     key: Option<&str>,
     text: &str,
     instruction: &str,
+    on_partial: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
     match settings.provider {
-        Provider::Gemini => gemini::suggest(settings, key, text, instruction),
-        Provider::Together => together::suggest(settings, key, text, instruction),
-        Provider::Ollama => ollama::suggest(settings, text, instruction),
-        Provider::Local => local::suggest(settings, text, instruction),
+        Provider::Gemini => gemini::suggest_stream(settings, key, text, instruction, on_partial),
+        Provider::Together => {
+            together::suggest_stream(settings, key, text, instruction, on_partial)
+        }
+        Provider::Ollama => ollama::suggest_stream(settings, text, instruction, on_partial),
+        Provider::Local => local::suggest_stream(settings, text, instruction, on_partial),
     }
 }
 
 /// One entry point for every provider: the grammar instruction, temperature 0
 /// and UNCLEAR handling.
 pub fn suggest(settings: &AppSettings, key: Option<&str>, text: &str) -> Result<String, String> {
-    dispatch(settings, key, text, gemini::SYSTEM_INSTRUCTION)
+    suggest_stream(settings, key, text, &mut |_| {})
+}
+
+#[allow(dead_code)] // Used by the popups (local-model round 6+).
+pub fn suggest_stream(
+    settings: &AppSettings,
+    key: Option<&str>,
+    text: &str,
+    on_partial: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    dispatch_stream(settings, key, text, gemini::SYSTEM_INSTRUCTION, on_partial)
 }
 
 /// Same dispatch as [`suggest`], but with the given rewrite style's system
@@ -161,8 +175,19 @@ pub fn rewrite(
     text: &str,
     style: RewriteStyle,
 ) -> Result<String, String> {
+    rewrite_stream(settings, key, text, style, &mut |_| {})
+}
+
+#[allow(dead_code)] // Used by the popups (local-model round 6+).
+pub fn rewrite_stream(
+    settings: &AppSettings,
+    key: Option<&str>,
+    text: &str,
+    style: RewriteStyle,
+    on_partial: &mut dyn FnMut(&str),
+) -> Result<String, String> {
     let instruction = style.instruction();
-    dispatch(settings, key, text, &instruction)
+    dispatch_stream(settings, key, text, &instruction, on_partial)
 }
 
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
@@ -171,7 +196,17 @@ pub const COMPOSE_INSTRUCTION: &str = "You write English text for the user. The 
 /// Writes new text from the user's description of what they want to write.
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub fn compose(settings: &AppSettings, key: Option<&str>, request: &str) -> Result<String, String> {
-    dispatch(settings, key, request, COMPOSE_INSTRUCTION)
+    compose_stream(settings, key, request, &mut |_| {})
+}
+
+#[allow(dead_code)] // Used by the popups (local-model round 6+).
+pub fn compose_stream(
+    settings: &AppSettings,
+    key: Option<&str>,
+    request: &str,
+    on_partial: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    dispatch_stream(settings, key, request, COMPOSE_INSTRUCTION, on_partial)
 }
 
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
@@ -192,11 +227,23 @@ pub fn change(
     text: &str,
     request: &str,
 ) -> Result<String, String> {
-    dispatch(
+    change_stream(settings, key, text, request, &mut |_| {})
+}
+
+#[allow(dead_code)] // Used by the popups (local-model round 6+).
+pub fn change_stream(
+    settings: &AppSettings,
+    key: Option<&str>,
+    text: &str,
+    request: &str,
+    on_partial: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    dispatch_stream(
         settings,
         key,
         &change_message(request, text),
         CHANGE_INSTRUCTION,
+        on_partial,
     )
 }
 
@@ -207,9 +254,11 @@ pub const MAX_REQUEST_CHARS: usize = 1000;
 #[cfg(test)]
 mod tests {
     use super::{
-        change_message, classify_suggestion, clean_reply, strip_think_block, RewriteStyle,
-        SuggestionOutcome, CHANGE_INSTRUCTION, COMPOSE_INSTRUCTION,
+        change, change_message, change_stream, classify_suggestion, clean_reply, compose,
+        compose_stream, rewrite, rewrite_stream, strip_think_block, suggest, suggest_stream,
+        RewriteStyle, SuggestionOutcome, CHANGE_INSTRUCTION, COMPOSE_INSTRUCTION,
     };
+    use crate::config::AppSettings;
 
     #[test]
     fn classify_suggestion_distinguishes_three_outcomes() {
@@ -332,6 +381,45 @@ mod tests {
                 "instruction misses UNCLEAR: {instruction}"
             );
         }
+    }
+
+    #[test]
+    fn stream_twins_share_dispatch_with_non_stream_wrappers() {
+        // Default settings are Gemini with a model set, so a missing key
+        // fails in dispatch before any network use, whatever instruction
+        // each entry point passes. The instructions themselves are shared
+        // by construction: each non-stream wrapper calls its `_stream`
+        // twin, which is the only place the instruction is chosen.
+        let settings = AppSettings::default();
+        let mut partials: Vec<String> = Vec::new();
+        let streamed = [
+            suggest_stream(&settings, None, "She go.", &mut |text: &str| {
+                partials.push(text.to_string())
+            }),
+            rewrite_stream(
+                &settings,
+                None,
+                "She go.",
+                RewriteStyle::Friendly,
+                &mut |_| {},
+            ),
+            compose_stream(&settings, None, "a thank-you note", &mut |_| {}),
+            change_stream(&settings, None, "She go.", "sound confident", &mut |_| {}),
+        ];
+        let plain = [
+            suggest(&settings, None, "She go."),
+            rewrite(&settings, None, "She go.", RewriteStyle::Friendly),
+            compose(&settings, None, "a thank-you note"),
+            change(&settings, None, "She go.", "sound confident"),
+        ];
+        assert_eq!(streamed, plain);
+        for result in &streamed {
+            assert_eq!(
+                result.as_ref().expect_err("missing key should fail"),
+                "Add your Gemini API key first: click the Writely menu-bar icon › Settings…"
+            );
+        }
+        assert!(partials.is_empty(), "{partials:?}");
     }
 
     #[test]

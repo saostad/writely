@@ -202,6 +202,7 @@ pub(crate) fn complete(
     run_stream(&mut reader, max_tokens, on_partial)
 }
 
+#[allow(dead_code)] // Non-streaming wrapper; dispatch_stream calls suggest_stream directly.
 pub fn suggest(settings: &AppSettings, text: &str, instruction: &str) -> Result<String, String> {
     suggest_stream(settings, text, instruction, &mut |_| {})
 }

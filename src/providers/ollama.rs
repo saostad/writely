@@ -144,6 +144,7 @@ fn run_stream(
     finish(partial.into_raw(), finish_reason, model)
 }
 
+#[allow(dead_code)] // Non-streaming wrapper; dispatch_stream calls suggest_stream directly.
 pub fn suggest(settings: &AppSettings, text: &str, instruction: &str) -> Result<String, String> {
     suggest_stream(settings, text, instruction, &mut |_| {})
 }
