@@ -1480,6 +1480,29 @@ fn show_card(window: HWND, caret: &CaretRect, width: i32, height: i32) -> bool {
         y = (caret.y - 4.0) as i32 - height;
     }
     y = y.clamp(work.top, (work.bottom - height).max(work.top));
+    // Streamed partials call this many times a second at the same anchor.
+    // When the card is already visible at exactly this rectangle, skip
+    // SetWindowPos and the full erase/repaint: the changed child text
+    // repaints itself, and re-positioning + erasing would only flicker.
+    // (No call on this path activates: SWP_NOACTIVATE / SW_SHOWNOACTIVATE.)
+    let visible = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|popup| popup.visible)
+            .unwrap_or(false)
+    });
+    let mut current = RECT::default();
+    // SAFETY: window is a live popup window and current is a live RECT.
+    let already_there = visible
+        && unsafe { GetWindowRect(window, &mut current) }.is_ok()
+        && current.left == x
+        && current.top == y
+        && current.right == x + width
+        && current.bottom == y + height;
+    if already_there {
+        return true;
+    }
     // SAFETY: window is a live popup window on this thread.
     if let Err(error) = unsafe {
         SetWindowPos(
