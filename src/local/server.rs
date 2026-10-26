@@ -226,7 +226,7 @@ fn assign_child_to_job(child: &Child) {
 
     let result = job_handle().and_then(|raw| unsafe {
         let job = HANDLE(raw as *mut c_void);
-        let process = HANDLE(child.as_raw_handle() as *mut c_void);
+        let process = HANDLE(child.as_raw_handle());
         AssignProcessToJobObject(job, process)
     });
     if let Err(e) = result {

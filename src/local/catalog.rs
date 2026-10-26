@@ -58,7 +58,10 @@ pub struct RuntimeFile {
 
 pub const RUNTIME_VERSION: &str = "b11900";
 
-#[allow(dead_code)] // Used on macOS (see runtime_file).
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 static RUNTIME_MACOS_ARM64: RuntimeFile = RuntimeFile {
     version: "b11900",
     url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-macos-arm64.tar.gz",
@@ -68,7 +71,10 @@ static RUNTIME_MACOS_ARM64: RuntimeFile = RuntimeFile {
     server_path: "llama-b11900/llama-server",
 };
 
-#[allow(dead_code)] // Used on macOS (see runtime_file).
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 static RUNTIME_MACOS_X64: RuntimeFile = RuntimeFile {
     version: "b11900",
     url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-macos-x64.tar.gz",
@@ -78,7 +84,10 @@ static RUNTIME_MACOS_X64: RuntimeFile = RuntimeFile {
     server_path: "llama-b11900/llama-server",
 };
 
-#[allow(dead_code)] // Used on Windows (see runtime_file).
+#[cfg_attr(
+    not(all(target_os = "windows", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 static RUNTIME_WINDOWS_X64: RuntimeFile = RuntimeFile {
     version: "b11900",
     url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cpu-x64.zip",
@@ -88,6 +97,10 @@ static RUNTIME_WINDOWS_X64: RuntimeFile = RuntimeFile {
     server_path: "llama-server.exe",
 };
 
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 static RUNTIME_LINUX_X64: RuntimeFile = RuntimeFile {
     version: "b11900",
     url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-ubuntu-x64.tar.gz",
