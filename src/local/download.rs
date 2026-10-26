@@ -58,6 +58,9 @@ fn range_plan(part_len: u64, size: u64) -> RangePlan {
     }
 }
 
+const OVERSIZED_ERROR: &str =
+    "The download was larger than expected, so Writely stopped it.";
+
 fn write_error(part: &Path, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::StorageFull {
         "Not enough free disk space to finish the download. Free some space and try again."
@@ -108,6 +111,9 @@ fn copy_verified(
         file.write_all(&buf[..n])
             .map_err(|e| write_error(part, &e))?;
         bytes_so_far += n as u64;
+        if bytes_so_far > total {
+            return Err(OVERSIZED_ERROR.to_string());
+        }
         if bytes_so_far - last_reported >= 1024 * 1024 {
             progress(bytes_so_far, total);
             last_reported = bytes_so_far;
@@ -213,7 +219,17 @@ pub fn download_file(
 
     {
         let mut reader = response.body_mut().as_reader();
-        copy_verified(&mut reader, &part, start_at, size, progress, cancel)?;
+        if let Err(e) = copy_verified(&mut reader, &part, start_at, size, progress, cancel) {
+            if e == OVERSIZED_ERROR {
+                if let Err(delete_err) = std::fs::remove_file(&part) {
+                    eprintln!(
+                        "Writely: could not delete the oversized download ({}): {delete_err}",
+                        part.display()
+                    );
+                }
+            }
+            return Err(e);
+        }
     }
 
     let damaged = || {
@@ -370,6 +386,21 @@ mod tests {
         let len = std::fs::metadata(&part).expect("metadata").len();
         assert!(len >= 1024 * 1024, "part len {len}");
         assert!(len < total, "part len {len} should be partial");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn copy_verified_rejects_oversized() {
+        let dir = temp_dir("oversized");
+        let part = dir.join("f.part");
+        let mut reader = Cursor::new(vec![b'x'; 110]);
+        let cancel = AtomicBool::new(false);
+        let err = copy_verified(&mut reader, &part, 0, 100, &mut |_, _| {}, &cancel)
+            .expect_err("should reject oversized");
+        assert_eq!(
+            err,
+            "The download was larger than expected, so Writely stopped it."
+        );
         cleanup(&dir);
     }
 
