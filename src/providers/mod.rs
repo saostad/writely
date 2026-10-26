@@ -1,6 +1,8 @@
 pub mod gemini;
 pub mod local;
 pub mod ollama;
+#[allow(dead_code)] // Wired into every provider in the next item (local-model round 5).
+pub(crate) mod stream;
 pub mod together;
 
 pub use crate::config::{AppSettings, Provider};
