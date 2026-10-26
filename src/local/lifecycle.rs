@@ -77,7 +77,7 @@ fn start_idle_thread() {
 /// loaded and answered, so it counts as success here.
 fn warm_up(settings: &AppSettings) {
     let result = server::ensure_running(settings).and_then(|_| {
-        match local::complete(settings, "OK", "Reply with OK.", 1) {
+        match local::complete(settings, "OK", "Reply with OK.", 1, &mut |_| {}) {
             Ok(_) => Ok(()),
             Err(e) if e == local::length_cutoff_message(1) => Ok(()),
             Err(e) => Err(e),

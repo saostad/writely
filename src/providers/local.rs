@@ -1,7 +1,9 @@
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 use crate::config::AppSettings;
 use crate::local::{lifecycle, server};
+use crate::providers::stream::{read_events, Partial, StreamDelta, StreamFormat};
 use crate::providers::{clean_reply, truncate_body};
 use crate::settings;
 
@@ -14,7 +16,7 @@ pub fn build_request_body(text: &str, instruction: &str, max_tokens: u32) -> ser
         ],
         "temperature": 0,
         "max_tokens": max_tokens,
-        "stream": false,
+        "stream": true,
         "chat_template_kwargs": { "enable_thinking": false }
     })
 }
@@ -85,6 +87,75 @@ impl Drop for RequestGuard {
     }
 }
 
+fn parse_stream_event(json: &str) -> Result<StreamDelta, String> {
+    if json.trim() == "[DONE]" {
+        return Ok(StreamDelta {
+            done: true,
+            ..StreamDelta::default()
+        });
+    }
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("Could not parse the local model response: {e}"))?;
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|message| message.as_str())
+            .or_else(|| error.as_str())
+            .map(|message| message.to_string())
+            .unwrap_or_else(|| truncate_body(json));
+        return Err(format!("The local model request failed: {message}"));
+    }
+    let first = value
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|list| list.first());
+    let finish_reason = first
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(|reason| reason.as_str())
+        .map(|reason| reason.to_string());
+    let text = first
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|content| content.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(StreamDelta {
+        text,
+        done: finish_reason.is_some(),
+        finish_reason,
+    })
+}
+
+fn finish(raw: String, finish_reason: Option<String>, max_tokens: u32) -> Result<String, String> {
+    if finish_reason.as_deref() == Some("length") {
+        return Err(length_cutoff_message(max_tokens));
+    }
+    match clean_reply(&raw) {
+        Some(reply) => Ok(reply),
+        None => Err("The local model returned no suggestion.".to_string()),
+    }
+}
+
+fn run_stream(
+    reader: &mut dyn BufRead,
+    max_tokens: u32,
+    on_partial: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    let mut partial = Partial::new(&mut *on_partial);
+    let mut finish_reason: Option<String> = None;
+    read_events(reader, StreamFormat::Sse, &mut |event| {
+        let delta = parse_stream_event(event)?;
+        if !delta.text.is_empty() {
+            partial.push(&delta.text);
+        }
+        if delta.finish_reason.is_some() {
+            finish_reason = delta.finish_reason.clone();
+        }
+        Ok(!delta.done)
+    })?;
+    finish(partial.into_raw(), finish_reason, max_tokens)
+}
+
 /// One request to the local helper: starts it if needed, posts the chat
 /// completion, and parses the reply. `suggest` uses the longest-reply
 /// setting; the warm-up in `lifecycle` passes a smaller `max_tokens`.
@@ -93,6 +164,7 @@ pub(crate) fn complete(
     text: &str,
     instruction: &str,
     max_tokens: u32,
+    on_partial: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
     lifecycle::request_started();
     let _guard = RequestGuard;
@@ -119,21 +191,42 @@ pub(crate) fn complete(
         .map_err(|e| format!("Could not reach the local model: {e}"))?;
 
     let status = response.status().as_u16();
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("Could not reach the local model: {e}"))?;
-
-    parse_response(status, &body, max_tokens)
+    if !(200..300).contains(&status) {
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("Could not reach the local model: {e}"))?;
+        return parse_response(status, &body, max_tokens);
+    }
+    let mut reader = BufReader::new(response.body_mut().as_reader());
+    run_stream(&mut reader, max_tokens, on_partial)
 }
 
 pub fn suggest(settings: &AppSettings, text: &str, instruction: &str) -> Result<String, String> {
-    complete(settings, text, instruction, settings.local_max_reply_tokens)
+    suggest_stream(settings, text, instruction, &mut |_| {})
+}
+
+pub fn suggest_stream(
+    settings: &AppSettings,
+    text: &str,
+    instruction: &str,
+    on_partial: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    complete(
+        settings,
+        text,
+        instruction,
+        settings.local_max_reply_tokens,
+        on_partial,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_request_body, length_cutoff_message, parse_response};
+    use super::{
+        build_request_body, length_cutoff_message, parse_response, parse_stream_event, run_stream,
+    };
+    use std::io::{BufReader, Cursor};
 
     #[test]
     fn request_body_shape() {
@@ -145,7 +238,7 @@ mod tests {
         assert_eq!(body["messages"][1]["content"], "She go.");
         assert_eq!(body["temperature"], 0);
         assert_eq!(body["max_tokens"], 1024);
-        assert_eq!(body["stream"], false);
+        assert_eq!(body["stream"], true);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         // No key anywhere in the body.
         assert!(body.get("api_key").is_none());
@@ -197,5 +290,86 @@ mod tests {
             parse_response(200, body, 1024).expect_err("should fail"),
             "The local model returned no suggestion."
         );
+    }
+
+    fn run(bytes: &str, max_tokens: u32) -> (Result<String, String>, Vec<String>) {
+        let mut partials: Vec<String> = Vec::new();
+        let result = {
+            let mut reader = BufReader::with_capacity(2, Cursor::new(bytes.as_bytes().to_vec()));
+            let mut on_partial = |text: &str| partials.push(text.to_string());
+            run_stream(&mut reader, max_tokens, &mut on_partial)
+        };
+        (result, partials)
+    }
+
+    fn event(text: &str, finish: Option<&str>) -> String {
+        let mut choice = serde_json::json!({
+            "delta": { "role": "assistant", "content": text },
+            "finish_reason": null
+        });
+        if let Some(reason) = finish {
+            choice["finish_reason"] = serde_json::Value::String(reason.to_string());
+        }
+        format!("data: {}\n\n", serde_json::json!({ "choices": [choice] }))
+    }
+
+    #[test]
+    fn stream_assembles_text_and_partials_in_order() {
+        let bytes = format!(
+            "{}{}{}data: [DONE]\n\n",
+            event("She ", None),
+            event("goes to ", None),
+            event("school.", Some("stop"))
+        );
+        let (result, partials) = run(&bytes, 1024);
+        assert_eq!(result.expect("should succeed"), "She goes to school.");
+        assert_eq!(partials, ["She", "She goes to", "She goes to school."]);
+    }
+
+    #[test]
+    fn stream_hides_think_block_until_closed() {
+        let bytes = format!(
+            "{}{}",
+            event("<think>fix", None),
+            event(" verb</think>She goes.", Some("stop"))
+        );
+        let (result, partials) = run(&bytes, 1024);
+        assert_eq!(result.expect("should succeed"), "She goes.");
+        assert_eq!(partials, ["She goes."]);
+    }
+
+    #[test]
+    fn stream_unclear_result_shows_no_partial() {
+        let bytes = format!("{}{}", event("UNC", None), event("LEAR", Some("stop")));
+        let (result, partials) = run(&bytes, 1024);
+        assert_eq!(result.expect("should succeed"), "UNCLEAR");
+        assert!(partials.is_empty(), "{partials:?}");
+    }
+
+    #[test]
+    fn stream_empty_error_and_length() {
+        let (result, _) = run(&event("  ", Some("stop")), 1024);
+        assert_eq!(
+            result.expect_err("should fail"),
+            "The local model returned no suggestion."
+        );
+        let (result, _) = run(
+            "data: {\"error\":{\"message\":\"model not loaded\"}}\n\n",
+            1024,
+        );
+        assert_eq!(
+            result.expect_err("should fail"),
+            "The local model request failed: model not loaded"
+        );
+        let (result, _) = run(&event("She goes to sch", Some("length")), 256);
+        assert_eq!(result.expect_err("should fail"), length_cutoff_message(256));
+    }
+
+    #[test]
+    fn stream_event_done_marker() {
+        let delta = parse_stream_event("[DONE]").expect("should parse");
+        assert!(delta.done);
+        assert!(delta.text.is_empty());
+        assert_eq!(delta.finish_reason, None);
     }
 }

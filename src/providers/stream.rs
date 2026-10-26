@@ -8,6 +8,14 @@ pub(crate) enum StreamFormat {
     Ndjson,
 }
 
+/// One provider stream event, decoded by each provider's event parser.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct StreamDelta {
+    pub(crate) text: String,
+    pub(crate) finish_reason: Option<String>,
+    pub(crate) done: bool,
+}
+
 /// Reads a streamed reply event by event. SSE events are the joined `data:`
 /// lines up to a blank line; NDJSON events are single non-blank lines.
 /// `on_event` returns `Ok(false)` to stop reading early.

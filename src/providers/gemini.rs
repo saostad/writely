@@ -1,7 +1,9 @@
+use std::io::{BufRead, BufReader};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::config::{AppSettings, Effort};
+use crate::providers::stream::{read_events, Partial, StreamDelta, StreamFormat};
 use crate::providers::{clean_reply, truncate_body};
 
 pub const SYSTEM_INSTRUCTION: &str = "You fix English grammar, spelling and punctuation. Return only the corrected text, with no quotes or explanation. Keep the meaning, tone and wording otherwise unchanged. If the text is already correct, return it unchanged. Keep line breaks and paragraph breaks as they are. If the text is not understandable English (random letters or gibberish), reply with exactly UNCLEAR and nothing else.";
@@ -100,11 +102,96 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
+fn parse_stream_event(json: &str, model: &str) -> Result<StreamDelta, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("Could not parse Gemini response: {e}"))?;
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|message| message.as_str())
+            .map(|message| message.to_string())
+            .unwrap_or_else(|| truncate_body(json));
+        return Err(format!("Gemini request failed (model {model}): {message}"));
+    }
+    let first = value
+        .get("candidates")
+        .and_then(|candidates| candidates.as_array())
+        .and_then(|list| list.first());
+    let finish_reason = first
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(|reason| reason.as_str())
+        .map(|reason| reason.to_string())
+        .or_else(|| {
+            value
+                .get("promptFeedback")
+                .and_then(|feedback| feedback.get("blockReason"))
+                .and_then(|reason| reason.as_str())
+                .map(|reason| reason.to_string())
+        });
+    let text = first
+        .and_then(|candidate| candidate.get("content"))
+        .and_then(|content| content.get("parts"))
+        .and_then(|parts| parts.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text"))
+                .filter_map(|text| text.as_str())
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    Ok(StreamDelta {
+        text,
+        done: finish_reason.is_some(),
+        finish_reason,
+    })
+}
+
+fn finish(raw: String, finish_reason: Option<String>, model: &str) -> Result<String, String> {
+    match clean_reply(&raw) {
+        Some(reply) => Ok(reply),
+        None => Err(format!(
+            "Gemini returned no suggestion (model {model}, finishReason: {}).",
+            finish_reason.as_deref().unwrap_or("unknown")
+        )),
+    }
+}
+
+fn run_stream(
+    reader: &mut dyn BufRead,
+    model: &str,
+    on_partial: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    let mut partial = Partial::new(&mut *on_partial);
+    let mut finish_reason: Option<String> = None;
+    read_events(reader, StreamFormat::Sse, &mut |event| {
+        let delta = parse_stream_event(event, model)?;
+        if !delta.text.is_empty() {
+            partial.push(&delta.text);
+        }
+        if delta.finish_reason.is_some() {
+            finish_reason = delta.finish_reason.clone();
+        }
+        Ok(!delta.done)
+    })?;
+    finish(partial.into_raw(), finish_reason, model)
+}
+
 pub fn suggest(
     settings: &AppSettings,
     key: Option<&str>,
     sentence: &str,
     instruction: &str,
+) -> Result<String, String> {
+    suggest_stream(settings, key, sentence, instruction, &mut |_| {})
+}
+
+pub fn suggest_stream(
+    settings: &AppSettings,
+    key: Option<&str>,
+    sentence: &str,
+    instruction: &str,
+    on_partial: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
     let model = settings.current_model();
     if model.is_empty() {
@@ -116,8 +203,9 @@ pub fn suggest(
                 .to_string(),
         );
     };
-    let url =
-        format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse"
+    );
 
     let mut response = agent()
         .post(&url)
@@ -126,18 +214,24 @@ pub fn suggest(
         .map_err(|e| format!("Could not reach Gemini: {e}"))?;
 
     let status = response.status().as_u16();
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("Could not reach Gemini: {e}"))?;
-
-    parse_response(status, &body, &model)
+    if !(200..300).contains(&status) {
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("Could not reach Gemini: {e}"))?;
+        return parse_response(status, &body, &model);
+    }
+    let mut reader = BufReader::new(response.body_mut().as_reader());
+    run_stream(&mut reader, &model, on_partial)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_request_body, parse_response, SYSTEM_INSTRUCTION};
+    use super::{
+        build_request_body, parse_response, parse_stream_event, run_stream, SYSTEM_INSTRUCTION,
+    };
     use crate::config::Effort;
+    use std::io::{BufReader, Cursor};
 
     const MODEL: &str = "gemini-3.5-flash-lite";
 
@@ -244,5 +338,82 @@ mod tests {
             parse_response(200, body, MODEL).expect_err("should fail"),
             "Gemini returned no suggestion (model gemini-3.5-flash-lite, finishReason: unknown)."
         );
+    }
+
+    fn run(bytes: &str) -> (Result<String, String>, Vec<String>) {
+        let mut partials: Vec<String> = Vec::new();
+        let result = {
+            let mut reader = BufReader::with_capacity(2, Cursor::new(bytes.as_bytes().to_vec()));
+            let mut on_partial = |text: &str| partials.push(text.to_string());
+            run_stream(&mut reader, MODEL, &mut on_partial)
+        };
+        (result, partials)
+    }
+
+    fn event(text: &str, finish: Option<&str>) -> String {
+        let mut candidate = serde_json::json!({ "content": { "parts": [{ "text": text }] } });
+        if let Some(reason) = finish {
+            candidate["finishReason"] = serde_json::Value::String(reason.to_string());
+        }
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({ "candidates": [candidate] })
+        )
+    }
+
+    #[test]
+    fn stream_assembles_text_and_partials_in_order() {
+        let bytes = format!(
+            "{}{}{}",
+            event("She ", None),
+            event("goes to ", None),
+            event("school.", Some("STOP"))
+        );
+        let (result, partials) = run(&bytes);
+        assert_eq!(result.expect("should succeed"), "She goes to school.");
+        assert_eq!(partials, ["She", "She goes to", "She goes to school."]);
+    }
+
+    #[test]
+    fn stream_hides_think_block_until_closed() {
+        let bytes = format!(
+            "{}{}",
+            event("<think>fix", None),
+            event(" verb</think>She goes.", Some("STOP"))
+        );
+        let (result, partials) = run(&bytes);
+        assert_eq!(result.expect("should succeed"), "She goes.");
+        assert_eq!(partials, ["She goes."]);
+    }
+
+    #[test]
+    fn stream_unclear_result_shows_no_partial() {
+        let bytes = format!("{}{}", event("UNC", None), event("LEAR", Some("STOP")));
+        let (result, partials) = run(&bytes);
+        assert_eq!(result.expect("should succeed"), "UNCLEAR");
+        assert!(partials.is_empty(), "{partials:?}");
+    }
+
+    #[test]
+    fn stream_empty_and_error_event() {
+        let (result, _) = run(&event("", Some("SAFETY")));
+        assert_eq!(
+            result.expect_err("should fail"),
+            "Gemini returned no suggestion (model gemini-3.5-flash-lite, finishReason: SAFETY)."
+        );
+        let (result, _) = run("data: {\"error\":{\"message\":\"quota gone\"}}\n\n");
+        assert_eq!(
+            result.expect_err("should fail"),
+            "Gemini request failed (model gemini-3.5-flash-lite): quota gone"
+        );
+    }
+
+    #[test]
+    fn stream_event_uses_block_reason_as_finish() {
+        let delta = parse_stream_event(r#"{"promptFeedback":{"blockReason":"SAFETY"}}"#, MODEL)
+            .expect("should parse");
+        assert_eq!(delta.finish_reason.as_deref(), Some("SAFETY"));
+        assert!(delta.done);
+        assert!(delta.text.is_empty());
     }
 }
