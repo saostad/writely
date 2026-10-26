@@ -87,6 +87,22 @@ static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static ROUNDED_LOGGED: AtomicBool = AtomicBool::new(false);
 
+// What `WM_PAINT` draws from, that can change without the card moving:
+// the spinner (`loading`) and the error state. `selected` is not read by
+// `WM_PAINT`, so it is not part of this.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PaintState {
+    loading: bool,
+    error: bool,
+}
+
+// The card needs a repaint when it was last painted with different state
+// than it would be painted with now (e.g. loading spinner -> final result
+// at the same rectangle).
+fn needs_repaint(last: PaintState, now: PaintState) -> bool {
+    last != now
+}
+
 struct PopupState {
     window: HWND,
     header: HWND,
@@ -113,6 +129,8 @@ struct PopupState {
     copy_font: HFONT,
     dpi: u32,
     error: bool,
+    // The paint state the window was last painted (or queued to paint) with.
+    painted: PaintState,
     visible: bool,
     // Physical y of the footer separator, or -1 when there is no footer.
     footer_y: i32,
@@ -704,6 +722,16 @@ extern "system" fn popup_proc(
                 }
                 let _ = EndPaint(window, &ps);
             }
+            // Remember what this paint drew with, so `show_card` can tell
+            // whether a same-rectangle update still needs a repaint.
+            STATE.with(|state| {
+                if let Some(popup) = state.borrow_mut().as_mut() {
+                    popup.painted = PaintState {
+                        loading: popup.loading,
+                        error: popup.error,
+                    };
+                }
+            });
             LRESULT(0)
         }
         WM_DRAWITEM => {
@@ -1316,6 +1344,7 @@ fn ensure_window() -> Option<HWND> {
             copy_font: HFONT::default(),
             dpi: 0,
             error: false,
+            painted: PaintState::default(),
             visible: false,
             footer_y: -1,
         });
@@ -1501,6 +1530,31 @@ fn show_card(window: HWND, caret: &CaretRect, width: i32, height: i32) -> bool {
         && current.right == x + width
         && current.bottom == y + height;
     if already_there {
+        // Still skip SetWindowPos/ShowWindow, but if what WM_PAINT draws
+        // changed (e.g. the spinner stopped for the final result), queue a
+        // repaint without erasing, or the last spinner frame stays painted.
+        let repaint = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let Some(popup) = state.as_mut() else {
+                return false;
+            };
+            let now = PaintState {
+                loading: popup.loading,
+                error: popup.error,
+            };
+            if needs_repaint(popup.painted, now) {
+                popup.painted = now;
+                true
+            } else {
+                false
+            }
+        });
+        if repaint {
+            // SAFETY: window is a live popup window on this thread.
+            unsafe {
+                let _ = InvalidateRect(Some(window), None, false);
+            }
+        }
         return true;
     }
     // SAFETY: window is a live popup window on this thread.
@@ -1532,6 +1586,15 @@ fn show_card(window: HWND, caret: &CaretRect, width: i32, height: i32) -> bool {
     unsafe {
         let _ = InvalidateRect(Some(window), None, true);
     }
+    // The queued full repaint will draw with the current state.
+    STATE.with(|state| {
+        if let Some(popup) = state.borrow_mut().as_mut() {
+            popup.painted = PaintState {
+                loading: popup.loading,
+                error: popup.error,
+            };
+        }
+    });
     true
 }
 
@@ -2231,8 +2294,8 @@ pub fn is_visible() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        diff_runs, focus_handoff_is_recent, menu_id_for_tab, note_box_height, tab_for_menu_id,
-        DiffStyle, PopupTab, RewriteStyle,
+        diff_runs, focus_handoff_is_recent, menu_id_for_tab, needs_repaint, note_box_height,
+        tab_for_menu_id, DiffStyle, PaintState, PopupTab, RewriteStyle,
     };
     use std::time::{Duration, Instant};
 
@@ -2294,6 +2357,31 @@ mod tests {
             handoff,
             handoff + Duration::from_secs(2)
         ));
+    }
+
+    #[test]
+    fn needs_repaint_covers_loading_to_final_at_same_rect() {
+        let loading = PaintState {
+            loading: true,
+            error: false,
+        };
+        let final_result = PaintState {
+            loading: false,
+            error: false,
+        };
+        // The final result replacing a streamed partial must repaint, or
+        // the last spinner frame stays on screen.
+        assert!(needs_repaint(loading, final_result));
+        assert!(needs_repaint(final_result, loading));
+        assert!(!needs_repaint(loading, loading));
+        assert!(!needs_repaint(final_result, final_result));
+        let failed = PaintState {
+            loading: false,
+            error: true,
+        };
+        assert!(needs_repaint(loading, failed));
+        assert!(needs_repaint(final_result, failed));
+        assert!(!needs_repaint(failed, failed));
     }
 
     #[test]
