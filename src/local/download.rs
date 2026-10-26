@@ -58,8 +58,7 @@ fn range_plan(part_len: u64, size: u64) -> RangePlan {
     }
 }
 
-const OVERSIZED_ERROR: &str =
-    "The download was larger than expected, so Writely stopped it.";
+const OVERSIZED_ERROR: &str = "The download was larger than expected, so Writely stopped it.";
 
 fn write_error(part: &Path, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::StorageFull {

@@ -3394,6 +3394,7 @@ dependencies = [
  "flate2",
  "fs4",
  "futures-lite",
+ "getrandom 0.4.3",
  "global-hotkey",
  "gtk",
  "keyring",
