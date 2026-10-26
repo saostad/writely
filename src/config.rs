@@ -132,6 +132,43 @@ fn default_clipboard_fallback() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LocalModelId {
+    #[default]
+    #[serde(rename = "qwen3.5-0.8b")]
+    Qwen35_0_8B,
+    #[serde(rename = "qwen3.5-2b")]
+    Qwen35_2B,
+}
+
+fn default_local_model() -> LocalModelId {
+    LocalModelId::Qwen35_0_8B
+}
+
+fn default_local_warm_up() -> bool {
+    true
+}
+
+fn default_local_idle_minutes() -> u32 {
+    10
+}
+
+fn default_local_threads() -> u32 {
+    4
+}
+
+fn default_local_max_reply_tokens() -> u32 {
+    1024
+}
+
+fn default_local_context_tokens() -> u32 {
+    4096
+}
+
+fn default_local_startup_timeout_secs() -> u32 {
+    60
+}
+
 fn default_models() -> HashMap<String, String> {
     let mut models = HashMap::new();
     models.insert("gemini".to_string(), DEFAULT_GEMINI_MODEL.to_string());
@@ -162,6 +199,20 @@ pub struct AppSettings {
     /// never touches the clipboard to read or replace text.
     #[serde(default = "default_clipboard_fallback")]
     pub clipboard_fallback: bool,
+    #[serde(default = "default_local_model")]
+    pub local_model: LocalModelId,
+    #[serde(default = "default_local_warm_up")]
+    pub local_warm_up: bool,
+    #[serde(default = "default_local_idle_minutes")]
+    pub local_idle_minutes: u32,
+    #[serde(default = "default_local_threads")]
+    pub local_threads: u32,
+    #[serde(default = "default_local_max_reply_tokens")]
+    pub local_max_reply_tokens: u32,
+    #[serde(default = "default_local_context_tokens")]
+    pub local_context_tokens: u32,
+    #[serde(default = "default_local_startup_timeout_secs")]
+    pub local_startup_timeout_secs: u32,
 }
 
 impl Default for AppSettings {
@@ -173,8 +224,40 @@ impl Default for AppSettings {
             ollama_url: DEFAULT_OLLAMA_URL.to_string(),
             launch_at_login: true,
             clipboard_fallback: true,
+            local_model: LocalModelId::Qwen35_0_8B,
+            local_warm_up: true,
+            local_idle_minutes: 10,
+            local_threads: 4,
+            local_max_reply_tokens: 1024,
+            local_context_tokens: 4096,
+            local_startup_timeout_secs: 60,
         }
     }
+}
+
+#[allow(dead_code)] // Wired up in a later round (local-model task).
+pub fn validate_local_settings(s: &AppSettings) -> Result<(), String> {
+    if s.local_idle_minutes > 1440 {
+        return Err(
+            "Free memory after must be between 0 and 1440 minutes (0 means never).".to_string(),
+        );
+    }
+    if s.local_threads == 0 || s.local_threads > 64 {
+        return Err("Processor threads must be between 1 and 64.".to_string());
+    }
+    if s.local_max_reply_tokens < 64 || s.local_max_reply_tokens > 8192 {
+        return Err("Longest reply must be between 64 and 8192 tokens.".to_string());
+    }
+    if s.local_context_tokens < 1024 || s.local_context_tokens > 32768 {
+        return Err("Context size must be between 1024 and 32768 tokens.".to_string());
+    }
+    if s.local_startup_timeout_secs < 5 || s.local_startup_timeout_secs > 600 {
+        return Err("Startup time limit must be between 5 and 600 seconds.".to_string());
+    }
+    if s.local_max_reply_tokens >= s.local_context_tokens {
+        return Err("Longest reply must be smaller than the context size.".to_string());
+    }
+    Ok(())
 }
 
 impl AppSettings {
@@ -406,6 +489,179 @@ mod tests {
         assert_eq!(switched.ollama_url, settings.ollama_url);
         assert_eq!(switched.launch_at_login, settings.launch_at_login);
         assert_eq!(switched.clipboard_fallback, settings.clipboard_fallback);
+    }
+
+    #[test]
+    fn local_defaults_have_expected_values() {
+        let s = AppSettings::default();
+        assert_eq!(s.local_model, LocalModelId::Qwen35_0_8B);
+        assert!(s.local_warm_up);
+        assert_eq!(s.local_idle_minutes, 10);
+        assert_eq!(s.local_threads, 4);
+        assert_eq!(s.local_max_reply_tokens, 1024);
+        assert_eq!(s.local_context_tokens, 4096);
+        assert_eq!(s.local_startup_timeout_secs, 60);
+        assert!(validate_local_settings(&s).is_ok());
+    }
+
+    #[test]
+    fn local_settings_default_for_old_files() {
+        let old =
+            r#"{"provider":"gemini","effort":"default","ollama_url":"http://localhost:11434"}"#;
+        let s: AppSettings = serde_json::from_str(old).expect("old file should parse");
+        assert_eq!(s, AppSettings::default());
+    }
+
+    #[test]
+    fn local_model_round_trip_qwen35_2b() {
+        let s = AppSettings {
+            local_model: LocalModelId::Qwen35_2B,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(json.contains(r#""local_model":"qwen3.5-2b""#));
+        let back: AppSettings = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.local_model, LocalModelId::Qwen35_2B);
+        let parsed: AppSettings =
+            serde_json::from_str(r#"{"local_model":"qwen3.5-2b"}"#).expect("parse");
+        assert_eq!(parsed.local_model, LocalModelId::Qwen35_2B);
+        let parsed: AppSettings =
+            serde_json::from_str(r#"{"local_model":"qwen3.5-0.8b"}"#).expect("parse");
+        assert_eq!(parsed.local_model, LocalModelId::Qwen35_0_8B);
+    }
+
+    #[test]
+    fn validate_local_settings_edges() {
+        let base = AppSettings::default();
+        // idle 0-1440
+        assert!(validate_local_settings(&AppSettings {
+            local_idle_minutes: 0,
+            ..base.clone()
+        })
+        .is_ok());
+        assert!(validate_local_settings(&AppSettings {
+            local_idle_minutes: 1440,
+            ..base.clone()
+        })
+        .is_ok());
+        assert_eq!(
+            validate_local_settings(&AppSettings {
+                local_idle_minutes: 1441,
+                ..base.clone()
+            })
+            .expect_err("fail"),
+            "Free memory after must be between 0 and 1440 minutes (0 means never)."
+        );
+        // threads 1-64
+        assert!(validate_local_settings(&AppSettings {
+            local_threads: 1,
+            ..base.clone()
+        })
+        .is_ok());
+        assert!(validate_local_settings(&AppSettings {
+            local_threads: 64,
+            ..base.clone()
+        })
+        .is_ok());
+        for v in [0, 65] {
+            assert_eq!(
+                validate_local_settings(&AppSettings {
+                    local_threads: v,
+                    ..base.clone()
+                })
+                .expect_err("fail"),
+                "Processor threads must be between 1 and 64."
+            );
+        }
+        // max reply 64-8192 (context raised so reply<context at high edge)
+        assert!(validate_local_settings(&AppSettings {
+            local_max_reply_tokens: 64,
+            ..base.clone()
+        })
+        .is_ok());
+        assert!(validate_local_settings(&AppSettings {
+            local_max_reply_tokens: 8192,
+            local_context_tokens: 32768,
+            ..base.clone()
+        })
+        .is_ok());
+        for v in [63, 8193] {
+            assert_eq!(
+                validate_local_settings(&AppSettings {
+                    local_max_reply_tokens: v,
+                    local_context_tokens: 32768,
+                    ..base.clone()
+                })
+                .expect_err("fail"),
+                "Longest reply must be between 64 and 8192 tokens."
+            );
+        }
+        // context 1024-32768 (reply lowered so reply<context at low edge)
+        assert!(validate_local_settings(&AppSettings {
+            local_context_tokens: 1024,
+            local_max_reply_tokens: 64,
+            ..base.clone()
+        })
+        .is_ok());
+        assert!(validate_local_settings(&AppSettings {
+            local_context_tokens: 32768,
+            ..base.clone()
+        })
+        .is_ok());
+        for v in [1023, 32769] {
+            assert_eq!(
+                validate_local_settings(&AppSettings {
+                    local_context_tokens: v,
+                    local_max_reply_tokens: 64,
+                    ..base.clone()
+                })
+                .expect_err("fail"),
+                "Context size must be between 1024 and 32768 tokens."
+            );
+        }
+        // startup 5-600
+        assert!(validate_local_settings(&AppSettings {
+            local_startup_timeout_secs: 5,
+            ..base.clone()
+        })
+        .is_ok());
+        assert!(validate_local_settings(&AppSettings {
+            local_startup_timeout_secs: 600,
+            ..base.clone()
+        })
+        .is_ok());
+        for v in [4, 601] {
+            assert_eq!(
+                validate_local_settings(&AppSettings {
+                    local_startup_timeout_secs: v,
+                    ..base.clone()
+                })
+                .expect_err("fail"),
+                "Startup time limit must be between 5 and 600 seconds."
+            );
+        }
+    }
+
+    #[test]
+    fn validate_local_settings_reply_must_be_smaller_than_context() {
+        let base = AppSettings::default();
+        for (reply, ctx) in [(4096, 4096), (8192, 4096)] {
+            assert_eq!(
+                validate_local_settings(&AppSettings {
+                    local_max_reply_tokens: reply,
+                    local_context_tokens: ctx,
+                    ..base.clone()
+                })
+                .expect_err("fail"),
+                "Longest reply must be smaller than the context size."
+            );
+        }
+        assert!(validate_local_settings(&AppSettings {
+            local_max_reply_tokens: 4095,
+            local_context_tokens: 4096,
+            ..base
+        })
+        .is_ok());
     }
 
     #[test]
