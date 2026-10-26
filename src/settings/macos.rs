@@ -1,18 +1,22 @@
 use std::cell::{OnceCell, RefCell};
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSColor, NSMenu, NSMenuItem, NSPopUpButton,
-    NSSecureTextField, NSTextField, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSBackingStoreType, NSButton, NSColor,
+    NSMenu, NSMenuItem, NSPopUpButton, NSSecureTextField, NSTextField, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSRunLoop, NSSize, NSString, NSURL,
+    NSRunLoop, NSSize, NSString, NSTimer, NSURL,
 };
 
-use crate::config::{AppSettings, Effort, Provider};
+use crate::config::{AppSettings, Effort, LocalModelId, Provider};
+use crate::local::{catalog, download, install, server};
 
 const PROVIDER_TITLES: [&str; 4] = [
     "Google Gemini",
@@ -50,6 +54,38 @@ fn effort_at(index: isize) -> Effort {
         _ => Effort::Default,
     }
 }
+
+fn local_model_at(index: isize) -> LocalModelId {
+    match index {
+        1 => LocalModelId::Qwen35_2B,
+        _ => LocalModelId::Qwen35_0_8B,
+    }
+}
+
+fn local_model_index(model: LocalModelId) -> isize {
+    match model {
+        LocalModelId::Qwen35_0_8B => 0,
+        LocalModelId::Qwen35_2B => 1,
+    }
+}
+
+// The five Advanced rows, in LocalFields order (threads, longest reply,
+// context, startup limit, reply limit). Same strings as Linux/Windows.
+const ADVANCED_LABELS: [&str; 5] = [
+    "Processor threads",
+    "Longest reply (tokens)",
+    "Context size (tokens)",
+    "Startup time limit (seconds)",
+    "Reply time limit (seconds)",
+];
+
+const ADVANCED_HELPS: [&str; 5] = [
+    "How many processor cores the model uses. 4 suits most computers.",
+    "Stops a reply that runs too long. A token is about 4 characters.",
+    "How much text the model reads at once. Larger uses more memory.",
+    "How long to wait for the model to load.",
+    "How long to wait for a reply.",
+];
 
 fn effort_index(effort: Effort) -> isize {
     match effort {
@@ -103,6 +139,582 @@ fn set_status(status: &NSTextField, text: &str, is_error: bool) {
     }
 }
 
+// One control's rectangle in top-down coordinates (`top` measured from the
+// top of the content view), converted to AppKit's bottom-up frames when
+// applied. Hidden rows keep a placeholder rectangle but take no space.
+#[derive(Clone, Copy)]
+struct RowRect {
+    x: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
+struct Layout {
+    provider_label: RowRect,
+    provider_popup: RowRect,
+    provider_help: RowRect,
+    model_label: RowRect,
+    model_field: RowRect,
+    model_help: RowRect,
+    effort_label: RowRect,
+    effort_popup: RowRect,
+    effort_help: RowRect,
+    key_label: RowRect,
+    field: RowRect,
+    key_help: RowRect,
+    link_button: RowRect,
+    local_model_label: RowRect,
+    local_model_popup: RowRect,
+    local_model_help: RowRect,
+    local_status: RowRect,
+    local_download_button: RowRect,
+    local_cancel_button: RowRect,
+    local_delete_button: RowRect,
+    local_runtime_help: RowRect,
+    local_warm_checkbox: RowRect,
+    local_warm_help: RowRect,
+    local_idle_label: RowRect,
+    local_idle_field: RowRect,
+    local_idle_help: RowRect,
+    local_advanced_checkbox: RowRect,
+    adv_labels: [RowRect; 5],
+    adv_fields: [RowRect; 5],
+    adv_helps: [RowRect; 5],
+    autostart_checkbox: RowRect,
+    autostart_help: RowRect,
+    clipboard_checkbox: RowRect,
+    clipboard_help: RowRect,
+    save_button: RowRect,
+    remove_button: RowRect,
+    hotkey_hint: RowRect,
+    accessibility_button: RowRect,
+    status: RowRect,
+    height: f64,
+}
+
+fn compute_layout(
+    is_local: bool,
+    show_advanced: bool,
+    has_accessibility: bool,
+    status_height: f64,
+) -> Layout {
+    let mut cursor = 16.0;
+    let mut row = |height: f64, gap: f64| -> RowRect {
+        let rect = RowRect {
+            x: 20.0,
+            top: cursor,
+            width: 380.0,
+            height,
+        };
+        cursor += height + gap;
+        rect
+    };
+    let provider_label = row(18.0, 4.0);
+    let provider_popup = row(26.0, 2.0);
+    let provider_help = row(16.0, 10.0);
+    // The shared model rows are hidden for Local; they take no space then.
+    let (model_label, model_field, model_help) = if is_local {
+        (provider_help, provider_help, provider_help)
+    } else {
+        (row(18.0, 4.0), row(24.0, 2.0), row(44.0, 10.0))
+    };
+    let effort_label = row(18.0, 4.0);
+    let effort_popup = row(26.0, 2.0);
+    let effort_help = row(34.0, 10.0);
+    let placeholder = effort_help;
+    let (
+        key_label,
+        field,
+        key_help,
+        link_button,
+        local_model_label,
+        local_model_popup,
+        local_model_help,
+        local_status,
+        local_download_button,
+        local_cancel_button,
+        local_delete_button,
+        local_runtime_help,
+        local_warm_checkbox,
+        local_warm_help,
+        local_idle_label,
+        local_idle_field,
+        local_idle_help,
+        local_advanced_checkbox,
+        adv_labels,
+        adv_fields,
+        adv_helps,
+    ) = if is_local {
+        let local_model_label = row(18.0, 4.0);
+        let local_model_popup = row(26.0, 2.0);
+        let local_model_help = row(30.0, 8.0);
+        let local_status = row(36.0, 4.0);
+        let buttons = row(26.0, 6.0);
+        let local_download_button = RowRect {
+            x: 20.0,
+            width: 90.0,
+            ..buttons
+        };
+        let local_cancel_button = RowRect {
+            x: 120.0,
+            width: 80.0,
+            ..buttons
+        };
+        let local_delete_button = RowRect {
+            x: 210.0,
+            width: 110.0,
+            ..buttons
+        };
+        let local_runtime_help = row(40.0, 8.0);
+        let local_warm_checkbox = row(22.0, 2.0);
+        let local_warm_help = row(30.0, 8.0);
+        let local_idle_label = row(18.0, 4.0);
+        let local_idle_field = row(24.0, 2.0);
+        let local_idle_help = row(30.0, 8.0);
+        let local_advanced_checkbox = row(22.0, 8.0);
+        let (adv_labels, adv_fields, adv_helps) = if show_advanced {
+            let help_heights = [30.0, 30.0, 30.0, 16.0, 16.0];
+            let mut labels = [placeholder; 5];
+            let mut fields = [placeholder; 5];
+            let mut helps = [placeholder; 5];
+            for (i, help_height) in help_heights.into_iter().enumerate() {
+                // Label and field share a row to keep the window short.
+                let adv_row = row(24.0, 2.0);
+                labels[i] = RowRect {
+                    x: 20.0,
+                    top: adv_row.top + 3.0,
+                    width: 200.0,
+                    height: 18.0,
+                };
+                fields[i] = RowRect {
+                    x: 230.0,
+                    width: 170.0,
+                    ..adv_row
+                };
+                helps[i] = row(help_height, 8.0);
+            }
+            (labels, fields, helps)
+        } else {
+            ([placeholder; 5], [placeholder; 5], [placeholder; 5])
+        };
+        (
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            local_model_label,
+            local_model_popup,
+            local_model_help,
+            local_status,
+            local_download_button,
+            local_cancel_button,
+            local_delete_button,
+            local_runtime_help,
+            local_warm_checkbox,
+            local_warm_help,
+            local_idle_label,
+            local_idle_field,
+            local_idle_help,
+            local_advanced_checkbox,
+            adv_labels,
+            adv_fields,
+            adv_helps,
+        )
+    } else {
+        // The key rows and the Ollama-address rows share the same rects.
+        let key_label = row(18.0, 4.0);
+        let field = row(24.0, 2.0);
+        let key_help = row(34.0, 2.0);
+        let link_button = row(18.0, 10.0);
+        (
+            key_label,
+            field,
+            key_help,
+            link_button,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+            [placeholder; 5],
+            [placeholder; 5],
+            [placeholder; 5],
+        )
+    };
+    let autostart_checkbox = row(22.0, 2.0);
+    let autostart_help = row(16.0, 10.0);
+    let clipboard_checkbox = row(22.0, 2.0);
+    let clipboard_help = row(34.0, 10.0);
+    let buttons = row(26.0, 12.0);
+    let save_button = RowRect {
+        x: 20.0,
+        width: 80.0,
+        ..buttons
+    };
+    let remove_button = RowRect {
+        x: 110.0,
+        width: 110.0,
+        ..buttons
+    };
+    let hotkey_hint = row(18.0, 10.0);
+    let accessibility_button = if has_accessibility {
+        row(24.0, 8.0)
+    } else {
+        placeholder
+    };
+    let status = row(status_height, 14.0);
+    Layout {
+        provider_label,
+        provider_popup,
+        provider_help,
+        model_label,
+        model_field,
+        model_help,
+        effort_label,
+        effort_popup,
+        effort_help,
+        key_label,
+        field,
+        key_help,
+        link_button,
+        local_model_label,
+        local_model_popup,
+        local_model_help,
+        local_status,
+        local_download_button,
+        local_cancel_button,
+        local_delete_button,
+        local_runtime_help,
+        local_warm_checkbox,
+        local_warm_help,
+        local_idle_label,
+        local_idle_field,
+        local_idle_help,
+        local_advanced_checkbox,
+        adv_labels,
+        adv_fields,
+        adv_helps,
+        autostart_checkbox,
+        autostart_help,
+        clipboard_checkbox,
+        clipboard_help,
+        save_button,
+        remove_button,
+        hotkey_hint,
+        accessibility_button,
+        status,
+        height: cursor,
+    }
+}
+
+fn frame_for(rect: RowRect, content_height: f64) -> NSRect {
+    NSRect::new(
+        NSPoint::new(rect.x, content_height - rect.top - rect.height),
+        NSSize::new(rect.width, rect.height),
+    )
+}
+
+/// Re-renders the local-model status, buttons and model-popup sensitivity
+/// from the current install phase for the selected model. Runs on the main
+/// thread only (button actions and the repeating timer).
+fn render_local() {
+    struct Rows {
+        selected: LocalModelId,
+        runtime_error: bool,
+        local_status: Retained<NSTextField>,
+        download_button: Retained<NSButton>,
+        cancel_button: Retained<NSButton>,
+        delete_button: Retained<NSButton>,
+        model_popup: Retained<NSPopUpButton>,
+    }
+    let rows = STATE.with(|state| {
+        state.borrow().as_ref().map(|window_state| Rows {
+            selected: local_model_at(window_state.local_model_popup.indexOfSelectedItem()),
+            runtime_error: window_state.local_runtime_error,
+            local_status: window_state.local_status.clone(),
+            download_button: window_state.local_download_button.clone(),
+            cancel_button: window_state.local_cancel_button.clone(),
+            delete_button: window_state.local_delete_button.clone(),
+            model_popup: window_state.local_model_popup.clone(),
+        })
+    });
+    let Some(rows) = rows else { return };
+    let phase = install::install_phase();
+    let ready = install::model_ready(rows.selected);
+    let view = super::local_view(&phase, ready, catalog::model_file(rows.selected).label);
+    let busy = matches!(
+        phase,
+        install::InstallPhase::Downloading { .. }
+            | install::InstallPhase::Verifying { .. }
+            | install::InstallPhase::Unpacking
+    );
+    set_status(&rows.local_status, &view.status, view.is_error);
+    rows.download_button
+        .setHidden(!(view.show_download && !rows.runtime_error));
+    rows.cancel_button
+        .setHidden(!(view.show_cancel && !rows.runtime_error));
+    rows.delete_button
+        .setHidden(!(view.show_delete && !rows.runtime_error));
+    rows.model_popup.setEnabled(view.fields_enabled);
+    let finished = STATE.with(|state| {
+        state
+            .borrow_mut()
+            .as_mut()
+            .map(|window_state| {
+                let finished = window_state.local_was_busy
+                    && matches!(phase, install::InstallPhase::Idle)
+                    && ready;
+                window_state.local_was_busy = busy;
+                finished
+            })
+            .unwrap_or(false)
+    });
+    if finished {
+        super::notify_changed();
+    }
+}
+
+/// Shows or hides the five Advanced rows from the checkbox and provider.
+fn refresh_advanced_visibility() {
+    let rows = STATE.with(|state| {
+        state.borrow().as_ref().map(|window_state| {
+            (
+                provider_at(window_state.provider_popup.indexOfSelectedItem()) == Provider::Local
+                    && window_state.local_advanced_checkbox.state() == 1,
+                window_state.adv_labels.clone(),
+                window_state.adv_fields.clone(),
+                window_state.adv_helps.clone(),
+            )
+        })
+    });
+    let Some((show, labels, fields, helps)) = rows else {
+        return;
+    };
+    for i in 0..5 {
+        labels[i].setHidden(!show);
+        fields[i].setHidden(!show);
+        helps[i].setHidden(!show);
+    }
+}
+
+/// Positions every control for what is visible now, resizes the window to
+/// fit, and keeps the whole window on screen.
+fn layout_window() {
+    struct Rows {
+        window: Retained<NSWindow>,
+        provider_label: Retained<NSTextField>,
+        provider_popup: Retained<NSPopUpButton>,
+        provider_help: Retained<NSTextField>,
+        model_label: Retained<NSTextField>,
+        model_field: Retained<NSTextField>,
+        model_help: Retained<NSTextField>,
+        effort_label: Retained<NSTextField>,
+        effort_popup: Retained<NSPopUpButton>,
+        effort_help: Retained<NSTextField>,
+        key_label: Retained<NSTextField>,
+        field: Retained<NSSecureTextField>,
+        key_help: Retained<NSTextField>,
+        link_button: Retained<NSButton>,
+        url_label: Retained<NSTextField>,
+        url_field: Retained<NSTextField>,
+        url_help: Retained<NSTextField>,
+        local_model_label: Retained<NSTextField>,
+        local_model_popup: Retained<NSPopUpButton>,
+        local_model_help: Retained<NSTextField>,
+        local_status: Retained<NSTextField>,
+        local_download_button: Retained<NSButton>,
+        local_cancel_button: Retained<NSButton>,
+        local_delete_button: Retained<NSButton>,
+        local_runtime_help: Retained<NSTextField>,
+        local_warm_checkbox: Retained<NSButton>,
+        local_warm_help: Retained<NSTextField>,
+        local_idle_label: Retained<NSTextField>,
+        local_idle_field: Retained<NSTextField>,
+        local_idle_help: Retained<NSTextField>,
+        local_advanced_checkbox: Retained<NSButton>,
+        adv_labels: [Retained<NSTextField>; 5],
+        adv_fields: [Retained<NSTextField>; 5],
+        adv_helps: [Retained<NSTextField>; 5],
+        autostart_checkbox: Retained<NSButton>,
+        autostart_help: Retained<NSTextField>,
+        clipboard_checkbox: Retained<NSButton>,
+        clipboard_help: Retained<NSTextField>,
+        save_button: Retained<NSButton>,
+        remove_button: Retained<NSButton>,
+        hotkey_hint: Retained<NSTextField>,
+        accessibility_button: Option<Retained<NSButton>>,
+        status: Retained<NSTextField>,
+        is_local: bool,
+        show_advanced: bool,
+        status_height: f64,
+    }
+    let rows = STATE.with(|state| {
+        state.borrow().as_ref().map(|ws| Rows {
+            window: ws.window.clone(),
+            provider_label: ws.provider_label.clone(),
+            provider_popup: ws.provider_popup.clone(),
+            provider_help: ws.provider_help.clone(),
+            model_label: ws.model_label.clone(),
+            model_field: ws.model_field.clone(),
+            model_help: ws.model_help.clone(),
+            effort_label: ws.effort_label.clone(),
+            effort_popup: ws.effort_popup.clone(),
+            effort_help: ws.effort_help.clone(),
+            key_label: ws.key_label.clone(),
+            field: ws.field.clone(),
+            key_help: ws.key_help.clone(),
+            link_button: ws.link_button.clone(),
+            url_label: ws.url_label.clone(),
+            url_field: ws.url_field.clone(),
+            url_help: ws.url_help.clone(),
+            local_model_label: ws.local_model_label.clone(),
+            local_model_popup: ws.local_model_popup.clone(),
+            local_model_help: ws.local_model_help.clone(),
+            local_status: ws.local_status.clone(),
+            local_download_button: ws.local_download_button.clone(),
+            local_cancel_button: ws.local_cancel_button.clone(),
+            local_delete_button: ws.local_delete_button.clone(),
+            local_runtime_help: ws.local_runtime_help.clone(),
+            local_warm_checkbox: ws.local_warm_checkbox.clone(),
+            local_warm_help: ws.local_warm_help.clone(),
+            local_idle_label: ws.local_idle_label.clone(),
+            local_idle_field: ws.local_idle_field.clone(),
+            local_idle_help: ws.local_idle_help.clone(),
+            local_advanced_checkbox: ws.local_advanced_checkbox.clone(),
+            adv_labels: ws.adv_labels.clone(),
+            adv_fields: ws.adv_fields.clone(),
+            adv_helps: ws.adv_helps.clone(),
+            autostart_checkbox: ws.autostart_checkbox.clone(),
+            autostart_help: ws.autostart_help.clone(),
+            clipboard_checkbox: ws.clipboard_checkbox.clone(),
+            clipboard_help: ws.clipboard_help.clone(),
+            save_button: ws.save_button.clone(),
+            remove_button: ws.remove_button.clone(),
+            hotkey_hint: ws.hotkey_hint.clone(),
+            accessibility_button: ws.accessibility_button.clone(),
+            status: ws.status.clone(),
+            is_local: provider_at(ws.provider_popup.indexOfSelectedItem()) == Provider::Local,
+            show_advanced: ws.local_advanced_checkbox.state() == 1,
+            status_height: ws.status_height,
+        })
+    });
+    let Some(rows) = rows else { return };
+    let lay = compute_layout(
+        rows.is_local,
+        rows.show_advanced,
+        rows.accessibility_button.is_some(),
+        rows.status_height,
+    );
+    // Clamp the content height to the screen's visible area (less the
+    // title bar), then keep the resized window inside that area.
+    let visible = rows.window.screen().map(|screen| screen.visibleFrame());
+    let mut content_height = lay.height;
+    if let Some(visible) = visible {
+        let title_bar = rows.window.frame().size.height
+            - rows
+                .window
+                .contentView()
+                .map(|view| view.frame().size.height)
+                .unwrap_or(0.0);
+        content_height = content_height.min((visible.size.height - title_bar).max(200.0));
+    }
+    rows.window
+        .setContentSize(NSSize::new(420.0, content_height));
+    if let Some(visible) = visible {
+        let mut frame = rows.window.frame();
+        if frame.origin.y + frame.size.height > visible.origin.y + visible.size.height {
+            frame.origin.y = visible.origin.y + visible.size.height - frame.size.height;
+        }
+        if frame.origin.y < visible.origin.y {
+            frame.origin.y = visible.origin.y;
+        }
+        if frame.origin.x + frame.size.width > visible.origin.x + visible.size.width {
+            frame.origin.x = visible.origin.x + visible.size.width - frame.size.width;
+        }
+        if frame.origin.x < visible.origin.x {
+            frame.origin.x = visible.origin.x;
+        }
+        rows.window.setFrame_display(frame, true);
+    }
+    let h = content_height;
+    rows.provider_label
+        .setFrame(frame_for(lay.provider_label, h));
+    rows.provider_popup
+        .setFrame(frame_for(lay.provider_popup, h));
+    rows.provider_help.setFrame(frame_for(lay.provider_help, h));
+    rows.model_label.setFrame(frame_for(lay.model_label, h));
+    rows.model_field.setFrame(frame_for(lay.model_field, h));
+    rows.model_help.setFrame(frame_for(lay.model_help, h));
+    rows.effort_label.setFrame(frame_for(lay.effort_label, h));
+    rows.effort_popup.setFrame(frame_for(lay.effort_popup, h));
+    rows.effort_help.setFrame(frame_for(lay.effort_help, h));
+    rows.key_label.setFrame(frame_for(lay.key_label, h));
+    rows.field.setFrame(frame_for(lay.field, h));
+    rows.key_help.setFrame(frame_for(lay.key_help, h));
+    rows.link_button.setFrame(frame_for(lay.link_button, h));
+    // The Ollama-address rows share the key rows' rectangles.
+    rows.url_label.setFrame(frame_for(lay.key_label, h));
+    rows.url_field.setFrame(frame_for(lay.field, h));
+    rows.url_help.setFrame(frame_for(lay.key_help, h));
+    rows.local_model_label
+        .setFrame(frame_for(lay.local_model_label, h));
+    rows.local_model_popup
+        .setFrame(frame_for(lay.local_model_popup, h));
+    rows.local_model_help
+        .setFrame(frame_for(lay.local_model_help, h));
+    rows.local_status.setFrame(frame_for(lay.local_status, h));
+    rows.local_download_button
+        .setFrame(frame_for(lay.local_download_button, h));
+    rows.local_cancel_button
+        .setFrame(frame_for(lay.local_cancel_button, h));
+    rows.local_delete_button
+        .setFrame(frame_for(lay.local_delete_button, h));
+    rows.local_runtime_help
+        .setFrame(frame_for(lay.local_runtime_help, h));
+    rows.local_warm_checkbox
+        .setFrame(frame_for(lay.local_warm_checkbox, h));
+    rows.local_warm_help
+        .setFrame(frame_for(lay.local_warm_help, h));
+    rows.local_idle_label
+        .setFrame(frame_for(lay.local_idle_label, h));
+    rows.local_idle_field
+        .setFrame(frame_for(lay.local_idle_field, h));
+    rows.local_idle_help
+        .setFrame(frame_for(lay.local_idle_help, h));
+    rows.local_advanced_checkbox
+        .setFrame(frame_for(lay.local_advanced_checkbox, h));
+    for i in 0..5 {
+        rows.adv_labels[i].setFrame(frame_for(lay.adv_labels[i], h));
+        rows.adv_fields[i].setFrame(frame_for(lay.adv_fields[i], h));
+        rows.adv_helps[i].setFrame(frame_for(lay.adv_helps[i], h));
+    }
+    rows.autostart_checkbox
+        .setFrame(frame_for(lay.autostart_checkbox, h));
+    rows.autostart_help
+        .setFrame(frame_for(lay.autostart_help, h));
+    rows.clipboard_checkbox
+        .setFrame(frame_for(lay.clipboard_checkbox, h));
+    rows.clipboard_help
+        .setFrame(frame_for(lay.clipboard_help, h));
+    rows.save_button.setFrame(frame_for(lay.save_button, h));
+    rows.remove_button.setFrame(frame_for(lay.remove_button, h));
+    rows.hotkey_hint.setFrame(frame_for(lay.hotkey_hint, h));
+    if let Some(button) = rows.accessibility_button.as_ref() {
+        button.setFrame(frame_for(lay.accessibility_button, h));
+    }
+    rows.status.setFrame(frame_for(lay.status, h));
+}
+
 /// Refreshes the provider-dependent rows (model text, placeholders, key vs.
 /// Ollama-address visibility, link title) for the currently selected provider.
 fn refresh_provider_rows() {
@@ -111,7 +723,9 @@ fn refresh_provider_rows() {
         model_label: Retained<NSTextField>,
         model_field: Retained<NSTextField>,
         model_help: Retained<NSTextField>,
-        local_help: Retained<NSTextField>,
+        local_controls: Vec<Retained<NSTextField>>,
+        local_buttons: Vec<Retained<NSButton>>,
+        local_model_popup: Retained<NSPopUpButton>,
         key_field: Retained<NSSecureTextField>,
         url_field: Retained<NSTextField>,
         key_label: Retained<NSTextField>,
@@ -129,7 +743,24 @@ fn refresh_provider_rows() {
             model_label: window_state.model_label.clone(),
             model_field: window_state.model_field.clone(),
             model_help: window_state.model_help.clone(),
-            local_help: window_state.local_help.clone(),
+            local_controls: vec![
+                window_state.local_model_label.clone(),
+                window_state.local_model_help.clone(),
+                window_state.local_status.clone(),
+                window_state.local_runtime_help.clone(),
+                window_state.local_warm_help.clone(),
+                window_state.local_idle_label.clone(),
+                window_state.local_idle_field.clone(),
+                window_state.local_idle_help.clone(),
+            ],
+            local_buttons: vec![
+                window_state.local_download_button.clone(),
+                window_state.local_cancel_button.clone(),
+                window_state.local_delete_button.clone(),
+                window_state.local_warm_checkbox.clone(),
+                window_state.local_advanced_checkbox.clone(),
+            ],
+            local_model_popup: window_state.local_model_popup.clone(),
             key_field: window_state.field.clone(),
             url_field: window_state.url_field.clone(),
             key_label: window_state.key_label.clone(),
@@ -156,7 +787,13 @@ fn refresh_provider_rows() {
     rows.model_label.setHidden(is_local);
     rows.model_field.setHidden(is_local);
     rows.model_help.setHidden(is_local);
-    rows.local_help.setHidden(!is_local);
+    for control in &rows.local_controls {
+        control.setHidden(!is_local);
+    }
+    for button in &rows.local_buttons {
+        button.setHidden(!is_local);
+    }
+    rows.local_model_popup.setHidden(!is_local);
     rows.key_label.setHidden(is_ollama || is_local);
     rows.key_field.setHidden(is_ollama || is_local);
     rows.key_help.setHidden(is_ollama || is_local);
@@ -188,6 +825,13 @@ fn refresh_provider_rows() {
     }
     rows.url_field
         .setPlaceholderString(Some(&NSString::from_str(crate::config::DEFAULT_OLLAMA_URL)));
+    refresh_advanced_visibility();
+    if is_local {
+        // Button visibility and the model popup's enabled state follow
+        // the install phase, not just the provider.
+        render_local();
+    }
+    layout_window();
 }
 
 /// Reads the draft provider, model, effort, Ollama URL, start-at-login and
@@ -313,6 +957,49 @@ define_class!(
                     set_status(status, &error, true);
                     return;
                 }
+            }
+            // The local controls are read for every provider, so their
+            // values are kept (and validated) even when another provider
+            // is selected.
+            let local_snapshot = STATE.with(|state| {
+                state.borrow().as_ref().map(|window_state| {
+                    (
+                        local_model_at(window_state.local_model_popup.indexOfSelectedItem()),
+                        window_state.local_warm_checkbox.state() == 1,
+                        super::LocalFields {
+                            idle_minutes: window_state
+                                .local_idle_field
+                                .stringValue()
+                                .to_string(),
+                            threads: window_state.adv_fields[0].stringValue().to_string(),
+                            max_reply: window_state.adv_fields[1].stringValue().to_string(),
+                            context: window_state.adv_fields[2].stringValue().to_string(),
+                            startup_secs: window_state.adv_fields[3].stringValue().to_string(),
+                            reply_secs: window_state.adv_fields[4].stringValue().to_string(),
+                        },
+                    )
+                })
+            });
+            let Some((local_model, warm_up, local_fields)) = local_snapshot else {
+                return;
+            };
+            let apply_result = STATE.with(|state| {
+                state.borrow_mut().as_mut().map(|window_state| {
+                    super::apply_local_fields(
+                        &mut window_state.settings,
+                        local_model,
+                        warm_up,
+                        &local_fields,
+                    )
+                })
+            });
+            match apply_result {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    set_status(status, &error, true);
+                    return;
+                }
+                None => return,
             }
             stash_draft();
             let save_result = STATE.with(|state| {
@@ -441,6 +1128,85 @@ define_class!(
             apply_provider_change(new_provider);
         }
 
+        #[unsafe(method(localModelChanged:))]
+        fn local_model_changed(&self, _sender: Option<&AnyObject>) {
+            render_local();
+        }
+
+        #[unsafe(method(advancedToggled:))]
+        fn advanced_toggled(&self, _sender: Option<&AnyObject>) {
+            refresh_advanced_visibility();
+            layout_window();
+        }
+
+        #[unsafe(method(downloadClicked:))]
+        fn download_clicked(&self, _sender: Option<&AnyObject>) {
+            let Some(status) = self.ivars().status.get() else {
+                return;
+            };
+            let selected = STATE.with(|state| {
+                state.borrow().as_ref().map(|window_state| {
+                    local_model_at(window_state.local_model_popup.indexOfSelectedItem())
+                })
+            });
+            let Some(selected) = selected else { return };
+            if let Err(error) = install::start_install(selected, Arc::new(|| {})) {
+                set_status(status, &error, true);
+                return;
+            }
+            render_local();
+        }
+
+        #[unsafe(method(cancelDownloadClicked:))]
+        fn cancel_download_clicked(&self, _sender: Option<&AnyObject>) {
+            install::cancel_install();
+            render_local();
+        }
+
+        #[unsafe(method(deleteModelClicked:))]
+        fn delete_model_clicked(&self, _sender: Option<&AnyObject>) {
+            let Some(status) = self.ivars().status.get() else {
+                return;
+            };
+            let selected = STATE.with(|state| {
+                state.borrow().as_ref().map(|window_state| {
+                    local_model_at(window_state.local_model_popup.indexOfSelectedItem())
+                })
+            });
+            let Some(selected) = selected else { return };
+            let label = catalog::model_file(selected).label;
+            let Some(mtm) = MainThreadMarker::new() else {
+                set_status(
+                    status,
+                    "Could not delete the model: Writely must ask on the main thread.",
+                    true,
+                );
+                return;
+            };
+            // No STATE borrow is held across runModal: it spins a nested
+            // run loop and the progress timer borrows STATE.
+            let alert = NSAlert::new(mtm);
+            alert.setMessageText(&NSString::from_str(&format!(
+                "Delete {label}? You can download it again later."
+            )));
+            let delete_button = alert.addButtonWithTitle(&NSString::from_str("Delete"));
+            drop(delete_button);
+            let cancel_button = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+            drop(cancel_button);
+            if alert.runModal() != NSAlertFirstButtonReturn {
+                return;
+            }
+            server::stop("model deleted");
+            match install::delete_model(selected) {
+                Ok(()) => {
+                    set_status(status, "Deleted.", false);
+                    super::notify_changed();
+                }
+                Err(error) => set_status(status, &error, true),
+            }
+            render_local();
+        }
+
         #[unsafe(method(openAccessibilitySettings:))]
         fn open_accessibility_settings(&self, _sender: Option<&AnyObject>) {
             let Some(status) = self.ivars().status.get() else {
@@ -471,6 +1237,9 @@ define_class!(
         fn window_will_close(&self, _notification: &NSNotification) {
             STATE.with(|state| {
                 if let Some(window_state) = state.borrow().as_ref() {
+                    // Stop the progress timer; the window state (and with
+                    // it the timer) is dropped just below.
+                    window_state.local_timer.invalidate();
                     window_state.window.setDelegate(None);
                 }
             });
@@ -502,20 +1271,49 @@ struct WindowState {
     field: Retained<NSSecureTextField>,
     status: Retained<NSTextField>,
     accessibility_button: Option<Retained<NSButton>>,
+    provider_label: Retained<NSTextField>,
     provider_popup: Retained<NSPopUpButton>,
+    provider_help: Retained<NSTextField>,
     model_label: Retained<NSTextField>,
     model_field: Retained<NSTextField>,
     model_help: Retained<NSTextField>,
-    local_help: Retained<NSTextField>,
+    effort_label: Retained<NSTextField>,
     effort_popup: Retained<NSPopUpButton>,
+    effort_help: Retained<NSTextField>,
     url_field: Retained<NSTextField>,
     key_label: Retained<NSTextField>,
     key_help: Retained<NSTextField>,
     link_button: Retained<NSButton>,
     url_label: Retained<NSTextField>,
     url_help: Retained<NSTextField>,
+    local_model_label: Retained<NSTextField>,
+    local_model_popup: Retained<NSPopUpButton>,
+    local_model_help: Retained<NSTextField>,
+    local_status: Retained<NSTextField>,
+    local_download_button: Retained<NSButton>,
+    local_cancel_button: Retained<NSButton>,
+    local_delete_button: Retained<NSButton>,
+    local_runtime_help: Retained<NSTextField>,
+    local_warm_checkbox: Retained<NSButton>,
+    local_warm_help: Retained<NSTextField>,
+    local_idle_label: Retained<NSTextField>,
+    local_idle_field: Retained<NSTextField>,
+    local_idle_help: Retained<NSTextField>,
+    local_advanced_checkbox: Retained<NSButton>,
+    adv_labels: [Retained<NSTextField>; 5],
+    adv_fields: [Retained<NSTextField>; 5],
+    adv_helps: [Retained<NSTextField>; 5],
+    local_timer: Retained<NSTimer>,
+    local_runtime_error: bool,
+    local_was_busy: bool,
     autostart_checkbox: Retained<NSButton>,
+    autostart_help: Retained<NSTextField>,
     clipboard_checkbox: Retained<NSButton>,
+    clipboard_help: Retained<NSTextField>,
+    save_button: Retained<NSButton>,
+    remove_button: Retained<NSButton>,
+    hotkey_hint: Retained<NSTextField>,
+    status_height: f64,
     settings: AppSettings,
     draft_keys: [String; 3],
 }
@@ -750,11 +1548,133 @@ pub fn show_settings() -> Result<(), String> {
     );
     url_help.setFrame(key_help_frame);
 
-    let local_help = NSTextField::wrappingLabelWithString(
-        ns_string!("This runs a small AI model on your computer. Download and memory options are being added."),
+    // The "On this computer" section, shown only for that provider. Frames
+    // are temporary: layout_window() positions everything once the window
+    // state exists, and whenever visibility changes.
+    let local_model_label = NSTextField::labelWithString(ns_string!("Model"), mtm);
+    local_model_label.setFrame(key_help_frame);
+    // SAFETY: the frame is valid and mtm is the main thread.
+    let local_model_popup =
+        NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), key_help_frame, false);
+    for (_id, text) in super::local_model_choices() {
+        local_model_popup.addItemWithTitle(&NSString::from_str(&text));
+    }
+    // SAFETY: delegate implements localModelChanged: and lives in STATE while the window is open.
+    unsafe {
+        local_model_popup.setTarget(Some(target));
+        local_model_popup.setAction(Some(sel!(localModelChanged:)));
+    }
+    let local_model_help = NSTextField::wrappingLabelWithString(
+        ns_string!(
+            "Smaller is faster; larger makes fewer mistakes. Your text never leaves this computer."
+        ),
         mtm,
     );
-    local_help.setFrame(key_help_frame);
+    local_model_help.setFrame(key_help_frame);
+    let local_status = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+    local_status.setFrame(key_help_frame);
+    // SAFETY: delegate implements downloadClicked: and lives in STATE while the window is open.
+    let local_download_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("Download"),
+            Some(target),
+            Some(sel!(downloadClicked:)),
+            mtm,
+        )
+    };
+    local_download_button.setFrame(key_help_frame);
+    // SAFETY: delegate implements cancelDownloadClicked: and lives in STATE while the window is open.
+    let local_cancel_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("Cancel"),
+            Some(target),
+            Some(sel!(cancelDownloadClicked:)),
+            mtm,
+        )
+    };
+    local_cancel_button.setFrame(key_help_frame);
+    // SAFETY: delegate implements deleteModelClicked: and lives in STATE while the window is open.
+    let local_delete_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("Delete model"),
+            Some(target),
+            Some(sel!(deleteModelClicked:)),
+            mtm,
+        )
+    };
+    local_delete_button.setFrame(key_help_frame);
+    let (local_runtime_help_text, local_runtime_error) = match catalog::runtime_file() {
+        Ok(runtime) => (
+            format!(
+                "The first download also gets the llama.cpp helper ({}). Files are saved in {}.",
+                download::human_size(runtime.size),
+                catalog::local_data_dir().display()
+            ),
+            false,
+        ),
+        Err(error) => (error, true),
+    };
+    let local_runtime_help =
+        NSTextField::wrappingLabelWithString(&NSString::from_str(&local_runtime_help_text), mtm);
+    local_runtime_help.setFrame(key_help_frame);
+    // SAFETY: a checkbox with no target/action is valid; its state is read on Save.
+    let local_warm_checkbox = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            ns_string!("Load the model when Writely starts"),
+            None,
+            None,
+            mtm,
+        )
+    };
+    local_warm_checkbox.setFrame(key_help_frame);
+    let local_warm_help = NSTextField::wrappingLabelWithString(
+        ns_string!("Makes the first check fast. While loaded it uses about 1 GB of memory (2 GB for the 2B model)."),
+        mtm,
+    );
+    local_warm_help.setFrame(key_help_frame);
+    let local_idle_label =
+        NSTextField::labelWithString(ns_string!("Free memory after (minutes)"), mtm);
+    local_idle_label.setFrame(key_help_frame);
+    let local_idle_field = NSTextField::initWithFrame(NSTextField::alloc(mtm), key_help_frame);
+    let local_idle_help = NSTextField::wrappingLabelWithString(
+        ns_string!("Unload the model after this many minutes without use. 0 = never. It loads again in about a second when needed."),
+        mtm,
+    );
+    local_idle_help.setFrame(key_help_frame);
+    // SAFETY: delegate implements advancedToggled: and lives in STATE while the window is open.
+    let local_advanced_checkbox = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            ns_string!("Show advanced options"),
+            Some(target),
+            Some(sel!(advancedToggled:)),
+            mtm,
+        )
+    };
+    local_advanced_checkbox.setFrame(key_help_frame);
+    // "Show advanced options" starts unchecked every time Settings opens.
+    local_advanced_checkbox.setState(0);
+    let mut adv_label_vec: Vec<Retained<NSTextField>> = Vec::new();
+    let mut adv_field_vec: Vec<Retained<NSTextField>> = Vec::new();
+    let mut adv_help_vec: Vec<Retained<NSTextField>> = Vec::new();
+    for i in 0..5 {
+        let label = NSTextField::labelWithString(&NSString::from_str(ADVANCED_LABELS[i]), mtm);
+        label.setFrame(key_help_frame);
+        adv_label_vec.push(label);
+        adv_field_vec.push(NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            key_help_frame,
+        ));
+        let help =
+            NSTextField::wrappingLabelWithString(&NSString::from_str(ADVANCED_HELPS[i]), mtm);
+        help.setFrame(key_help_frame);
+        adv_help_vec.push(help);
+    }
+    let adv_labels: [Retained<NSTextField>; 5] =
+        adv_label_vec.try_into().expect("five advanced labels");
+    let adv_fields: [Retained<NSTextField>; 5] =
+        adv_field_vec.try_into().expect("five advanced fields");
+    let adv_helps: [Retained<NSTextField>; 5] =
+        adv_help_vec.try_into().expect("five advanced helps");
 
     // SAFETY: a checkbox with no target/action is valid; its state is read on Save.
     let autostart_checkbox = unsafe {
@@ -841,17 +1761,15 @@ pub fn show_settings() -> Result<(), String> {
         None
     };
 
+    let status_height = if permission_text.is_some() {
+        54.0
+    } else {
+        18.0
+    };
     let status_label = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
     status_label.setFrame(NSRect::new(
         NSPoint::new(20.0, 14.0),
-        NSSize::new(
-            380.0,
-            if permission_text.is_some() {
-                54.0
-            } else {
-                18.0
-            },
-        ),
+        NSSize::new(380.0, status_height),
     ));
 
     // SAFETY: delegate implements providerChanged: and lives in STATE while the window is open.
@@ -886,12 +1804,46 @@ pub fn show_settings() -> Result<(), String> {
     if let Some(page) = super::api_key_page_for(settings.provider) {
         link_button.setTitle(&NSString::from_str(page));
     }
+    local_model_popup.selectItemAtIndex(local_model_index(settings.local_model));
+    local_warm_checkbox.setState(if settings.local_warm_up { 1 } else { 0 });
+    local_idle_field.setStringValue(&NSString::from_str(
+        &settings.local_idle_minutes.to_string(),
+    ));
+    let adv_values = [
+        settings.local_threads,
+        settings.local_max_reply_tokens,
+        settings.local_context_tokens,
+        settings.local_startup_timeout_secs,
+        settings.local_reply_timeout_secs,
+    ];
+    for (i, value) in adv_values.into_iter().enumerate() {
+        adv_fields[i].setStringValue(&NSString::from_str(&value.to_string()));
+    }
     let is_ollama = settings.provider == Provider::Ollama;
     let is_local = settings.provider == Provider::Local;
     model_label.setHidden(is_local);
     model_field.setHidden(is_local);
     model_help.setHidden(is_local);
-    local_help.setHidden(!is_local);
+    local_model_label.setHidden(!is_local);
+    local_model_popup.setHidden(!is_local);
+    local_model_help.setHidden(!is_local);
+    local_status.setHidden(!is_local);
+    local_download_button.setHidden(!is_local);
+    local_cancel_button.setHidden(!is_local);
+    local_delete_button.setHidden(!is_local);
+    local_runtime_help.setHidden(!is_local);
+    local_warm_checkbox.setHidden(!is_local);
+    local_warm_help.setHidden(!is_local);
+    local_idle_label.setHidden(!is_local);
+    local_idle_field.setHidden(!is_local);
+    local_idle_help.setHidden(!is_local);
+    local_advanced_checkbox.setHidden(!is_local);
+    // Advanced rows start hidden: the checkbox is unchecked on open.
+    for i in 0..5 {
+        adv_labels[i].setHidden(true);
+        adv_fields[i].setHidden(true);
+        adv_helps[i].setHidden(true);
+    }
     key_label.setHidden(is_ollama || is_local);
     field.setHidden(is_ollama || is_local);
     key_help.setHidden(is_ollama || is_local);
@@ -944,7 +1896,25 @@ pub fn show_settings() -> Result<(), String> {
     content.addSubview(&url_label);
     content.addSubview(&url_field);
     content.addSubview(&url_help);
-    content.addSubview(&local_help);
+    content.addSubview(&local_model_label);
+    content.addSubview(&local_model_popup);
+    content.addSubview(&local_model_help);
+    content.addSubview(&local_status);
+    content.addSubview(&local_download_button);
+    content.addSubview(&local_cancel_button);
+    content.addSubview(&local_delete_button);
+    content.addSubview(&local_runtime_help);
+    content.addSubview(&local_warm_checkbox);
+    content.addSubview(&local_warm_help);
+    content.addSubview(&local_idle_label);
+    content.addSubview(&local_idle_field);
+    content.addSubview(&local_idle_help);
+    content.addSubview(&local_advanced_checkbox);
+    for i in 0..5 {
+        content.addSubview(&adv_labels[i]);
+        content.addSubview(&adv_fields[i]);
+        content.addSubview(&adv_helps[i]);
+    }
     content.addSubview(&autostart_checkbox);
     content.addSubview(&autostart_help);
     content.addSubview(&clipboard_checkbox);
@@ -954,6 +1924,16 @@ pub fn show_settings() -> Result<(), String> {
     content.addSubview(&hotkey_hint);
     content.addSubview(&status_label);
 
+    // Re-render download progress every 0.25 s on the main run loop;
+    // invalidated in windowWillClose before the state is dropped.
+    let timer_block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        render_local();
+    });
+    // SAFETY: the block captures nothing and only touches the main
+    // thread's STATE; it runs on the main run loop.
+    let local_timer =
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.25, true, &timer_block) };
+
     STATE.with(|state| {
         *state.borrow_mut() = Some(WindowState {
             window: window.clone(),
@@ -961,24 +1941,56 @@ pub fn show_settings() -> Result<(), String> {
             field: field.clone(),
             status: status_label.clone(),
             accessibility_button,
+            provider_label: provider_label.clone(),
             provider_popup: provider_popup.clone(),
+            provider_help: provider_help.clone(),
             model_label: model_label.clone(),
             model_field: model_field.clone(),
             model_help: model_help.clone(),
-            local_help: local_help.clone(),
+            effort_label: effort_label.clone(),
             effort_popup: effort_popup.clone(),
+            effort_help: effort_help.clone(),
             url_field: url_field.clone(),
             key_label: key_label.clone(),
             key_help: key_help.clone(),
             link_button: link_button.clone(),
             url_label: url_label.clone(),
             url_help: url_help.clone(),
+            local_model_label: local_model_label.clone(),
+            local_model_popup: local_model_popup.clone(),
+            local_model_help: local_model_help.clone(),
+            local_status: local_status.clone(),
+            local_download_button: local_download_button.clone(),
+            local_cancel_button: local_cancel_button.clone(),
+            local_delete_button: local_delete_button.clone(),
+            local_runtime_help: local_runtime_help.clone(),
+            local_warm_checkbox: local_warm_checkbox.clone(),
+            local_warm_help: local_warm_help.clone(),
+            local_idle_label: local_idle_label.clone(),
+            local_idle_field: local_idle_field.clone(),
+            local_idle_help: local_idle_help.clone(),
+            local_advanced_checkbox: local_advanced_checkbox.clone(),
+            adv_labels: adv_labels.clone(),
+            adv_fields: adv_fields.clone(),
+            adv_helps: adv_helps.clone(),
+            local_timer,
+            local_runtime_error,
+            local_was_busy: false,
             autostart_checkbox: autostart_checkbox.clone(),
+            autostart_help: autostart_help.clone(),
             clipboard_checkbox: clipboard_checkbox.clone(),
+            clipboard_help: clipboard_help.clone(),
+            save_button: save_button.clone(),
+            remove_button: remove_button.clone(),
+            hotkey_hint: hotkey_hint.clone(),
+            status_height,
             settings,
             draft_keys: [String::new(), String::new(), String::new()],
         });
     });
+
+    render_local();
+    layout_window();
 
     NSApplication::sharedApplication(mtm).activate();
     window.makeKeyAndOrderFront(None);
