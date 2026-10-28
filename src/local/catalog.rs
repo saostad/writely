@@ -56,19 +56,19 @@ pub struct RuntimeFile {
     pub server_path: &'static str,
 }
 
-pub const RUNTIME_VERSION: &str = "b11900";
+pub const RUNTIME_VERSION: &str = "b11960";
 
 #[cfg_attr(
     not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
 )]
 static RUNTIME_MACOS_ARM64: RuntimeFile = RuntimeFile {
-    version: "b11900",
-    url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-macos-arm64.tar.gz",
-    sha256: "6d3af8649e687b288395ee79f4423a21376892edb94520fa6320bfd3eb81700b",
-    size: 16295973,
+    version: "b11960",
+    url: "https://github.com/ggml-org/llama.cpp/releases/download/b11960/llama-b11960-bin-macos-arm64.tar.gz",
+    sha256: "58e5a5e1d7c2bf66cedd9c29e0323f3e570660a70a1e2156d32eed08f4cc1e3c",
+    size: 16465074,
     kind: ArchiveKind::TarGz,
-    server_path: "llama-b11900/llama-server",
+    server_path: "llama-b11960/llama-server",
 };
 
 #[cfg_attr(
@@ -76,12 +76,12 @@ static RUNTIME_MACOS_ARM64: RuntimeFile = RuntimeFile {
     allow(dead_code)
 )]
 static RUNTIME_MACOS_X64: RuntimeFile = RuntimeFile {
-    version: "b11900",
-    url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-macos-x64.tar.gz",
-    sha256: "81f27390c9338d017e775eee2b8ee0825cee88a67397e1fbfe615f76a0549877",
-    size: 12038400,
+    version: "b11960",
+    url: "https://github.com/ggml-org/llama.cpp/releases/download/b11960/llama-b11960-bin-macos-x64.tar.gz",
+    sha256: "d1e6c9ddcaed9a3b1bb8f3d946bdb3481c7b919357a4029dcb747762397f1da5",
+    size: 12205764,
     kind: ArchiveKind::TarGz,
-    server_path: "llama-b11900/llama-server",
+    server_path: "llama-b11960/llama-server",
 };
 
 #[cfg_attr(
@@ -89,10 +89,10 @@ static RUNTIME_MACOS_X64: RuntimeFile = RuntimeFile {
     allow(dead_code)
 )]
 static RUNTIME_WINDOWS_X64: RuntimeFile = RuntimeFile {
-    version: "b11900",
-    url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-win-cpu-x64.zip",
-    sha256: "d3bbbbb7d1b4979b72052fd73cdeeb5a4d5a4e6a3f52aeb40abd6f116558e323",
-    size: 24228419,
+    version: "b11960",
+    url: "https://github.com/ggml-org/llama.cpp/releases/download/b11960/llama-b11960-bin-win-cpu-x64.zip",
+    sha256: "73f962f82850d244db47eaacb9d913637027b82399124324298576d58c5f4287",
+    size: 24407745,
     kind: ArchiveKind::Zip,
     server_path: "llama-server.exe",
 };
@@ -102,12 +102,12 @@ static RUNTIME_WINDOWS_X64: RuntimeFile = RuntimeFile {
     allow(dead_code)
 )]
 static RUNTIME_LINUX_X64: RuntimeFile = RuntimeFile {
-    version: "b11900",
-    url: "https://github.com/ggml-org/llama.cpp/releases/download/b11900/llama-b11900-bin-ubuntu-x64.tar.gz",
-    sha256: "3effcc3009af64d6f30c217827d7982b3934577d282feb243b11fb6789ed124e",
-    size: 22497562,
+    version: "b11960",
+    url: "https://github.com/ggml-org/llama.cpp/releases/download/b11960/llama-b11960-bin-ubuntu-x64.tar.gz",
+    sha256: "31cc3a6bc638ac6c48dc4b1b74888f1eaadf3d14227c1e5f67daf9a49541d97a",
+    size: 22686210,
     kind: ArchiveKind::TarGz,
-    server_path: "llama-b11900/llama-server",
+    server_path: "llama-b11960/llama-server",
 };
 
 pub fn runtime_file() -> Result<&'static RuntimeFile, String> {
@@ -217,7 +217,7 @@ mod tests {
             &RUNTIME_LINUX_X64,
         ] {
             assert!(is_lower_hex64(r.sha256), "runtime {}", r.url);
-            assert_eq!(r.version, "b11900");
+            assert_eq!(r.version, "b11960");
         }
     }
 
@@ -238,15 +238,15 @@ mod tests {
         {
             let r = runtime_file().expect("linux x86_64 runtime");
             assert_eq!(r.kind, ArchiveKind::TarGz);
-            assert_eq!(r.version, "b11900");
-            assert_eq!(r.server_path, "llama-b11900/llama-server");
+            assert_eq!(r.version, "b11960");
+            assert_eq!(r.server_path, "llama-b11960/llama-server");
         }
     }
 
     #[test]
     fn data_dirs_end_with_expected_parts() {
         assert!(models_dir().ends_with("models"));
-        assert!(runtime_dir().ends_with("b11900"));
+        assert!(runtime_dir().ends_with("b11960"));
         assert!(local_data_dir().ends_with("local"));
     }
 }
